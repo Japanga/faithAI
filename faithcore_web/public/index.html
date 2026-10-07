@@ -1,0 +1,431 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Faith AI</title>
+  <link rel="stylesheet" href="/style.css">
+  <style>
+    /* Faith layout: keep the character/expression area fixed on screen.
+       Only the conversation message pane is allowed to scroll. */
+    html, body {
+      min-height: 100%;
+      height: auto;
+      overflow-x: hidden;
+      overflow-y: auto;
+    }
+
+    body {
+      margin: 0;
+    }
+
+    .app-shell {
+      /*
+       * The page itself is allowed to scroll. This prevents the top
+       * branding/tagline from being trapped outside the viewport.
+       * Only the message list inside .chat is independently scrollable.
+       */
+      min-height: 100vh;
+      height: auto;
+      overflow: visible;
+      grid-template-rows: auto minmax(300px, 38vh) minmax(260px, 32vh) auto auto;
+    }
+
+    .character-panel {
+      min-height: 300px;
+      height: 100%;
+      overflow: hidden;
+    }
+
+    .chat-panel {
+      min-height: 260px;
+      height: 100%;
+      overflow: hidden;
+      display: flex;
+      flex-direction: column;
+    }
+
+    .chat {
+      min-height: 0;
+      flex: 1 1 auto;
+      overflow-y: auto;
+      overflow-x: hidden;
+      overscroll-behavior: contain;
+      scrollbar-gutter: stable;
+    }
+
+    .composer {
+      flex: 0 0 auto;
+    }
+
+    .composer-row {
+      display: flex;
+      gap: 8px;
+      align-items: center;
+      flex-wrap: wrap;
+    }
+
+    #upload {
+      font-weight: 600;
+    }
+
+    .upload-status {
+      flex: 0 1 210px;
+      width: 210px;
+      max-width: 210px;
+      min-width: 120px;
+      padding: 8px 12px;
+      border: 1px solid rgba(128, 128, 128, 0.28);
+      border-radius: 8px;
+      font-size: 0.86rem;
+      opacity: 0.8;
+      overflow: hidden;
+      text-overflow: ellipsis;
+      white-space: nowrap;
+    }
+
+    .upload-status.sent {
+      opacity: 1;
+    }
+
+    .hint {
+      flex: 0 0 auto;
+    }
+
+    /* AI/Wikimedia image cards are rendered by app.js. */
+    .message-image {
+      display: block;
+      width: min(100%, 720px);
+      max-height: 520px;
+      object-fit: contain;
+      margin-top: 12px;
+      border-radius: 14px;
+      background: rgba(0, 0, 0, 0.12);
+    }
+
+    .image-card {
+      margin-top: 12px;
+    }
+
+    .image-label {
+      margin-top: 6px;
+      font-size: 0.78rem;
+      opacity: 0.7;
+    }
+
+    .image-loading {
+      display: flex;
+      align-items: center;
+      gap: 9px;
+      padding: 12px 14px;
+      margin-top: 12px;
+      border-radius: 12px;
+      background: rgba(0, 0, 0, 0.08);
+    }
+
+    .image-spinner {
+      width: 15px;
+      height: 15px;
+      border: 2px solid currentColor;
+      border-right-color: transparent;
+      border-radius: 50%;
+      animation: faith-spin 0.75s linear infinite;
+    }
+
+    @keyframes faith-spin {
+      to { transform: rotate(360deg); }
+    }
+
+    .image-error {
+      margin-top: 10px;
+      font-size: 0.85rem;
+      opacity: 0.8;
+    }
+
+    @media (max-width: 700px) {
+      .app-shell {
+        min-height: 100vh;
+        height: auto;
+        grid-template-rows: auto minmax(250px, 34vh) minmax(210px, 30vh) auto auto;
+      }
+
+      .character-panel {
+        min-height: 250px;
+      }
+
+      .chat-panel {
+        min-height: 210px;
+      }
+    }
+
+    /*
+     * Faith source renderer
+     *
+     * app.js is intentionally allowed to keep rendering messages as plain text.
+     * The server never sends HTML or Markdown citation syntax. It sends private
+     * [[FAITH_SOURCE|...|...]] / [[FAITH_MISSING]] tokens, and this layer turns
+     * those tokens into real DOM elements after the message exists in #chat.
+     */
+    .faith-source-link {
+      position: relative;
+      display: inline-block;
+      margin-left: 0.22em;
+      color: inherit;
+      text-decoration: none;
+      font-weight: 700;
+      cursor: pointer;
+      border-bottom: 1px dotted currentColor;
+      opacity: 0.82;
+    }
+
+    .faith-source-link:hover,
+    .faith-source-link:focus-visible {
+      opacity: 1;
+      text-decoration: none;
+    }
+
+    .faith-source-link::after,
+    .faith-source-missing::after {
+      content: attr(data-tooltip);
+      position: absolute;
+      left: 50%;
+      bottom: calc(100% + 8px);
+      transform: translateX(-50%) translateY(3px);
+      width: max-content;
+      max-width: 320px;
+      padding: 7px 9px;
+      border-radius: 7px;
+      background: rgba(20, 20, 20, 0.96);
+      color: #fff;
+      font-size: 0.78rem;
+      font-weight: 500;
+      line-height: 1.25;
+      white-space: normal;
+      text-align: left;
+      pointer-events: none;
+      opacity: 0;
+      visibility: hidden;
+      z-index: 1000;
+      box-shadow: 0 5px 18px rgba(0, 0, 0, 0.28);
+      transition: opacity 0.12s ease, transform 0.12s ease;
+    }
+
+    .faith-source-link:hover::after,
+    .faith-source-link:focus-visible::after,
+    .faith-source-missing:hover::after,
+    .faith-source-missing:focus-visible::after {
+      opacity: 1;
+      visibility: visible;
+      transform: translateX(-50%) translateY(0);
+    }
+
+    .faith-source-missing {
+      position: relative;
+      display: inline-block;
+      margin-left: 0.22em;
+      cursor: help;
+      font-weight: 700;
+      opacity: 0.65;
+      outline: none;
+    }
+
+    .faith-source-missing:hover,
+    .faith-source-missing:focus-visible {
+      opacity: 1;
+    }
+
+    @media (max-width: 700px) {
+      .faith-source-link::after,
+      .faith-source-missing::after {
+        max-width: min(280px, 70vw);
+      }
+    }
+  </style>
+</head>
+<body>
+  <main class="app-shell">
+    <section class="topbar">
+      <div>
+        <div class="brand">FAITH</div>
+        <div class="subtitle">Ruby AI Assistant</div>
+      </div>
+
+      <div class="state">
+        <div id="status" class="state-title">Ruby / Wrench</div>
+        <div id="state-detail" class="state-detail">Ready</div>
+      </div>
+    </section>
+
+    <section class="character-panel">
+      <div class="character-glow"></div>
+      <img id="expression"
+           src="/assets/ruby_wrench.png"
+           alt="Faith expression">
+    </section>
+
+    <section class="chat-panel">
+      <div class="chat-header">Conversation</div>
+      <div id="chat" class="chat" aria-live="polite" aria-busy="false"></div>
+    </section>
+
+    <form id="chat-form" class="composer">
+      <textarea id="input"
+                rows="2"
+                autocomplete="off"
+                placeholder="Ask Faith something..."></textarea>
+      <div class="composer-row">
+        <button id="upload" type="button" class="secondary">Upload</button>
+        <span id="upload-status" class="upload-status" aria-live="polite">No file selected</span>
+        <button id="send" type="submit">Send</button>
+        <button id="clear" type="button" class="secondary">Clear</button>
+        <input id="file-input"
+               type="file"
+               hidden
+               aria-label="Choose a file to send to Faith">
+      </div>
+    </form>
+
+    <div class="hint">Press Enter to send • Shift+Enter for a new line</div>
+  </main>
+
+  <script src="/app.js"></script>
+
+<script>
+(function () {
+  "use strict";
+
+  const SOURCE_RE = /\[\[FAITH_SOURCE\|([^|\]]+)\|([^|\]]+)\]\]|\[\[FAITH_MISSING\]\]/g;
+
+  function decodeBase64(value) {
+    try {
+      const binary = atob(value);
+      const bytes = Uint8Array.from(binary, ch => ch.charCodeAt(0));
+      return new TextDecoder("utf-8").decode(bytes);
+    } catch (_) {
+      return "";
+    }
+  }
+
+  function makeSourceLink(encodedUrl, encodedTitle) {
+    const url = decodeBase64(encodedUrl);
+    const title = decodeBase64(encodedTitle) || url;
+    if (!/^https?:\/\//i.test(url)) return null;
+
+    const a = document.createElement("a");
+    a.className = "faith-source-link";
+    a.href = url;
+    a.target = "_blank";
+    a.rel = "noopener noreferrer";
+    a.textContent = "[¶]";
+    a.setAttribute("aria-label", "Open source: " + title);
+    a.setAttribute("data-tooltip", "Source: " + title);
+    a.title = "Source: " + title;
+    return a;
+  }
+
+  function makeMissingMarker() {
+    const span = document.createElement("span");
+    span.className = "faith-source-missing";
+    span.tabIndex = 0;
+    span.textContent = "[?]";
+    span.setAttribute("aria-label", "Source/reference not found");
+    span.setAttribute("data-tooltip", "Source/reference not found");
+    span.title = "Source/reference not found";
+    return span;
+  }
+
+  function renderSourceTokens(root) {
+    if (!root) return;
+
+    const walker = document.createTreeWalker(
+      root,
+      NodeFilter.SHOW_TEXT,
+      {
+        acceptNode(node) {
+          if (!node.nodeValue || !SOURCE_RE.test(node.nodeValue)) {
+            SOURCE_RE.lastIndex = 0;
+            return NodeFilter.FILTER_REJECT;
+          }
+          SOURCE_RE.lastIndex = 0;
+          const parent = node.parentElement;
+          if (!parent) return NodeFilter.FILTER_REJECT;
+          if (parent.closest(".faith-source-link, .faith-source-missing, script, style, textarea")) {
+            return NodeFilter.FILTER_REJECT;
+          }
+          return NodeFilter.FILTER_ACCEPT;
+        }
+      }
+    );
+
+    const nodes = [];
+    let node;
+    while ((node = walker.nextNode())) nodes.push(node);
+
+    for (const textNode of nodes) {
+      const text = textNode.nodeValue;
+      SOURCE_RE.lastIndex = 0;
+      const fragment = document.createDocumentFragment();
+      let last = 0;
+      let match;
+
+      while ((match = SOURCE_RE.exec(text)) !== null) {
+        if (match.index > last) {
+          fragment.appendChild(document.createTextNode(text.slice(last, match.index)));
+        }
+
+        if (match[1] && match[2]) {
+          const link = makeSourceLink(match[1], match[2]);
+          fragment.appendChild(link || document.createTextNode("[?]"));
+        } else {
+          fragment.appendChild(makeMissingMarker());
+        }
+
+        last = SOURCE_RE.lastIndex;
+      }
+
+      if (last < text.length) {
+        fragment.appendChild(document.createTextNode(text.slice(last)));
+      }
+
+      textNode.parentNode.replaceChild(fragment, textNode);
+    }
+  }
+
+  function installFaithSourceRenderer() {
+    const chat = document.getElementById("chat");
+    if (!chat) return;
+
+    renderSourceTokens(chat);
+
+    const observer = new MutationObserver(function (mutations) {
+      for (const mutation of mutations) {
+        for (const added of mutation.addedNodes) {
+          if (added.nodeType === Node.TEXT_NODE) {
+            const parent = added.parentElement;
+            if (parent) renderSourceTokens(parent);
+          } else if (added.nodeType === Node.ELEMENT_NODE) {
+            renderSourceTokens(added);
+          }
+        }
+      }
+    });
+
+    observer.observe(chat, { childList: true, subtree: true });
+
+    // app.js can replace a message's text after initially inserting it.
+    // A tiny delayed pass catches that without changing normal chat behavior.
+    [0, 50, 150, 400, 1000].forEach(delay => {
+      setTimeout(() => renderSourceTokens(chat), delay);
+    });
+  }
+
+  if (document.readyState === "loading") {
+    document.addEventListener("DOMContentLoaded", installFaithSourceRenderer);
+  } else {
+    installFaithSourceRenderer();
+  }
+})();
+</script>
+
+</body>
+</html>
