@@ -2380,6 +2380,7 @@ server.mount_proc "/api/clear" do |req, res|
     next
   end
 
+
   mutex.synchronize do
     messages.replace([{ role: "system", content: SYSTEM_PROMPT }])
     latest_code_context = nil
