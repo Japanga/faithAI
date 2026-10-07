@@ -1,6 +1,7 @@
 # frozen_string_literal: true
 
 require "bundler/setup"
+require "colorize"
 require "faraday"
 require "json"
 require "securerandom"
@@ -2393,19 +2394,25 @@ server.mount_proc "/api/clear" do |req, res|
   json_response.call(res, 200, { ok: true })
 end
 
-# IMPORTANT: Ruby signal traps run in trap context and must not call Mutex#synchronize,
-# Thread#join, WEBrick shutdown, or other blocking operations directly. Ctrl+C simply
-# exits the process; the normal at_exit hook below performs cleanup outside trap context.
+# Graceful process shutdown.
+#
+# The previous implementation handled Ctrl+C by calling exit(0) from the signal
+# trap and relying on at_exit to stop WEBrick. On Windows this is unnecessarily
+# fragile: the trap can run while WEBrick is blocked in server.start, and the
+# cleanup then depends on SystemExit/at_exit completing cleanly. Handle SIGINT by
+# shutting WEBrick down directly so server.start returns normally, then let the
+# normal cleanup path finish.
 shutdown_faith = lambda do
   begin
     server.shutdown
-  rescue StandardError
-    nil
+  rescue StandardError => error
+    warn "Faith server shutdown warning: #{error.class}: #{error.message}"
   end
+
   begin
     local_vision_observer.shutdown!
-  rescue StandardError
-    nil
+  rescue StandardError => error
+    warn "Faith vision shutdown warning: #{error.class}: #{error.message}"
   end
 end
 
@@ -2414,27 +2421,34 @@ at_exit do
 end
 
 trap("INT") do
-  # Do not call shutdown_faith here. exit runs the at_exit cleanup in normal Ruby
-  # execution context, where Mutex#synchronize and WEBrick cleanup are safe.
-  exit(0)
-end
-trap("TERM") do
-  exit(0)
+  # WEBrick's shutdown is the important part: it releases the listening socket
+  # and causes server.start to return. Do not call exit here; that was the source
+  # of the unreliable Windows shutdown path.
+  begin
+    server.shutdown
+  rescue StandardError => error
+    warn "Faith Ctrl+C shutdown warning: #{error.class}: #{error.message}"
+  end
 end
 
-puts "================================="
-puts "        Faith Web AI"
-puts "Version: #{FAITH_SERVER_VERSION}"
-puts "================================="
-puts "Model: #{MODEL}"
-puts "Powered by Vireonix"
-puts "Vision: optional local image observer (requires manually downloaded Gemma 3 model)"
-puts "Images: Wikimedia Commons"
-puts "AI images: #{IMAGE_PROVIDER == "perchance" ? "Perchance" : (ENV["OPENAI_API_KEY"].to_s.empty? ? "disabled (set OPENAI_API_KEY)" : IMAGE_MODEL)}"
-puts "Faith image observation: #{PUBLIC_BASE_URL.empty? ? "base64 input" : "public URL input via #{PUBLIC_BASE_URL}"}"
+trap("TERM") do
+  begin
+    server.shutdown
+  rescue StandardError
+    nil
+  end
+end
+
+puts "=================================".red
+puts "        Faith Web AI".red
+puts "=================================".red
+puts "Model: #{MODEL}".red
+puts "Powered by Vireonix".red
+puts "Images: Wikimedia Commons".red
+puts "AI images: #{IMAGE_PROVIDER == "perchance" ? "Perchance" : (ENV["OPENAI_API_KEY"].to_s.empty? ? "disabled (set OPENAI_API_KEY)" : IMAGE_MODEL)}".red
 puts
-puts "Open http://localhost:#{PORT}"
-puts "Press Ctrl+C to stop."
+puts "Open http://localhost:#{PORT}".red
+puts "Press Ctrl+C to stop.".red
 puts
 
 server.start
