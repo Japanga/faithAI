@@ -1,0 +1,235 @@
+# frozen_string_literal: true
+
+require "json"
+require "net/http"
+require "open3"
+require "uri"
+require "tmpdir"
+
+# FaithLocalAI owns Faith's LOCAL TEXT/CHAT llama-server.
+#
+# This server intentionally uses the small Qwen2 GGUF first. Vision is kept
+# separate in FaithVisionLocalAI so a text-only model does not have to carry an
+# mmproj file and cannot break normal chat startup.
+module FaithLocalAI
+  module_function
+
+  DEFAULT_HOST = "127.0.0.1"
+  DEFAULT_PORT = 8080
+  DEFAULT_MODEL_FILENAME = "qwen2-0_5b-instruct-q4_k_m.gguf"
+  DEFAULT_CONTEXT = "4096"
+  DEFAULT_START_TIMEOUT = "180"
+
+  def root
+    File.expand_path(__dir__)
+  end
+
+  def models_dir
+    configured = ENV["FAITH_MODELS_DIR"].to_s.strip
+    configured.empty? ? File.join(root, "models") : File.expand_path(configured)
+  end
+
+  def local_url
+    ENV.fetch("FAITH_LOCAL_AI_URL", "http://#{DEFAULT_HOST}:#{DEFAULT_PORT}/v1/chat/completions").to_s.strip
+  end
+
+  def base_url
+    uri = URI.parse(local_url)
+    "#{uri.scheme}://#{uri.host}:#{uri.port}"
+  rescue URI::InvalidURIError
+    "http://#{DEFAULT_HOST}:#{DEFAULT_PORT}"
+  end
+
+  def port
+    URI.parse(local_url).port
+  rescue StandardError
+    DEFAULT_PORT
+  end
+
+  def model_path
+    configured = ENV["FAITH_LOCAL_MODEL_PATH"].to_s.strip
+    return File.expand_path(configured) if !configured.empty? && File.file?(File.expand_path(configured))
+    return configured if !configured.empty? && File.file?(configured)
+
+    candidates = [
+      File.join(models_dir, DEFAULT_MODEL_FILENAME),
+      File.join(root, DEFAULT_MODEL_FILENAME),
+      File.join(Dir.pwd, "models", DEFAULT_MODEL_FILENAME),
+      File.join(Dir.pwd, DEFAULT_MODEL_FILENAME)
+    ]
+    candidates.find { |path| File.file?(path) }.to_s
+  end
+
+  def llama_server_path
+    configured = ENV["FAITH_LLAMA_SERVER"].to_s.strip
+    return File.expand_path(configured) if !configured.empty? && File.file?(File.expand_path(configured))
+    return configured if !configured.empty? && File.file?(configured)
+
+    executable = Gem.win_platform? ? "llama-server.exe" : "llama-server"
+    candidates = [
+      File.join(root, executable),
+      File.join(root, "bin", executable),
+      File.join(Dir.pwd, executable),
+      File.join(Dir.pwd, "bin", executable)
+    ]
+    candidates.find { |path| File.file?(path) }.to_s
+  end
+
+  def model_name
+    configured = ENV["FAITH_LOCAL_AI_MODEL"].to_s.strip
+    return configured unless configured.empty? || configured == "local"
+
+    uri = URI.parse("#{base_url}/v1/models")
+    http = Net::HTTP.new(uri.host, uri.port)
+    http.open_timeout = 1
+    http.read_timeout = 2
+    response = http.get(uri.request_uri)
+    data = JSON.parse(response.body.to_s)
+    data.dig("data", 0, "id").to_s.strip
+  rescue StandardError
+    "local"
+  end
+
+  def ready?
+    uri = URI.parse("#{base_url}/v1/models")
+    http = Net::HTTP.new(uri.host, uri.port)
+    http.open_timeout = 1
+    http.read_timeout = 2
+    response = http.get(uri.request_uri)
+    response.is_a?(Net::HTTPSuccess)
+  rescue StandardError
+    false
+  end
+
+  def pid_file
+    File.join(Dir.tmpdir, "faith_llama_chat.pid")
+  end
+
+  def log_file
+    File.join(Dir.tmpdir, "faith_llama_chat.log")
+  end
+
+  def process_alive?(pid)
+    return false unless pid.to_i > 0
+    Process.kill(0, pid.to_i)
+    true
+  rescue StandardError
+    false
+  end
+
+  def existing_pid
+    Integer(File.read(pid_file).strip)
+  rescue StandardError
+    nil
+  end
+
+  def cleanup_stale_pid
+    pid = existing_pid
+    return unless pid.nil? || !process_alive?(pid) || !ready?
+    File.delete(pid_file) if File.file?(pid_file)
+  rescue StandardError
+    nil
+  end
+
+  def validate_files!
+    model = model_path
+    llama = llama_server_path
+    missing = []
+    missing << "#{DEFAULT_MODEL_FILENAME} (set FAITH_LOCAL_MODEL_PATH if it is elsewhere)" if model.empty? || !File.file?(model)
+    missing << "llama-server.exe (place it beside server.rb/bin or set FAITH_LLAMA_SERVER)" if llama.empty? || !File.file?(llama)
+    raise "Faith local chat AI is not configured: #{missing.join('; ')}" unless missing.empty?
+    [llama, model]
+  end
+
+  def build_server_args(llama, model)
+    args = [
+      llama,
+      "--model", model,
+      "--host", DEFAULT_HOST,
+      "--port", port.to_s,
+      "--ctx-size", ENV.fetch("FAITH_LOCAL_CONTEXT", DEFAULT_CONTEXT).to_s
+    ]
+
+    alias_name = ENV["FAITH_LOCAL_AI_MODEL_ALIAS"].to_s.strip
+    args += ["--alias", alias_name] unless alias_name.empty?
+    args
+  end
+
+  def start_process(args)
+    File.open(log_file, "ab") do |file|
+      file.sync = true
+      file.puts("\n=== Faith local CHAT llama-server #{Time.now} ===")
+      file.puts("Command: #{args.join(' ')}")
+    end
+
+    log = File.open(log_file, "ab")
+    log.sync = true
+    spawn_options = Gem.win_platform? ? { new_pgroup: true } : { pgroup: true }
+    begin
+      pid = Process.spawn(*args, out: log, err: log, **spawn_options)
+    ensure
+      log.close
+    end
+    Process.detach(pid)
+    File.write(pid_file, pid.to_s)
+    pid
+  end
+
+  def log_tail(limit = 10_000)
+    return "(no llama-server log was created)" unless File.file?(log_file)
+    File.read(log_file, mode: "rb").to_s.force_encoding("UTF-8").scrub.byteslice(-limit, limit).to_s
+  rescue StandardError => error
+    "(could not read llama-server log: #{error.class}: #{error.message})"
+  end
+
+  def wait_for_ready!(pid, timeout_seconds)
+    deadline = Time.now + timeout_seconds
+    until ready?
+      unless process_alive?(pid)
+        raise "llama-server exited during Faith chat startup (PID #{pid}). Last output:\n#{log_tail}"
+      end
+      if Time.now >= deadline
+        raise "llama-server started (PID #{pid}) but did not become ready on #{base_url} within #{timeout_seconds} seconds. Last output:\n#{log_tail}"
+      end
+      sleep 0.5
+    end
+    true
+  end
+
+  def start!
+    return true if ready?
+    return false if ENV.fetch("FAITH_LOCAL_AUTOSTART", "true").downcase == "false"
+
+    cleanup_stale_pid
+    return true if ready?
+
+    llama, model = validate_files!
+    timeout_seconds = Integer(ENV.fetch("FAITH_LOCAL_START_TIMEOUT", DEFAULT_START_TIMEOUT))
+    args = build_server_args(llama, model)
+    pid = start_process(args)
+    wait_for_ready!(pid, timeout_seconds)
+    true
+  rescue Errno::ENOENT => error
+    raise "Faith could not launch llama-server: #{error.message}. Set FAITH_LLAMA_SERVER to the full path of llama-server.exe."
+  end
+
+  def ensure_running!
+    return true if ready?
+    start!
+  end
+
+  def status
+    {
+      ready: ready?,
+      llama_server: llama_server_path,
+      model: model_path,
+      model_filename: File.basename(model_path.to_s),
+      url: local_url,
+      port: port,
+      pid: existing_pid,
+      pid_alive: process_alive?(existing_pid),
+      log_file: log_file,
+      log_tail: log_tail
+    }
+  end
+end

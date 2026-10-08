@@ -4,6 +4,7 @@ require "bundler/setup"
 require "colorize"
 require "faraday"
 require "json"
+require "net/http"
 require "securerandom"
 require "webrick"
 require "uri"
@@ -11,9 +12,14 @@ require "cgi"
 require "timeout"
 require "time"
 
-API_URL = "https://vireonix.ai/v1/chat/completions"
-# Image understanding is deliberately separated from FaithCore/Vireonix.
-# The visual observer is fully local: FaithVisionObserver launches llama-server when needed.
+FAITH_AI_PROVIDER = ENV.fetch("FAITH_AI_PROVIDER", "local").downcase
+FAITH_LOCAL_AI_URL = ENV.fetch("FAITH_LOCAL_AI_URL", "http://127.0.0.1:8080/v1/chat/completions")
+FAITH_LOCAL_AI_MODEL = ENV.fetch("FAITH_LOCAL_AI_MODEL", "local")
+FAITH_VIREONIX_AI_URL = ENV.fetch("FAITH_VIREONIX_AI_URL", "https://vireonix.ai/v1/chat/completions")
+require_relative "FaithAIProvider"
+# Image understanding is deliberately separated from chat inference.
+# FaithVisionObserver provides visual evidence; Qwen on :8080 is the language backend.
+# The visual observer remains fully local and never owns Faith's conversation.
 require_relative "FaithVisionObserver"
 VISION_MAX_TEXT = Integer(ENV.fetch("FAITH_VISION_MAX_TEXT", "60000"))
 WIKIMEDIA_API_URL = "https://commons.wikimedia.org/w/api.php"
@@ -23,7 +29,7 @@ MODEL = "auto"
 IMAGE_MODEL = ENV.fetch("FAITH_IMAGE_MODEL", "gpt-image-2")
 IMAGE_PROVIDER = ENV.fetch("FAITH_IMAGE_PROVIDER", "perchance").downcase
 PORT = Integer(ENV.fetch("PORT", "4567"))
-FAITH_SERVER_VERSION = "47-finite-source-links"
+FAITH_SERVER_VERSION = "58-qwen-streaming-buffered-media"
 ROOT = File.expand_path(__dir__)
 PUBLIC_DIR = File.join(ROOT, "public")
 GENERATED_DIR = File.join(PUBLIC_DIR, "generated")
@@ -117,8 +123,8 @@ PROMPT
 
 connection = Faraday.new do |faraday|
   faraday.headers["Content-Type"] = "application/json"
-  faraday.options.timeout = 60
-  faraday.options.open_timeout = 10
+  faraday.options.timeout = 600
+  faraday.options.open_timeout = 30
 end
 
 image_connection = Faraday.new do |faraday|
@@ -134,8 +140,10 @@ openai_connection = Faraday.new do |faraday|
 end
 
 
-# Vireonix is the already-working Faith text service. Uploaded images are converted
-# by the local FaithVisionObserver before they ever reach this text-only service.
+# Faith :4567 owns the application and conversation. Qwen :8080 is the private
+# text-generation backend. Uploaded images are first inspected by the local
+# FaithVisionObserver, then their visual observation can be handed to Qwen for
+# the final natural-language Faith response.
 multimodal_connection = Faraday.new do |faraday|
   faraday.headers["Content-Type"] = "application/json"
   faraday.options.timeout = 120
@@ -457,18 +465,15 @@ resolve_image_topic = lambda do |question, answer|
   TEXT
 
   begin
-    response = connection.post(API_URL) do |request|
-      request.body = {
-        model: MODEL,
-        messages: [
-          {
-            role: "system",
-            content: "You are Faith's private image-search topic resolver. Follow the requested output format exactly."
-          },
-          { role: "user", content: resolver_prompt }
-        ]
-      }.to_json
-    end
+    response = FaithAIProvider.chat(
+      connection: connection,
+      model: MODEL,
+      messages: [
+        { role: "system", content: "You are Faith's private image-search topic resolver. Follow the requested output format exactly." },
+        { role: "user", content: resolver_prompt }
+      ],
+      provider: FAITH_AI_PROVIDER
+    )
 
     return "" unless response.success?
 
@@ -734,7 +739,7 @@ end
 #   [[FAITH_SOURCE|base64(url)|base64(title)]] = clickable real source
 #   [[FAITH_MISSING]] = no sufficiently relevant public source was found
 #
-# Source discovery is AI-only. A second internal Vireonix research agent proposes
+# Source discovery is AI-assisted. A bounded internal research pass proposes
 # direct public source URLs from its learned knowledge. Ruby fetches those pages,
 # and the same research agent reviews the actual fetched content before a citation
 # can be emitted. Search engines are deliberately not part of this subsystem.
@@ -798,7 +803,7 @@ end
 # SOURCE DISCOVERY IS AI-ONLY.
 #
 # There is deliberately NO Google/Bing/DuckDuckGo/Yahoo discovery layer here.
-# A second, stateless Vireonix call acts as Faith's research agent. It uses its
+# A second, stateless local-model call acts as Faith's research agent. It uses its
 # own learned knowledge to identify likely real source pages, returns direct URLs
 # it knows about, and the Ruby layer fetches those URLs to verify that they are
 # actually reachable and contain useful material. If the first research pass is
@@ -887,7 +892,7 @@ end
 # -----------------------------------------------------------------------------
 # INTERNAL SOURCE RESEARCHER
 # -----------------------------------------------------------------------------
-# The normal Faith model writes the answer. This separate, stateless Vireonix
+# The normal Faith model writes the answer. This separate, stateless local-model
 # call acts as Faith's research AI: it identifies direct source pages from its own
 # learned knowledge, then evaluates the actual pages Ruby successfully fetched.
 # It never gets to invent a citation marker; only a real fetched URL can become
@@ -901,7 +906,7 @@ research_ai_call = lambda do |system_text, user_text|
     ]
   }.to_json
 
-  response = connection.post(API_URL) { |request| request.body = payload }
+  response = FaithAIProvider.chat(connection: connection, model: MODEL, messages: JSON.parse(payload)["messages"], provider: FAITH_AI_PROVIDER)
   raise "research AI returned HTTP #{response.status}" unless response.success?
 
   text = JSON.parse(response.body).dig("choices", 0, "message", "content").to_s.strip
@@ -1230,8 +1235,9 @@ psychotic_remember_response = lambda do |answer|
 end
 
 ask_ai = lambda do |question, attachment = nil, emotion = nil|
-  # FaithCore/Vireonix is intentionally text-only. Images are converted to a
-  # textual observation by observe_image before this function is called.
+  # The local Qwen backend is intentionally text-only. Images are converted to a
+  # textual observation by observe_image before this function is called. Faith
+  # Ruby remains responsible for all application-level image behavior.
   # Emotional instructions are injected only into the model-facing turn; the
   # actual conversation history keeps the user's original wording unchanged.
   base_user_message = attachment ? attachment[:model_content].to_s : question
@@ -1270,12 +1276,7 @@ ask_ai = lambda do |question, attachment = nil, emotion = nil|
     end
 
     begin
-      response = connection.post(API_URL) do |request|
-        request.body = {
-          model: MODEL,
-          messages: generation_messages
-        }.to_json
-      end
+      response = FaithAIProvider.chat(connection: connection, model: MODEL, messages: generation_messages, provider: FAITH_AI_PROVIDER)
 
       unless response.success?
         last_response_error = "API returned HTTP #{response.status}: #{response.body}"
@@ -1313,7 +1314,7 @@ ask_ai = lambda do |question, attachment = nil, emotion = nil|
 end
 
 # Separate image-understanding stage:
-# browser upload -> stored image -> LOCAL vision model -> text observation -> FaithCore.
+# browser upload -> stored image -> LOCAL vision model -> text observation -> Qwen.
 # No paid vision API and no remote image-review service are used.
 #
 # IMPORTANT: clean up OTHER stale Faith sessions exactly once at startup,
@@ -1340,7 +1341,7 @@ observe_image = lambda do |attachment, question|
 end
 
 # Source/text files are inspected LOCALLY.  Do not send .java/.py/etc. to
-# Vireonix's upload/review router: that router was the source of the
+# A remote upload/review router is not used: local file inspection stays inside Faith.
 # `local_review_unavailable` 503.  Faith can still report useful, concrete facts
 # from the actual bytes without requiring an external file-review API.
 observe_text_file = lambda do |attachment, question|
@@ -1510,7 +1511,8 @@ search_troubleshooting_web = lambda do |question, code_context|
         { role: "system", content: SYSTEM_PROMPT + "\nYou are currently in Troubleshooting mode. Diagnose the supplied source directly." },
         { role: "user", content: fallback_prompt }
       ] }.to_json
-      fallback_response = connection.post(API_URL) { |request| request.body = fallback_payload }
+      fallback_data = JSON.parse(fallback_payload)
+      fallback_response = FaithAIProvider.chat(connection: connection, model: MODEL, messages: fallback_data["messages"], provider: FAITH_AI_PROVIDER)
       if fallback_response.success?
         fallback_answer = JSON.parse(fallback_response.body).dig("choices", 0, "message", "content").to_s.strip
         unless fallback_answer.empty?
@@ -1551,7 +1553,8 @@ search_troubleshooting_web = lambda do |question, code_context|
     response = nil
     3.times do |attempt|
       begin
-        response = connection.post(API_URL) { |request| request.body = diagnosis_payload }
+        diagnosis_data = JSON.parse(diagnosis_payload)
+        response = FaithAIProvider.chat(connection: connection, model: MODEL, messages: diagnosis_data["messages"], provider: FAITH_AI_PROVIDER)
       rescue Faraday::TimeoutError, Faraday::ConnectionFailed => error
         warn "Faith troubleshooting model request attempt #{attempt + 1} failed: #{error.class}: #{error.message}"
         response = nil
@@ -1629,12 +1632,15 @@ fix_code_from_active_session = lambda do |user_request|
   PROMPT
 
   begin
-    response = connection.post(API_URL) do |request|
-      request.body = { model: MODEL, messages: [
+    response = FaithAIProvider.chat(
+      connection: connection,
+      model: MODEL,
+      messages: [
         { role: "system", content: SYSTEM_PROMPT + "\nYou are currently in Coding mode. Modify the user's uploaded source code and return the complete fixed file." },
         { role: "user", content: prompt }
-      ] }.to_json
-    end
+      ],
+      provider: FAITH_AI_PROVIDER
+    )
     unless response.success?
       next { ok: false, error: "The coding model returned HTTP #{response.status}." }
     end
@@ -1671,12 +1677,10 @@ fix_code_from_active_session = lambda do |user_request|
         #{diagnosis[0, 24000]}
       RETRY
       begin
-        retry_response = connection.post(API_URL) do |request|
-          request.body = { model: MODEL, messages: [
+        retry_response = FaithAIProvider.chat(connection: connection, model: MODEL, messages: [
             { role: "system", content: "You are Faith in Coding mode. Return complete source only." },
             { role: "user", content: retry_prompt }
-          ] }.to_json
-        end
+          ], provider: FAITH_AI_PROVIDER)
         if retry_response.success?
           retry_answer = JSON.parse(retry_response.body).dig("choices", 0, "message", "content").to_s
           retry_match = retry_answer.match(/<<<FAITH_CODE_START>>>\s*(.*?)\s*<<<FAITH_CODE_END>>>/m)
@@ -1900,7 +1904,7 @@ end
 
 
 
-# HARD ISOLATION: uploaded text/code files never enter the Vireonix request path.
+# HARD ISOLATION: uploaded text/code files never enter the remote chat path.
 # Browser Base64 is transport-only; prepare_attachment decodes it for storage, while
 # an optional client_text_content is used as the canonical UTF-8 source representation.
 # This endpoint returns a concrete local inspection report with HTTP 200.
@@ -2040,6 +2044,406 @@ server.mount_proc "/api/upload" do |req, res|
   end
 end
 
+# -----------------------------------------------------------------------------
+# DIRECT NORMAL-CHAT RELAY
+# -----------------------------------------------------------------------------
+# Ordinary conversation deliberately takes the shortest possible path:
+# browser :4567 -> this Ruby process -> llama-server :8080 -> back to :4567.
+# It does NOT run image search, source research, troubleshooting search, or any
+# other post-processing before returning the answer to the browser.
+direct_qwen_chat = lambda do |question, emotion, on_delta = nil|
+  # Ordinary chat uses the shortest possible path:
+  # browser :4567 -> this Ruby process -> llama-server :8080 -> back to :4567.
+  # The llama-server request is STREAMING, so the browser can receive Faith's
+  # first tokens as soon as Qwen produces them instead of waiting for the
+  # complete answer.
+  started_at = Time.now
+  uri = URI.parse(FAITH_LOCAL_AI_URL)
+  model_id = ENV.fetch("FAITH_LOCAL_AI_MODEL", "").to_s.strip
+
+  if model_id.empty? || model_id == "local"
+    models_uri = URI.parse("http://#{uri.host}:#{uri.port}/v1/models")
+    models_http = Net::HTTP.new(models_uri.host, models_uri.port)
+    models_http.open_timeout = 3
+    models_http.read_timeout = 5
+    models_response = models_http.get(models_uri.request_uri)
+    model_data = JSON.parse(models_response.body.to_s) rescue {}
+    model_id = model_data.dig("data", 0, "id").to_s.strip
+    model_id = "local" if model_id.empty?
+  end
+
+  emotional_hint = case emotion
+                   when :greeting then "Be warm and welcoming."
+                   when :sad then "Be gentle and supportive."
+                   when :robotic then "Be clear and analytical."
+                   when :psychotic then "Be unusual and unsettling, but still answer the question clearly."
+                   else "Be helpful and natural."
+                   end
+
+  payload = {
+    model: model_id,
+    messages: [
+      { role: "system", content: "You are Faith, a helpful local assistant. #{emotional_hint}" },
+      { role: "user", content: question.to_s }
+    ],
+    stream: true,
+    max_tokens: 384,
+    temperature: 0.7
+  }
+
+  http = Net::HTTP.new(uri.host, uri.port)
+  http.open_timeout = 15
+  http.read_timeout = 300
+  http.write_timeout = 30 if http.respond_to?(:write_timeout=)
+
+  request = Net::HTTP::Post.new(uri.request_uri)
+  request["Content-Type"] = "application/json"
+  request["Accept"] = "text/event-stream"
+  request["Connection"] = "keep-alive"
+  request.body = JSON.generate(payload)
+
+  answer_parts = []
+  parse_buffer = +""
+
+  warn "[Faith Qwen Relay] STREAM SEND :4567 -> #{FAITH_LOCAL_AI_URL} model=#{model_id.inspect} question=#{question.inspect}"
+
+  response = nil
+  http.request(request) do |stream_response|
+    response = stream_response
+
+    unless stream_response.is_a?(Net::HTTPSuccess)
+      body = +""
+      stream_response.read_body { |chunk| body << chunk.to_s }
+      raise "Qwen returned HTTP #{stream_response.code}: #{body}"
+    end
+
+    stream_response.read_body do |chunk|
+      parse_buffer << chunk.to_s
+
+      # OpenAI-compatible streaming responses are SSE lines separated by a
+      # blank line. Keep incomplete lines in parse_buffer for the next chunk.
+      while (newline = parse_buffer.index("\n"))
+        line = parse_buffer.slice!(0, newline + 1).to_s.strip
+        next if line.empty? || line.start_with?(":")
+        next unless line.start_with?("data:")
+
+        data_text = line.sub(/\Adata:\s*/, "")
+        break if data_text == "[DONE]"
+
+        begin
+          event = JSON.parse(data_text)
+          delta = event.dig("choices", 0, "delta", "content").to_s
+          delta = event.dig("choices", 0, "message", "content").to_s if delta.empty?
+          next if delta.empty?
+
+          answer_parts << delta
+          on_delta.call(delta) if on_delta
+        rescue JSON::ParserError
+          # A partial/non-JSON SSE line is ignored; llama-server will continue
+          # sending the remaining stream. This keeps the browser connection alive.
+        end
+      end
+    end
+  end
+
+  answer = answer_parts.join.gsub(/!\[[^\]]*\]\([^)]*\)/, "").gsub(/\n{3,}/, "\n\n").strip
+  raise "Qwen returned an empty streamed response." if answer.empty?
+
+  elapsed = ((Time.now - started_at) * 1000).round
+  warn "[Faith Qwen Relay] STREAM RECV :8080 -> :4567 HTTP #{response&.code} #{elapsed}ms #{answer.bytesize} bytes"
+
+  mutex.synchronize do
+    messages << { role: "user", content: question.to_s }
+    messages << { role: "assistant", content: answer }
+    max_history = 25
+    if messages.length > max_history + 1
+      system_message = messages.first
+      messages.replace([system_message] + messages[1..].last(max_history))
+    end
+  end
+
+  answer
+end
+
+# Image-generation phrases are NEVER sent to the direct Qwen chat relay.
+# Faith's existing /api/chat generation path handles these so Perchance/Pollinations
+# and the Painting expression remain intact. Keep this deliberately strict because
+# prompts such as "paint a sunset" and "generate a castle" may not contain the word
+# "image" at all.
+special_image_phrase = lambda do |question|
+  text = question.to_s
+  text.match?(/\bpaint\s+a\b/i) || text.match?(/\bgenerate\s+a\b/i)
+end
+
+# True only for ordinary text conversation. This helper is also used inside
+# /api/chat so an older/cached browser JavaScript file still reaches the same
+# direct Qwen pipe instead of falling into Faith's larger processing pipeline.
+simple_normal_chat_question = lambda do |question, raw_file = nil|
+  return false unless raw_file.nil?
+  text = question.to_s
+  return false if text.strip.empty?
+  return false if special_image_phrase.call(text)
+  return false if text.match?(/\b(?:generate|create|draw|paint|make)\b[\s\S]*\b(?:image|picture|photo|art)\b/i)
+  return false if text.match?(/\b(?:upload|file|code|debug|troubleshoot|troubleshooting|source research|research the web)\b/i)
+  true
+end
+
+server.mount_proc "/api/qwen-chat" do |req, res|
+  unless req.request_method == "POST"
+    json_response.call(res, 405, { error: "POST required." })
+    next
+  end
+
+  begin
+    payload = JSON.parse(req.body.to_s)
+    question = payload["question"].to_s.strip
+    raise "Empty question." if question.empty?
+
+    if special_image_phrase.call(question) || generate_image_request.call(question)
+      json_response.call(res, 409, {
+        error: "Image-generation requests must use Faith's image-generation path.",
+        special_request: true,
+        route: "/api/chat"
+      })
+      next
+    end
+
+    emotion = emotion_state.call(question)
+
+    # This endpoint is a real Server-Sent Events stream. Qwen/llama-server
+    # produces token deltas -> Ruby forwards them immediately -> the browser
+    # paints them immediately. Faith no longer waits for the whole answer before
+    # the user sees anything.
+    res.status = 200
+    res["Content-Type"] = "text/event-stream; charset=utf-8"
+    res["Cache-Control"] = "no-cache, no-store, must-revalidate"
+    res["Pragma"] = "no-cache"
+    res["Connection"] = "keep-alive"
+    res["X-Accel-Buffering"] = "no"
+    res["X-Faith-Server-Version"] = FAITH_SERVER_VERSION
+    res["X-Faith-Qwen-Relay"] = "direct-stream"
+    res.chunked = true
+
+    res.body = proc do |out|
+      write_event = lambda do |event|
+        out.write("data: #{JSON.generate(event)}\n\n")
+      end
+
+      begin
+        write_event.call({ type: "status", message: "Connected to local Qwen stream." })
+
+        answer = direct_qwen_chat.call(question, emotion, lambda do |delta|
+          write_event.call({ type: "delta", text: delta })
+        end)
+
+        # The complete text is available now. Send this event BEFORE any
+        # Wikimedia/source post-processing so the browser can finalize the
+        # visible Faith message immediately even if post-processing is slower.
+        expression = (emotion || (greeting_question.call(question) ? :greeting : :explanation)).to_s
+        write_event.call({
+          type: "text_complete",
+          answer: answer,
+          expression: expression,
+          emotion: emotion&.to_s,
+          session_mode: "idle"
+        })
+
+        # Wikimedia enrichment is deliberately decoupled from the Qwen answer.
+        # The answer is already visible in the browser at this point. Search
+        # Wikimedia in a separate thread and push the results as their own SSE
+        # event so a slow topic resolver or Wikimedia request can NEVER make
+        # the Qwen response appear frozen.
+        images = []
+        image_mode = "none"
+        image_thread = nil
+        image_thread_error = nil
+        unless special_image_phrase.call(question) || troubleshooting_request.call(question)
+          image_thread = Thread.new do
+            begin
+              warn "[Faith Images] Async Wikimedia enrichment started."
+              found_images = search_images.call(question, answer)
+              found_mode = found_images.empty? ? "none" : "wikimedia"
+              images = found_images
+              image_mode = found_mode
+              write_event.call({ type: "images", images: found_images, image_mode: found_mode })
+              warn "[Faith Images] Async Wikimedia enrichment complete (#{found_images.length} image(s))."
+            rescue StandardError => error
+              image_thread_error = error
+              images = []
+              image_mode = "none"
+              warn "[Faith Images] Async Wikimedia search failed: #{error.class}: #{error.message}"
+              write_event.call({ type: "images", images: [], image_mode: "none" })
+            end
+          end
+        end
+
+        source_job_id = nil
+        if sourceable_answer_request.call(question)
+          source_job_id = SecureRandom.hex(12)
+          original_answer = answer.to_s.dup
+          source_research_jobs_mutex.synchronize do
+            source_research_jobs[source_job_id] = {
+              status: "queued",
+              question: question.to_s,
+              answer: original_answer,
+              sourced_answer: nil,
+              error: nil,
+              started_at: Time.now.utc.iso8601,
+              completed_at: nil
+            }
+          end
+
+          Thread.new(source_job_id, question.to_s, original_answer) do |job_id, research_question, completed_answer|
+            begin
+              source_research_jobs_mutex.synchronize do
+                source_research_jobs[job_id][:status] = "researching" if source_research_jobs[job_id]
+              end
+              warn "[Faith Sources] Post-Qwen research started for job #{job_id}."
+
+              sourced_answer = source_factual_answer.call(research_question, completed_answer)
+
+              source_research_jobs_mutex.synchronize do
+                if source_research_jobs[job_id]
+                  source_research_jobs[job_id][:status] = "complete"
+                  source_research_jobs[job_id][:sourced_answer] = sourced_answer
+                  source_research_jobs[job_id][:completed_at] = Time.now.utc.iso8601
+                end
+              end
+              warn "[Faith Sources] Post-Qwen research complete for job #{job_id}."
+            rescue StandardError => error
+              source_research_jobs_mutex.synchronize do
+                if source_research_jobs[job_id]
+                  source_research_jobs[job_id][:status] = "failed"
+                  source_research_jobs[job_id][:error] = "#{error.class}: #{error.message}"
+                  source_research_jobs[job_id][:completed_at] = Time.now.utc.iso8601
+                end
+              end
+              warn "[Faith Sources] Post-Qwen research failed: #{error.class}: #{error.message}"
+            end
+          end
+        end
+
+        # Keep the SSE connection open only long enough for the independent
+        # Wikimedia job to publish its result. This does NOT delay Qwen text: the
+        # browser has already received text_complete and is displaying it.
+        image_thread.join if image_thread
+
+        write_event.call({
+          type: "done",
+          answer: answer,
+          expression: expression,
+          emotion: emotion&.to_s,
+          session_mode: "idle",
+          images: images,
+          image_prompt: nil,
+          image_mode: image_mode,
+          image_generation_available: false,
+          image_request: false,
+          source_research_job_id: source_job_id,
+          source_research_status: source_job_id ? "researching" : "none"
+        })
+      rescue StandardError => error
+        warn "[Faith Qwen Relay] STREAM ERROR: #{error.class}: #{error.message}"
+        write_event.call({
+          type: "error",
+          error: "Faith could not get a response from local Qwen.",
+          detail: error.message,
+          backend: FAITH_LOCAL_AI_URL
+        })
+      end
+    end
+  rescue JSON::ParserError
+    json_response.call(res, 400, { error: "Invalid JSON request." })
+  rescue StandardError => error
+    warn "[Faith Qwen Relay] ERROR: #{error.class}: #{error.message}"
+    json_response.call(res, 503, {
+      error: "Faith could not get a response from local Qwen.",
+      detail: error.message,
+      backend: FAITH_LOCAL_AI_URL
+    })
+  end
+end
+
+
+# -----------------------------------------------------------------------------
+# DEDICATED IMAGE-GENERATION ENDPOINT
+# -----------------------------------------------------------------------------
+# Image-generation requests have their own route so they can NEVER be mistaken
+# for ordinary Qwen conversation.  This endpoint intentionally does not call
+# direct_qwen_chat, FaithAIProvider, or /v1/chat/completions.
+server.mount_proc "/api/imagegen" do |req, res|
+  unless req.request_method == "POST"
+    json_response.call(res, 405, { error: "POST required." })
+    next
+  end
+
+  begin
+    payload = JSON.parse(req.body.to_s)
+    question = payload["question"].to_s.strip
+    raise "Empty image-generation request." if question.empty?
+
+    unless generate_image_request.call(question)
+      json_response.call(res, 400, {
+        error: "This endpoint is reserved for image-generation requests.",
+        route: "/api/qwen-chat"
+      })
+      next
+    end
+
+    warn "[Faith Image Relay] IMAGE ONLY :4567 -> image generator question=#{question[0, 120].inspect}"
+
+    images = generate_image.call(question)
+    image_prompt = nil
+    image_mode = "generated"
+
+    if images.empty?
+      image_prompt = extract_visual_prompt.call(question)
+      image_prompt = fallback_image_topic.call(question) if image_prompt.to_s.length < 3
+      image_mode = image_prompt.to_s.length >= 3 ? "generated-pending" : "none"
+      warn "[Faith Image Relay] Server image generation unavailable; returning browser fallback prompt."
+    else
+      warn "[Faith Image Relay] Generated #{images.length} image(s) successfully."
+    end
+
+    generation_available = if IMAGE_PROVIDER == "perchance"
+      true
+    else
+      !ENV["OPENAI_API_KEY"].to_s.strip.empty?
+    end
+
+    res["X-Faith-Server-Version"] = FAITH_SERVER_VERSION
+    res["X-Faith-Qwen-Relay"] = "not-used"
+    res["X-Faith-Image-Relay"] = "direct"
+    json_response.call(res, 200, {
+      answer: "",
+      expression: "painting",
+      emotion: nil,
+      session_mode: "idle",
+      images: images,
+      image_prompt: image_prompt,
+      image_resolution: ENV.fetch("FAITH_IMAGE_RESOLUTION", "768x768"),
+      image_guidance: ENV.fetch("FAITH_IMAGE_GUIDANCE_SCALE", "7"),
+      image_seed: -1,
+      image_mode: image_mode,
+      image_generation_available: generation_available,
+      image_request: true,
+      source_research_job_id: nil,
+      source_research_status: "none"
+    })
+  rescue JSON::ParserError
+    json_response.call(res, 400, { error: "Invalid JSON request." })
+  rescue StandardError => error
+    warn "[Faith Image Relay] ERROR: #{error.class}: #{error.message}"
+    res["X-Faith-Server-Version"] = FAITH_SERVER_VERSION
+    res["X-Faith-Qwen-Relay"] = "not-used"
+    res["X-Faith-Image-Relay"] = "direct"
+    json_response.call(res, 503, {
+      error: "Faith's image generator could not complete the request.",
+      detail: error.message
+    })
+  end
+end
+
 server.mount_proc "/api/chat" do |req, res|
   unless req.request_method == "POST"
     json_response.call(res, 405, { error: "POST required." })
@@ -2050,6 +2454,33 @@ server.mount_proc "/api/chat" do |req, res|
     payload = JSON.parse(req.body.to_s)
     question = payload["question"].to_s.strip
     raw_file = payload["file"]
+
+    # HARD ROUTING RULE: image-generation requests are NEVER eligible for the
+    # direct Qwen compatibility path.  This protects old/cached /api/chat clients
+    # as well as the current frontend.  They continue into Faith's image path.
+    image_generation_compat = raw_file.nil? && generate_image_request.call(question)
+
+    # Compatibility guard: if the browser is still calling /api/chat, ordinary
+    # conversation MUST use the exact same direct Qwen path.  Image generation,
+    # coding, troubleshooting, uploads, and photo requests are explicitly excluded.
+    if !image_generation_compat && simple_normal_chat_question.call(question, raw_file)
+      emotion = emotion_state.call(question)
+      answer = direct_qwen_chat.call(question, emotion)
+      res["X-Faith-Server-Version"] = FAITH_SERVER_VERSION
+      res["X-Faith-Qwen-Relay"] = "direct"
+      json_response.call(res, 200, {
+        answer: answer,
+        expression: (emotion || (greeting_question.call(question) ? :greeting : :explanation)).to_s,
+        emotion: emotion&.to_s,
+        session_mode: "idle",
+        images: [],
+        image_prompt: nil,
+        image_mode: "none",
+        image_generation_available: false,
+        image_request: false
+      })
+      next
+    end
     raw_file["question"] = question if raw_file.is_a?(Hash)
     attachment = prepare_attachment.call(raw_file)
 
@@ -2087,6 +2518,82 @@ server.mount_proc "/api/chat" do |req, res|
                       else
                         "explanation"
                       end
+
+    # NORMAL CHAT: take the direct relay path and return immediately.
+    # Specialized requests continue through Faith's existing image,
+    # troubleshooting, upload, and coding paths below.
+    active_special_session = mutex.synchronize { troubleshooting_active || coding_active }
+    if attachment.nil? && !generated_request && !direct_photo && !active_special_session && !troubleshooting_request.call(observation_question)
+      begin
+        # Compatibility path for an older/cached frontend. It must behave exactly
+        # like /api/qwen-chat, including Wikimedia enrichment and post-answer
+        # source research, rather than silently dropping Faith's special features.
+        answer = direct_qwen_chat.call(observation_question, emotion)
+
+        images = []
+        image_mode = "none"
+        begin
+          images = search_images.call(observation_question, answer)
+          image_mode = images.empty? ? "none" : "wikimedia"
+        rescue StandardError => error
+          warn "[Faith Images] Compatibility post-Qwen search failed: #{error.class}: #{error.message}"
+        end
+
+        source_job_id = nil
+        if sourceable_answer_request.call(observation_question)
+          source_job_id = SecureRandom.hex(12)
+          original_answer = answer.to_s.dup
+          source_research_jobs_mutex.synchronize do
+            source_research_jobs[source_job_id] = {
+              status: "queued", question: observation_question.to_s, answer: original_answer,
+              sourced_answer: nil, error: nil, started_at: Time.now.utc.iso8601, completed_at: nil
+            }
+          end
+          Thread.new(source_job_id, observation_question.to_s, original_answer) do |job_id, research_question, completed_answer|
+            begin
+              source_research_jobs_mutex.synchronize { source_research_jobs[job_id][:status] = "researching" if source_research_jobs[job_id] }
+              warn "[Faith Sources] Compatibility post-Qwen research started for job #{job_id}."
+              sourced_answer = source_factual_answer.call(research_question, completed_answer)
+              source_research_jobs_mutex.synchronize do
+                if source_research_jobs[job_id]
+                  source_research_jobs[job_id][:status] = "complete"
+                  source_research_jobs[job_id][:sourced_answer] = sourced_answer
+                  source_research_jobs[job_id][:completed_at] = Time.now.utc.iso8601
+                end
+              end
+              warn "[Faith Sources] Compatibility post-Qwen research complete for job #{job_id}."
+            rescue StandardError => error
+              source_research_jobs_mutex.synchronize do
+                if source_research_jobs[job_id]
+                  source_research_jobs[job_id][:status] = "failed"
+                  source_research_jobs[job_id][:error] = "#{error.class}: #{error.message}"
+                  source_research_jobs[job_id][:completed_at] = Time.now.utc.iso8601
+                end
+              end
+              warn "[Faith Sources] Compatibility post-Qwen research failed: #{error.class}: #{error.message}"
+            end
+          end
+        end
+
+        res["X-Faith-Server-Version"] = FAITH_SERVER_VERSION
+        res["X-Faith-Qwen-Relay"] = "direct"
+        json_response.call(res, 200, {
+          answer: answer, source_research_job_id: source_job_id,
+          source_research_status: source_job_id ? "researching" : "none",
+          expression: expression_name, emotion: emotion&.to_s, session_mode: "idle",
+          fix_code_available: false, images: images, image_prompt: nil,
+          image_resolution: ENV.fetch("FAITH_IMAGE_RESOLUTION", "768x768"),
+          image_guidance: ENV.fetch("FAITH_IMAGE_GUIDANCE_SCALE", "7"), image_seed: -1,
+          image_mode: image_mode, image_generation_available: false, image_request: false
+        })
+      rescue StandardError => error
+        warn "[Faith Qwen Relay] ERROR: #{error.class}: #{error.message}"
+        res["X-Faith-Server-Version"] = FAITH_SERVER_VERSION
+        res["X-Faith-Qwen-Relay"] = "direct"
+        json_response.call(res, 503, { error: "Faith could not get a response from local Qwen.", detail: error.message, backend: FAITH_LOCAL_AI_URL })
+      end
+      next
+    end
 
     # Anger is a deliberate hard-stop: Faith should not carry out an otherwise
     # valid request when the user delivers it in the aggressive form that triggered
@@ -2249,30 +2756,38 @@ server.mount_proc "/api/chat" do |req, res|
     end
 
     if attachment && attachment[:image]
-      # The visual observer is the source of truth for uploaded images.
-      # Do NOT pass the observation through FaithCore first: FaithCore can
-      # legally/technically answer as though it has no image, which was causing
-      # the generic "I don't have a detailed visual breakdown" response.
-      answer = observation.to_s.strip
-      answer = "I received the image, but the visual observation service did not return an image description. Please retry." if answer.empty?
-
-      mutex.synchronize do
-        messages << { role: "assistant", content: answer }
-      end
+      # The vision model supplies evidence; Qwen supplies Faith's natural-language
+      # response. This keeps one conversation path on :4567 while still preserving
+      # the specialized local image-understanding subsystem.
+      answer = ask_ai.call(observation_question, attachment, nil)
     elsif attachment && attachment[:text_content]
-      # Source/text files use the independent file observer and never go through
-      # FaithCore's raw-upload/local-review route.
-      answer = observe_text_file.call(attachment, observation_question)
+      # Source/text files are inspected locally first. The resulting observation is
+      # then handed to the same Qwen language backend used for ordinary chat.
+      file_observation = observe_text_file.call(attachment, observation_question)
+
+      attachment[:model_content] = <<~FILE_OBSERVATION
+        FAITH FILE INPUT
+
+        The user uploaded the file "#{attachment[:name]}".
+
+        USER REQUEST:
+        #{observation_question}
+
+        LOCAL FILE OBSERVATION:
+        #{file_observation}
+
+        Treat the LOCAL FILE OBSERVATION as the information Faith has extracted from
+        the uploaded file. Respond naturally as Faith using those actual contents.
+        Do not claim to have inspected bytes or details that are not present in the
+        supplied observation.
+      FILE_OBSERVATION
 
       attachment[:history_content] = <<~HISTORY.strip
         [Uploaded #{attachment[:name]} (#{attachment[:mime]}, #{attachment[:size]} bytes).
-        Faith's file observation: #{answer}]
+        Faith's file observation: #{file_observation}]
       HISTORY
 
-      mutex.synchronize do
-        messages << { role: "user", content: attachment[:history_content] }
-        messages << { role: "assistant", content: answer }
-      end
+      answer = ask_ai.call(observation_question, attachment, nil)
     elsif troubleshooting_request.call(observation_question)
       set_troubleshooting = true
       was_already_troubleshooting = mutex.synchronize { troubleshooting_active }
@@ -2475,7 +2990,7 @@ server.mount_proc "/api/chat" do |req, res|
     warn "Faith optional vision model missing: #{error.message}"
     json_response.call(res, 424, vision_missing_payload.call(error))
   rescue StandardError => error
-    warn "FaithCore error: #{error.class}: #{error.message}"
+    warn "Faith local chat error: #{error.class}: #{error.message}"
     json_response.call(res, 500, { error: error.message })
   end
 end
@@ -2625,7 +3140,7 @@ end
 puts " ".red
 puts "Faith Web AI".red
 puts "Model: #{MODEL}".red
-puts "Powered by Vireonix".red
+puts "Chat backend: local Qwen2 via #{FAITH_LOCAL_AI_URL}".red
 puts "Images: Wikimedia Commons".red
 puts "AI images: #{IMAGE_PROVIDER == "perchance" ? "Perchance" : (ENV["OPENAI_API_KEY"].to_s.empty? ? "disabled (set OPENAI_API_KEY)" : IMAGE_MODEL)}".red
 puts
