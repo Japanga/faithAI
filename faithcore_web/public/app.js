@@ -61,6 +61,7 @@ const uploadStatus = document.getElementById("upload-status");
 
 let busy = false;
 let sessionMode = "idle";
+let pendingCodeFile = null;
 
 // These are the exact two local vision files Faith requires. They are kept in
 // the browser client as a final fallback so even an older/stale Faith server
@@ -1116,7 +1117,7 @@ function addFixCodeButton(messageItem) {
   messageItem.appendChild(wrap);
 }
 
-async function uploadFileToFaith(file) {
+async function uploadFileToFaith(file, suppliedQuestion = null) {
   if (busy || !file) return;
 
   const maxBytes = 12 * 1024 * 1024;
@@ -1127,9 +1128,20 @@ async function uploadFileToFaith(file) {
     return;
   }
 
-  const question = input.value.trim();
+  const question = suppliedQuestion === null ? input.value.trim() : String(suppliedQuestion || "").trim();
   input.value = "";
   const isImageUpload = String(file.type || "").toLowerCase().startsWith("image/");
+
+  // Source code is staged like a chat attachment: selecting it alone must not
+  // send it or start analysis. The next user message sends file + comment.
+  if (!isImageUpload && !question) {
+    pendingCodeFile = file;
+    setUploadStatus(`Attached: ${file.name} — add a message to send`, false);
+    appendAttachmentMessage("You", file, { status: "Attached — add your comment and press Send" });
+    setExpression("thinking", "Code attached — waiting for your message");
+    return;
+  }
+  if (!isImageUpload) pendingCodeFile = null;
 
   setUploadStatus(`Selected: ${file.name}`);
   setBusy(true);
@@ -1246,6 +1258,14 @@ async function uploadFileToFaith(file) {
       const parentMessage = lastUploadCard.closest(".message");
       const messageText = parentMessage && parentMessage.querySelector(".message-text");
       if (messageText) messageText.textContent = "Sent to Faith for analysis";
+    }
+
+    // If the user's attachment comment explicitly starts Troubleshooting,
+    // skip the upload-observer answer and hand the stored source directly to
+    // the coding GGUF stream. Otherwise, simply attach/read the file as normal.
+    if (!isImageUpload && /\b(?:troubleshoot|troubleshooting|debug|debugging)\b/i.test(question)) {
+      await runCoderTroubleshooting(question);
+      return;
     }
 
     appendMessage(
@@ -1398,6 +1418,84 @@ async function runQwenPostEnrichment(messageItem, question, answer, wikimediaPro
   void Promise.allSettled([wikimediaTask, sourcesTask]);
 }
 
+async function runCoderTroubleshooting(question) {
+  // Publish progress as a real Faith chat reply immediately, then update that
+  // same bubble with each server status and finally stream the generated answer
+  // into it. Users can see the long-running processing stage in the transcript.
+  let faithItem = appendMessage("Faith", "Connecting to Faith's coding model...", "ai");
+  const showProgress = (message) => {
+    const node = faithItem && faithItem.querySelector(".message-text");
+    if (node) node.innerHTML = formatFaithMessage(message);
+    chat.scrollTop = chat.scrollHeight;
+  };
+  showProgress("Connecting to Faith's coding model...");
+  const response = await fetch("/api/coder-troubleshoot", {
+    method: "POST",
+    headers: { "Content-Type": "application/json", "Accept": "text/event-stream", "Cache-Control": "no-cache" },
+    cache: "no-store",
+    body: JSON.stringify({ question })
+  });
+  if (!response.ok) {
+    let data = {};
+    try { data = await response.json(); } catch (_) {}
+    throw new Error(data.error || `Coding service HTTP ${response.status}`);
+  }
+  if (!response.body) throw new Error("The browser could not open the coding stream.");
+  const reader = response.body.getReader();
+  const decoder = new TextDecoder();
+  let buffer = "";
+  let answer = "";
+  let startedCoding = false;
+  setExpression("troubleshooting", "Connecting to coding GGUF...");
+  const consume = (raw) => {
+    const line = raw.trim();
+    if (!line.startsWith("data:")) return;
+    let event;
+    try { event = JSON.parse(line.slice(5).trim()); } catch (_) { return; }
+    if (event.type === "status") {
+      // The progress is visible both in Faith's expression and as a chat reply.
+      if (event.phase === "processing") {
+        const message = event.message || "Processing source with the coding GGUF...";
+        setExpression("troubleshooting", message);
+        if (!startedCoding) showProgress(message);
+      }
+      if (event.phase === "connecting") {
+        const message = event.message || "Connecting...";
+        setExpression("troubleshooting", message);
+        if (!startedCoding) showProgress(message);
+      }
+      if (event.phase === "coding" && !startedCoding) {
+        startedCoding = true;
+        setExpression("coding", "Coding response received...");
+      }
+    } else if (event.type === "delta" && event.text) {
+      if (!startedCoding) { startedCoding = true; setExpression("coding", "Coding..."); }
+      answer += event.text;
+      const node = faithItem && faithItem.querySelector(".message-text");
+      if (node) node.innerHTML = formatFaithMessage(answer);
+      chat.scrollTop = chat.scrollHeight;
+    } else if (event.type === "error") {
+      throw new Error(event.error || "Coding model failed.");
+    } else if (event.type === "done") {
+      sessionMode = "troubleshooting";
+      setExpression("coding", "Troubleshooting response complete");
+    }
+  };
+  while (true) {
+    const { value, done } = await reader.read();
+    if (done) break;
+    buffer += decoder.decode(value, { stream: true });
+    let boundary;
+    while ((boundary = buffer.indexOf("\n\n")) >= 0) {
+      const frame = buffer.slice(0, boundary);
+      buffer = buffer.slice(boundary + 2);
+      frame.split("\n").forEach(consume);
+    }
+  }
+  if (!answer.trim()) throw new Error("The coding server completed without returning a diagnosis.");
+  return answer;
+}
+
 async function submitQuestion() {
   if (busy) return;
 
@@ -1406,6 +1504,19 @@ async function submitQuestion() {
 
   input.value = "";
   appendMessage("You", question, "you");
+
+  // A staged source attachment is sent together with this comment, never on
+  // file selection. The user explicitly chooses whether to troubleshoot it.
+  if (pendingCodeFile) {
+    const stagedFile = pendingCodeFile;
+    try {
+      await uploadFileToFaith(stagedFile, question);
+    } finally {
+      setBusy(false);
+      input.focus();
+    }
+    return;
+  }
 
   // In an active troubleshooting session, natural requests such as
   // “can you fix the code yourself?” are the same action as the Fix Code button.
@@ -1448,6 +1559,22 @@ async function submitQuestion() {
   setBusy(true);
   const isTroubleshootingPrompt = /\b(?:troubleshoot|troubleshooting|debug|debugging)\b/i.test(question);
   setExpression(isTroubleshootingPrompt ? "troubleshooting" : "thinking");
+
+  // Explicit Troubleshooting requests use the dedicated :8090 coding GGUF.
+  // Keep the visual loader active during model processing, then switch to the
+  // Coding expression as soon as the first generated token arrives.
+  if (isTroubleshootingPrompt) {
+    try {
+      await runCoderTroubleshooting(question);
+    } catch (error) {
+      setExpression("troubleshooting", "Coding service unavailable");
+      appendMessage("Error", error.message, "error");
+    } finally {
+      setBusy(false);
+      input.focus();
+    }
+    return;
+  }
 
   // Do NOT show an image-generation message until the server confirms that
   // this is actually an image-generation request. Normal chat and real-photo
