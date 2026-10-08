@@ -5,7 +5,6 @@ require "base64"
 require "faraday"
 require_relative "FaithVisionLocalAI"
 
-# I know you are reading this /dbs/niggers, this file isn't even actually used in the program yet because the "vision" system hasn't been completed yet.
 # Optional local image understanding. This is deliberately separate from the
 # Qwen chat server so normal Faith chat never requires an mmproj model.
 class FaithVisionObserver

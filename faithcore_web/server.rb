@@ -29,7 +29,7 @@ MODEL = "auto"
 IMAGE_MODEL = ENV.fetch("FAITH_IMAGE_MODEL", "gpt-image-2")
 IMAGE_PROVIDER = ENV.fetch("FAITH_IMAGE_PROVIDER", "perchance").downcase
 PORT = Integer(ENV.fetch("PORT", "4567"))
-FAITH_SERVER_VERSION = "58-qwen-streaming-buffered-media"
+FAITH_SERVER_VERSION = "63-parallel-wikimedia-during-qwen"
 ROOT = File.expand_path(__dir__)
 PUBLIC_DIR = File.join(ROOT, "public")
 GENERATED_DIR = File.join(PUBLIC_DIR, "generated")
@@ -506,7 +506,16 @@ search_images = lambda do |question, answer = ""|
 
   explicit_photo = photo_request.call(question)
 
-  topic = resolve_image_topic.call(question, answer)
+  # PRE-ANSWER SEARCH: when Qwen has not produced any text yet, do not spend
+  # the early search window waiting for another Qwen call just to resolve a
+  # topic. Build a deterministic Commons query immediately from the user's
+  # words. If that fast pass fails, the normal AI topic resolver gets a chance.
+  topic = if answer.to_s.strip.empty?
+    fallback_image_topic.call(question)
+  else
+    resolve_image_topic.call(question, answer)
+  end
+  topic = resolve_image_topic.call(question, answer) if topic.to_s.length < 3
   topic = fallback_image_topic.call(question) if topic.to_s.empty?
 
   return [] if topic.to_s.length < 3
@@ -2248,99 +2257,24 @@ server.mount_proc "/api/qwen-chat" do |req, res|
           session_mode: "idle"
         })
 
-        # Wikimedia enrichment is deliberately decoupled from the Qwen answer.
-        # The answer is already visible in the browser at this point. Search
-        # Wikimedia in a separate thread and push the results as their own SSE
-        # event so a slow topic resolver or Wikimedia request can NEVER make
-        # the Qwen response appear frozen.
-        images = []
-        image_mode = "none"
-        image_thread = nil
-        image_thread_error = nil
-        unless special_image_phrase.call(question) || troubleshooting_request.call(question)
-          image_thread = Thread.new do
-            begin
-              warn "[Faith Images] Async Wikimedia enrichment started."
-              found_images = search_images.call(question, answer)
-              found_mode = found_images.empty? ? "none" : "wikimedia"
-              images = found_images
-              image_mode = found_mode
-              write_event.call({ type: "images", images: found_images, image_mode: found_mode })
-              warn "[Faith Images] Async Wikimedia enrichment complete (#{found_images.length} image(s))."
-            rescue StandardError => error
-              image_thread_error = error
-              images = []
-              image_mode = "none"
-              warn "[Faith Images] Async Wikimedia search failed: #{error.class}: #{error.message}"
-              write_event.call({ type: "images", images: [], image_mode: "none" })
-            end
-          end
-        end
-
-        source_job_id = nil
-        if sourceable_answer_request.call(question)
-          source_job_id = SecureRandom.hex(12)
-          original_answer = answer.to_s.dup
-          source_research_jobs_mutex.synchronize do
-            source_research_jobs[source_job_id] = {
-              status: "queued",
-              question: question.to_s,
-              answer: original_answer,
-              sourced_answer: nil,
-              error: nil,
-              started_at: Time.now.utc.iso8601,
-              completed_at: nil
-            }
-          end
-
-          Thread.new(source_job_id, question.to_s, original_answer) do |job_id, research_question, completed_answer|
-            begin
-              source_research_jobs_mutex.synchronize do
-                source_research_jobs[job_id][:status] = "researching" if source_research_jobs[job_id]
-              end
-              warn "[Faith Sources] Post-Qwen research started for job #{job_id}."
-
-              sourced_answer = source_factual_answer.call(research_question, completed_answer)
-
-              source_research_jobs_mutex.synchronize do
-                if source_research_jobs[job_id]
-                  source_research_jobs[job_id][:status] = "complete"
-                  source_research_jobs[job_id][:sourced_answer] = sourced_answer
-                  source_research_jobs[job_id][:completed_at] = Time.now.utc.iso8601
-                end
-              end
-              warn "[Faith Sources] Post-Qwen research complete for job #{job_id}."
-            rescue StandardError => error
-              source_research_jobs_mutex.synchronize do
-                if source_research_jobs[job_id]
-                  source_research_jobs[job_id][:status] = "failed"
-                  source_research_jobs[job_id][:error] = "#{error.class}: #{error.message}"
-                  source_research_jobs[job_id][:completed_at] = Time.now.utc.iso8601
-                end
-              end
-              warn "[Faith Sources] Post-Qwen research failed: #{error.class}: #{error.message}"
-            end
-          end
-        end
-
-        # Keep the SSE connection open only long enough for the independent
-        # Wikimedia job to publish its result. This does NOT delay Qwen text: the
-        # browser has already received text_complete and is displaying it.
-        image_thread.join if image_thread
-
+        # Qwen is finished. Do NOT fetch Wikimedia or start source research on
+        # this request. The browser must receive `done` immediately so the chat
+        # unlocks and Faith can return to Explanation mode. Post-answer
+        # enrichment is handled by /api/qwen-enrichment after the stream closes.
         write_event.call({
           type: "done",
           answer: answer,
           expression: expression,
           emotion: emotion&.to_s,
           session_mode: "idle",
-          images: images,
+          images: [],
           image_prompt: nil,
-          image_mode: image_mode,
+          image_mode: "none",
           image_generation_available: false,
           image_request: false,
-          source_research_job_id: source_job_id,
-          source_research_status: source_job_id ? "researching" : "none"
+          post_enrichment: true,
+          source_research_job_id: nil,
+          source_research_status: "none"
         })
       rescue StandardError => error
         warn "[Faith Qwen Relay] STREAM ERROR: #{error.class}: #{error.message}"
@@ -2364,6 +2298,222 @@ server.mount_proc "/api/qwen-chat" do |req, res|
   end
 end
 
+
+# -----------------------------------------------------------------------------
+# POST-ANSWER WIKIMEDIA + SOURCE START ROUTES
+# -----------------------------------------------------------------------------
+# These are deliberately separate from the Qwen stream and from each other.
+# The browser is already unlocked when these are called.
+server.mount_proc "/api/qwen-wikimedia" do |req, res|
+  unless req.request_method == "POST"
+    json_response.call(res, 405, { error: "POST required." })
+    next
+  end
+
+  begin
+    payload = JSON.parse(req.body.to_s)
+    question = payload["question"].to_s.strip
+    answer = payload["answer"].to_s
+    raise "Empty question." if question.empty?
+
+    # This endpoint is intentionally usable BEFORE Qwen has an answer.
+    # When answer is blank, Wikimedia searches from the user's question alone.
+    # The browser starts this request at the same time it starts Qwen, so the
+    # entire Qwen generation window becomes useful search time.
+    images = []
+    image_mode = "none"
+    unless special_image_phrase.call(question) || troubleshooting_request.call(question)
+      begin
+        phase = answer.to_s.strip.empty? ? "pre-answer" : "post-answer"
+        warn "[Faith Images] Dedicated Wikimedia search started #{phase}; running in parallel with Qwen when pre-answer."
+        images = search_images.call(question, answer)
+
+        # If the AI topic resolver produces an unusable topic or the result
+        # scoring rejects every candidate, make one deterministic second pass
+        # using the user's actual subject. This keeps ordinary Qwen chat from
+        # depending on a second model decision for Wikimedia attachments.
+        if images.empty?
+          fallback_topic = fallback_image_topic.call(question)
+          if fallback_topic.to_s.length >= 3 && fallback_topic.to_s.downcase != question.to_s.downcase
+            warn "[Faith Images] Resolver returned no usable images; retrying Wikimedia with fallback topic=#{fallback_topic.inspect}."
+            images = search_images.call(fallback_topic, answer)
+          end
+        end
+
+        image_mode = images.empty? ? "none" : "wikimedia"
+        warn "[Faith Images] Dedicated post-answer Wikimedia request complete (#{images.length} image(s))."
+      rescue StandardError => error
+        warn "[Faith Images] Dedicated Wikimedia request failed: #{error.class}: #{error.message}"
+      end
+    end
+
+    json_response.call(res, 200, { images: images, image_mode: image_mode })
+  rescue JSON::ParserError
+    json_response.call(res, 400, { error: "Invalid JSON request." })
+  rescue StandardError => error
+    warn "[Faith Wikimedia] ERROR: #{error.class}: #{error.message}"
+    json_response.call(res, 503, { error: "Faith could not complete Wikimedia enrichment.", detail: error.message })
+  end
+end
+
+server.mount_proc "/api/qwen-source-start" do |req, res|
+  unless req.request_method == "POST"
+    json_response.call(res, 405, { error: "POST required." })
+    next
+  end
+
+  begin
+    payload = JSON.parse(req.body.to_s)
+    question = payload["question"].to_s.strip
+    answer = payload["answer"].to_s
+    raise "Empty question." if question.empty?
+
+    source_job_id = nil
+    if sourceable_answer_request.call(question)
+      source_job_id = SecureRandom.hex(12)
+      original_answer = answer.to_s.dup
+      source_research_jobs_mutex.synchronize do
+        source_research_jobs[source_job_id] = {
+          status: "queued",
+          question: question.to_s,
+          answer: original_answer,
+          sourced_answer: nil,
+          error: nil,
+          started_at: Time.now.utc.iso8601,
+          completed_at: nil
+        }
+      end
+
+      Thread.new(source_job_id, question.to_s, original_answer) do |job_id, research_question, completed_answer|
+        begin
+          source_research_jobs_mutex.synchronize do
+            source_research_jobs[job_id][:status] = "researching" if source_research_jobs[job_id]
+          end
+          warn "[Faith Sources] Dedicated post-answer research started for job #{job_id}."
+          sourced_answer = source_factual_answer.call(research_question, completed_answer)
+          source_research_jobs_mutex.synchronize do
+            if source_research_jobs[job_id]
+              source_research_jobs[job_id][:status] = "complete"
+              source_research_jobs[job_id][:sourced_answer] = sourced_answer
+              source_research_jobs[job_id][:completed_at] = Time.now.utc.iso8601
+            end
+          end
+          warn "[Faith Sources] Dedicated post-answer research complete for job #{job_id}."
+        rescue StandardError => error
+          source_research_jobs_mutex.synchronize do
+            if source_research_jobs[job_id]
+              source_research_jobs[job_id][:status] = "failed"
+              source_research_jobs[job_id][:error] = "#{error.class}: #{error.message}"
+              source_research_jobs[job_id][:completed_at] = Time.now.utc.iso8601
+            end
+          end
+          warn "[Faith Sources] Dedicated post-answer research failed: #{error.class}: #{error.message}"
+        end
+      end
+    end
+
+    json_response.call(res, 200, {
+      source_research_job_id: source_job_id,
+      source_research_status: source_job_id ? "researching" : "none"
+    })
+  rescue JSON::ParserError
+    json_response.call(res, 400, { error: "Invalid JSON request." })
+  rescue StandardError => error
+    warn "[Faith Sources] START ERROR: #{error.class}: #{error.message}"
+    json_response.call(res, 503, { error: "Faith could not start source research.", detail: error.message })
+  end
+end
+
+# -----------------------------------------------------------------------------
+# POST-ANSWER ENRICHMENT FOR NORMAL QWEN CHAT
+# -----------------------------------------------------------------------------
+# This route is deliberately separate from /api/qwen-chat. Qwen's stream can
+# close immediately after the complete answer is delivered, which unlocks the
+# chat and returns Faith to Explanation mode. Only then does the browser call
+# this route to fetch Wikimedia images and start finite source research.
+server.mount_proc "/api/qwen-enrichment" do |req, res|
+  unless req.request_method == "POST"
+    json_response.call(res, 405, { error: "POST required." })
+    next
+  end
+
+  begin
+    payload = JSON.parse(req.body.to_s)
+    question = payload["question"].to_s.strip
+    answer = payload["answer"].to_s
+    raise "Empty question." if question.empty?
+
+    images = []
+    image_mode = "none"
+
+    unless special_image_phrase.call(question) || troubleshooting_request.call(question)
+      begin
+        warn "[Faith Images] Post-answer enrichment started."
+        images = search_images.call(question, answer)
+        image_mode = images.empty? ? "none" : "wikimedia"
+        warn "[Faith Images] Post-answer enrichment complete (#{images.length} image(s))."
+      rescue StandardError => error
+        warn "[Faith Images] Post-answer enrichment failed: #{error.class}: #{error.message}"
+      end
+    end
+
+    source_job_id = nil
+    if sourceable_answer_request.call(question)
+      source_job_id = SecureRandom.hex(12)
+      original_answer = answer.to_s.dup
+      source_research_jobs_mutex.synchronize do
+        source_research_jobs[source_job_id] = {
+          status: "queued",
+          question: question.to_s,
+          answer: original_answer,
+          sourced_answer: nil,
+          error: nil,
+          started_at: Time.now.utc.iso8601,
+          completed_at: nil
+        }
+      end
+
+      Thread.new(source_job_id, question.to_s, original_answer) do |job_id, research_question, completed_answer|
+        begin
+          source_research_jobs_mutex.synchronize do
+            source_research_jobs[job_id][:status] = "researching" if source_research_jobs[job_id]
+          end
+          warn "[Faith Sources] Post-answer research started for job #{job_id}."
+          sourced_answer = source_factual_answer.call(research_question, completed_answer)
+          source_research_jobs_mutex.synchronize do
+            if source_research_jobs[job_id]
+              source_research_jobs[job_id][:status] = "complete"
+              source_research_jobs[job_id][:sourced_answer] = sourced_answer
+              source_research_jobs[job_id][:completed_at] = Time.now.utc.iso8601
+            end
+          end
+          warn "[Faith Sources] Post-answer research complete for job #{job_id}."
+        rescue StandardError => error
+          source_research_jobs_mutex.synchronize do
+            if source_research_jobs[job_id]
+              source_research_jobs[job_id][:status] = "failed"
+              source_research_jobs[job_id][:error] = "#{error.class}: #{error.message}"
+              source_research_jobs[job_id][:completed_at] = Time.now.utc.iso8601
+            end
+          end
+          warn "[Faith Sources] Post-answer research failed: #{error.class}: #{error.message}"
+        end
+      end
+    end
+
+    json_response.call(res, 200, {
+      images: images,
+      image_mode: image_mode,
+      source_research_job_id: source_job_id,
+      source_research_status: source_job_id ? "researching" : "none"
+    })
+  rescue JSON::ParserError
+    json_response.call(res, 400, { error: "Invalid JSON request." })
+  rescue StandardError => error
+    warn "[Faith Enrichment] ERROR: #{error.class}: #{error.message}"
+    json_response.call(res, 503, { error: "Faith could not complete post-answer enrichment.", detail: error.message })
+  end
+end
 
 # -----------------------------------------------------------------------------
 # DEDICATED IMAGE-GENERATION ENDPOINT
