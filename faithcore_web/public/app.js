@@ -1,3 +1,4 @@
+const FAITH_CLIENT_VERSION = "63-parallel-wikimedia-during-qwen";
 const expressionImages = {
   ruby: "/assets/ruby_wrench.png",
   thinking: "/assets/thinking.PNG",
@@ -788,6 +789,172 @@ function removeLoadingMessage(item) {
   }
 }
 
+function appendQwenRelayLoadingMessage() {
+  const item = appendLoadingMessage("Getting response from Qwen and llama_server... (0s)");
+  const startedAt = Date.now();
+  const timer = setInterval(() => {
+    const seconds = Math.floor((Date.now() - startedAt) / 1000);
+    updateLoadingMessage(item, `Getting response from Qwen and llama_server... (${seconds}s)`);
+  }, 250);
+  return {
+    item,
+    stop() {
+      clearInterval(timer);
+      removeLoadingMessage(item);
+    }
+  };
+}
+
+
+async function consumeQwenStream(response, qwenRelayLoading) {
+  const contentType = response.headers.get("content-type") || "";
+  if (!contentType.toLowerCase().includes("text/event-stream") || !response.body) {
+    return { data: null, faithItem: null };
+  }
+
+  const reader = response.body.getReader();
+  const decoder = new TextDecoder();
+  let buffer = "";
+  let answer = "";
+  let faithItem = null;
+  let finalData = null;
+  let sawFirstToken = false;
+  // Wikimedia results are buffered until the complete Qwen message has
+  // finished. This keeps images/references from appearing in the middle of
+  // a still-streaming answer.
+  let pendingImages = [];
+
+  const ensureFaithItem = () => {
+    if (faithItem) return faithItem;
+    if (qwenRelayLoading) {
+      qwenRelayLoading.stop();
+    }
+    const item = appendMessage("Faith", "", "ai");
+    faithItem = item;
+    sawFirstToken = true;
+    return item;
+  };
+
+  const updateStreamingText = () => {
+    if (!faithItem) return;
+    const textNode = faithItem.querySelector(".message-text");
+    if (!textNode) return;
+    // During the live stream, keep the raw text visible so Markdown cannot
+    // produce half-rendered HTML while Qwen is still writing. The final pass
+    // below converts the completed answer to Faith's normal Markdown renderer.
+    textNode.textContent = answer;
+    chat.scrollTop = chat.scrollHeight;
+  };
+
+  const handleEvent = (event) => {
+    if (!event || typeof event !== "object") return;
+
+    if (event.type === "status") {
+      return;
+    }
+
+    if (event.type === "delta") {
+      const delta = String(event.text || "");
+      if (!delta) return;
+      ensureFaithItem();
+      answer += delta;
+      updateStreamingText();
+      return;
+    }
+
+    if (event.type === "text_complete") {
+      answer = typeof event.answer === "string" ? event.answer : answer;
+      ensureFaithItem();
+      updateStreamingText();
+
+      // Qwen is finished at this exact point. Do not wait for Wikimedia or
+      // source research before returning Faith to her normal Explanation mode.
+      // Those are post-message enrichments and must never control her expression.
+      const completedExpression = [
+        "robotic", "psychotic", "sad", "anger",
+        "greeting", "thinking", "explanation", "confusion",
+        "troubleshooting", "observing", "coding"
+      ].includes(event.expression) ? event.expression : "explanation";
+      if (event.session_mode === "coding") sessionMode = "coding";
+      else if (event.session_mode === "troubleshooting") sessionMode = "troubleshooting";
+      else sessionMode = "idle";
+      setExpression(completedExpression);
+      return;
+    }
+
+    if (event.type === "images") {
+      // Kept for compatibility with older Faith servers. v59 does not send
+      // this event until the final message phase, so normal v59 responses are
+      // appended only from the done event below.
+      pendingImages = Array.isArray(event.images) ? event.images : [];
+      return;
+    }
+
+    if (event.type === "done") {
+      finalData = event;
+      answer = typeof event.answer === "string" ? event.answer : answer;
+      ensureFaithItem();
+      updateStreamingText();
+
+      // Only now, after the complete answer has been delivered, attach the
+      // buffered Wikimedia results. Prefer the final event payload if it has
+      // them; otherwise use the earlier async images event.
+      const completedImages = Array.isArray(event.images)
+        ? event.images
+        : pendingImages;
+      if (completedImages.length > 0) {
+        appendImages(faithItem, completedImages);
+      }
+      pendingImages = [];
+      return;
+    }
+
+    if (event.type === "error") {
+      throw new Error(event.error || event.detail || "Qwen stream failed.");
+    }
+  };
+
+  while (true) {
+    const { value, done } = await reader.read();
+    if (done) break;
+
+    buffer += decoder.decode(value, { stream: true });
+    let newline;
+    while ((newline = buffer.indexOf("\n")) >= 0) {
+      const line = buffer.slice(0, newline).replace(/\r$/, "");
+      buffer = buffer.slice(newline + 1);
+      const trimmed = line.trim();
+      if (!trimmed || !trimmed.startsWith("data:")) continue;
+
+      const payload = trimmed.slice(5).trim();
+      if (!payload || payload === "[DONE]") continue;
+
+      try {
+        handleEvent(JSON.parse(payload));
+      } catch (error) {
+        if (error instanceof SyntaxError) continue;
+        throw error;
+      }
+    }
+  }
+
+  if (buffer.trim().startsWith("data:")) {
+    const payload = buffer.trim().slice(5).trim();
+    if (payload && payload !== "[DONE]") {
+      handleEvent(JSON.parse(payload));
+    }
+  }
+
+  if (!finalData) {
+    throw new Error("Faith's Qwen stream ended before the final response was received.");
+  }
+
+  if (qwenRelayLoading && !sawFirstToken) {
+    qwenRelayLoading.stop();
+  }
+
+  return { data: finalData, faithItem };
+}
 
 function setBusy(value) {
   busy = value;
@@ -1163,6 +1330,74 @@ function isDirectCodeFixRequest(question) {
     /\b(?:can|could|will|would)\b[\s\S]*\b(?:you|faith)\b[\s\S]*\b(?:fix|repair|correct|modify|change|edit|patch)\b[\s\S]*\b(?:code|file|it|this)\b/i.test(text);
 }
 
+function isFaithImageGenerationPhrase(text) {
+  const value = String(text || "");
+  // These two natural-language forms are explicitly reserved for Faith's
+  // existing Perchance/Pollinations image-generation pipeline. They must never
+  // enter the direct Qwen chat relay.
+  return /\bpaint\s+a\b/i.test(value) || /\bgenerate\s+a\b/i.test(value);
+}
+
+async function runQwenPostEnrichment(messageItem, question, answer, wikimediaPromise = null) {
+  if (!messageItem || !question) return;
+
+  // Wikimedia is normally STARTED BEFORE the Qwen request. The promise is
+  // passed in here after Qwen finishes, so we simply collect the images that
+  // have been searching in parallel for the entire duration of generation.
+  // If the search is still running, it finishes independently and appends the
+  // images when ready. It never blocks chat unlock or Explanation mode.
+  const wikimediaTask = (async () => {
+    try {
+      let data;
+      if (wikimediaPromise) {
+        data = await wikimediaPromise;
+      } else {
+        const response = await fetch(`/api/qwen-wikimedia?ts=${Date.now()}`, {
+          method: "POST",
+          headers: { "Content-Type": "application/json", "Accept": "application/json", "Cache-Control": "no-cache" },
+          cache: "no-store",
+          body: JSON.stringify({ question, answer })
+        });
+        if (!response.ok) throw new Error(`Wikimedia HTTP ${response.status}`);
+        data = await response.json();
+      }
+
+      const images = Array.isArray(data && data.images) ? data.images : [];
+      if (images.length > 0) {
+        appendImages(messageItem, images);
+        chat.scrollTop = chat.scrollHeight;
+      }
+      console.info(`[Faith Images] Parallel Wikimedia returned ${images.length} image(s).`);
+    } catch (error) {
+      console.warn("[Faith Images] Parallel Wikimedia search failed:", error);
+    }
+  })();
+
+  const sourcesTask = (async () => {
+    try {
+      const response = await fetch(`/api/qwen-source-start?ts=${Date.now()}`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json", "Accept": "application/json", "Cache-Control": "no-cache" },
+        cache: "no-store",
+        body
+      });
+      if (!response.ok) throw new Error(`Sources HTTP ${response.status}`);
+      const data = await response.json();
+      if (data.source_research_job_id) {
+        startFaithReferenceLoader(messageItem);
+        pollFaithSourceResearch(messageItem, data.source_research_job_id);
+      } else {
+        console.info("[Faith Sources] No source research required for this reply.");
+      }
+    } catch (error) {
+      console.warn("[Faith Sources] Post-answer research start failed:", error);
+    }
+  })();
+
+  // Keep both requests alive without making the completed Qwen response wait.
+  void Promise.allSettled([wikimediaTask, sourcesTask]);
+}
+
 async function submitQuestion() {
   if (busy) return;
 
@@ -1218,23 +1453,117 @@ async function submitQuestion() {
   // this is actually an image-generation request. Normal chat and real-photo
   // requests must never display "Generating your image...".
   let loadingMessage = null;
+  let qwenRelayLoading = null;
   let requestModeConfirmed = false;
+  let wikimediaPreflight = null;
 
   try {
-    const response = await fetch("/api/chat", {
+    // Ordinary conversation uses the dedicated direct Qwen relay. Specialized
+    // requests continue through /api/chat below. This endpoint is intentionally
+    // tiny: browser -> Faith :4567 -> Qwen :8080 -> Faith -> browser.
+    const isSimpleChat = !isTroubleshootingPrompt && sessionMode === "idle" &&
+      !isFaithImageGenerationPhrase(question) &&
+      !/\b(?:generate|create|draw|paint|make)\b[\s\S]*\b(?:image|picture|photo|art)\b/i.test(question) &&
+      !/\b(?:upload|file|code|debug|troubleshoot)\b/i.test(question);
+
+    const isImageGeneration = isFaithImageGenerationPhrase(question) ||
+      /\b(?:generate|create|draw|paint|make|render|illustrate|design|sketch)\b[\s\S]*\b(?:image|picture|photo|art|portrait|drawing|painting|scene|wallpaper)\b/i.test(question);
+
+    // IMAGE GENERATION HAS ITS OWN PIPE. It must never enter the Qwen chat relay.
+    // This is especially important for Perchance/Pollinations requests.
+    const endpoint = isImageGeneration ? "/api/imagegen" : (isSimpleChat ? "/api/qwen-chat" : "/api/chat");
+
+    // Normal chat can take a while while Qwen/llama-server generates the
+    // response. Show an explicit relay status and a live elapsed-time counter
+    // so the user always knows Faith is waiting on the local AI backend.
+    // Image generation and other specialized routes keep their own loaders.
+    if (isSimpleChat) {
+      qwenRelayLoading = appendQwenRelayLoadingMessage();
+
+      // START WIKIMEDIA AT THE SAME TIME AS QWEN. Do not wait for the first
+      // token, a complete answer, or Explanation mode. The search now gets the
+      // full Qwen generation window to find relevant Commons images.
+      wikimediaPreflight = (async () => {
+        try {
+          const response = await fetch(`/api/qwen-wikimedia?ts=${Date.now()}`, {
+            method: "POST",
+            headers: {
+              "Content-Type": "application/json",
+              "Accept": "application/json",
+              "Cache-Control": "no-cache"
+            },
+            cache: "no-store",
+            body: JSON.stringify({ question })
+          });
+          if (!response.ok) throw new Error(`Wikimedia HTTP ${response.status}`);
+          return await response.json();
+        } catch (error) {
+          console.warn("[Faith Images] Parallel Wikimedia preflight failed:", error);
+          return { images: [], image_mode: "none" };
+        }
+      })();
+    }
+
+    let response = await fetch(endpoint, {
       method: "POST",
       headers: {
-        "Content-Type": "application/json"
+        "Content-Type": "application/json",
+        "Accept": "application/json"
       },
       body: JSON.stringify({ question })
     });
 
-    // The server decides whether this is a Wikimedia/photo request
-    // or an AI-generated image request.
-    const data = await response.json();
+    // If a stale server/proxy does not know /api/qwen-chat, immediately retry
+    // ordinary chat through /api/chat. server.rb contains the same direct-Qwen
+    // compatibility guard, so this cannot fall into the slow Faith pipeline.
+    if ((isSimpleChat || isImageGeneration) && (response.status === 404 || response.status === 405)) {
+      response = await fetch("/api/chat", {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          "Accept": "application/json"
+        },
+        body: JSON.stringify({ question })
+      });
+    }
 
-    if (!response.ok) {
-      throw new Error(data.error || `HTTP ${response.status}`);
+    let data;
+    let streamedFaithItem = null;
+
+    if (isSimpleChat && response.ok && (response.headers.get("content-type") || "").toLowerCase().includes("text/event-stream")) {
+      const streamed = await consumeQwenStream(response, qwenRelayLoading);
+      data = streamed.data;
+      streamedFaithItem = streamed.faithItem;
+      qwenRelayLoading = null;
+
+      // v60: the Qwen stream is completely finished here. Unlock the chat and
+      // keep Faith in Explanation mode BEFORE doing any Wikimedia/source work.
+      // Enrichment continues independently on the already-completed message.
+      if (data && data.post_enrichment && streamedFaithItem) {
+        setExpression("explanation");
+        setBusy(false);
+        input.focus();
+        void runQwenPostEnrichment(streamedFaithItem, question, data.answer || "", wikimediaPreflight);
+        return;
+      }
+    } else {
+      if (qwenRelayLoading) {
+        qwenRelayLoading.stop();
+        qwenRelayLoading = null;
+      }
+
+      const contentType = response.headers.get("content-type") || "";
+      const rawResponse = await response.text();
+      try {
+        data = JSON.parse(rawResponse);
+      } catch (_) {
+        const preview = rawResponse.replace(/\s+/g, " ").slice(0, 220);
+        throw new Error(`Faith returned non-JSON from ${endpoint} (HTTP ${response.status}). Response: ${preview}`);
+      }
+
+      if (!response.ok) {
+        throw new Error(data.error || `HTTP ${response.status}`);
+      }
     }
 
     const generatedImages = Array.isArray(data.images)
@@ -1304,7 +1633,7 @@ async function submitQuestion() {
     }
 
     const responseImages = (sessionMode === "troubleshooting" || sessionMode === "coding") ? [] : (data.images || []);
-    const faithItem = appendMessage("Faith", data.answer, "ai", responseImages, {
+    const faithItem = streamedFaithItem || appendMessage("Faith", data.answer, "ai", responseImages, {
       onGeneratedStateChange: (remaining, loaded) => {
         // Pending Perchance flow manages its own loadingMessage below - ignore backend callbacks with 0 images.
         if (isPendingGenerated) return;
@@ -1325,6 +1654,10 @@ async function submitQuestion() {
         }
       }
     });
+
+    if (streamedFaithItem && responseImages.length) {
+      appendImages(streamedFaithItem, responseImages);
+    }
 
     // Faith's answer is already visible. If finite background source research
     // was started, update THIS SAME message when that job completes.
@@ -1393,6 +1726,10 @@ async function submitQuestion() {
       setExpression("painting", "Image ready");
     }
   } catch (error) {
+    if (qwenRelayLoading) {
+      qwenRelayLoading.stop();
+      qwenRelayLoading = null;
+    }
     removeLoadingMessage(loadingMessage);
     loadingMessage = null;
 
