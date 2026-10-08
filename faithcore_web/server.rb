@@ -3181,6 +3181,99 @@ server.mount_proc "/api/source-research" do |req, res|
   end
 end
 
+
+# -----------------------------------------------------------------------------
+# CODER GGUF TROUBLESHOOTING RELAY (:8090)
+# Uploading a source file only stores it. This route is entered only when the
+# user explicitly asks Faith to troubleshoot; progress and generated tokens are
+# streamed to the visual browser as they arrive.
+# -----------------------------------------------------------------------------
+server.mount_proc "/api/coder-troubleshoot" do |req, res|
+  unless req.request_method == "POST"
+    json_response.call(res, 405, { error: "POST required." })
+    next
+  end
+  payload = JSON.parse(req.body.to_s) rescue {}
+  question = payload["question"].to_s.strip
+  code_text, filename = mutex.synchronize { [latest_code_text.to_s, latest_code_filename.to_s] }
+  if code_text.strip.empty?
+    json_response.call(res, 400, { error: "Upload a source-code file before starting Troubleshooting." })
+    next
+  end
+  res.status = 200
+  res["Content-Type"] = "text/event-stream; charset=utf-8"
+  res["Cache-Control"] = "no-cache, no-store, must-revalidate"
+  res["Connection"] = "keep-alive"
+  res["X-Accel-Buffering"] = "no"
+  res.chunked = true
+  res.body = proc do |out|
+    emit = lambda { |event| out.write("data: #{JSON.generate(event)}\n\n") }
+    begin
+      emit.call({ type: "status", phase: "connecting", message: "Connecting to Faith's coding model..." })
+      uri = URI.parse(ENV.fetch("FAITH_CODER_AI_URL", "http://127.0.0.1:8090/v1/chat/completions"))
+      model_id = ENV.fetch("FAITH_CODER_AI_MODEL", "coding-local")
+      prompt = <<~PROMPT
+        You are Faith's code troubleshooting specialist. Analyze the actual source file and the user's request. Explain the concrete issue and practical fix. If the user asks to fix/debug code, provide a useful diagnosis first; do not fabricate test results. Keep the response focused and readable.
+
+        FILE: #{filename}
+        USER REQUEST: #{question.empty? ? "Please troubleshoot this source file." : question}
+
+        SOURCE CODE:
+        #{code_text[0, 50000]}
+      PROMPT
+      body = { model: model_id, messages: [{ role: "user", content: prompt }], stream: true, max_tokens: 2048, temperature: 0.2 }
+      http = Net::HTTP.new(uri.host, uri.port)
+      http.open_timeout = 5
+      http.read_timeout = 600
+      request = Net::HTTP::Post.new(uri.request_uri)
+      request["Content-Type"] = "application/json"
+      request["Accept"] = "text/event-stream"
+      request.body = JSON.generate(body)
+      emit.call({ type: "status", phase: "processing", message: "Processing source with the coding GGUF..." })
+      buffer = +""
+      got_token = false
+      http.request(request) do |response|
+        unless response.is_a?(Net::HTTPSuccess)
+          detail = response.body.to_s
+          raise "Coding model returned HTTP #{response.code}: #{detail[0, 500]}"
+        end
+        response.read_body do |chunk|
+          buffer << chunk
+          while (idx = buffer.index("\n"))
+            line = buffer.slice!(0, idx + 1).strip
+            next unless line.start_with?("data:")
+            data = line.sub(/\Adata:\s*/, "")
+            next if data == "[DONE]"
+            begin
+              event = JSON.parse(data)
+              delta = event.dig("choices", 0, "delta", "content").to_s
+              next if delta.empty?
+              unless got_token
+                got_token = true
+                emit.call({ type: "status", phase: "coding", message: "Coding response received — relaying output..." })
+              end
+              emit.call({ type: "delta", text: delta })
+            rescue JSON::ParserError
+              next
+            end
+          end
+        end
+      end
+      raise "The coding model returned no text. Check that the GGUF server is running on port 8090." unless got_token
+      mutex.synchronize do
+        latest_troubleshooting_response = "Completed by coding GGUF."
+        troubleshooting_active = true
+        troubleshooting_diagnosis_ready = true
+        troubleshooting_turn_count += 1
+      end
+      emit.call({ type: "done", expression: "coding", session_mode: "troubleshooting" })
+    rescue StandardError => error
+      warn "[Faith Coder Troubleshooting] #{error.class}: #{error.message}"
+      emit.call({ type: "error", error: error.message })
+    end
+  end
+end
+
 server.mount_proc "/api/fix-code" do |req, res|
   unless req.request_method == "POST"
     json_response.call(res, 405, { error: "POST required." })
