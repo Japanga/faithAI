@@ -92,7 +92,7 @@
       flex: 0 0 auto;
     }
 
-    /* AI/Wikimedia image cards are rendered by app.js. */
+    /* AI/Wikimedia image cards are rendered by app.js?v=53. */
     .message-image {
       display: block;
       width: min(100%, 720px);
@@ -161,7 +161,7 @@
     /*
      * Faith source renderer
      *
-     * app.js is intentionally allowed to keep rendering messages as plain text.
+     * app.js?v=53 is intentionally allowed to keep rendering messages as plain text.
      * The server never sends HTML or Markdown citation syntax. It sends private
      * [[FAITH_SOURCE|...|...]] / [[FAITH_MISSING]] tokens, and this layer turns
      * those tokens into real DOM elements after the message exists in #chat.
@@ -285,13 +285,10 @@
       </div>
     </form>
 
-    <div class="hint">Press Enter to send • Shift+Enter for a new line</div>
+    <div class="hint">Press Enter to send, Shift+Enter for a new line</div>
   </main>
 
-  <script src="/app.js"></script>
-
-<script>
-(function () {
+  <script src="/app.js?v=53 () {
   "use strict";
 
   const SOURCE_RE = /\[\[FAITH_SOURCE\|([^|\]]+)\|([^|\]]+)\]\]|\[\[FAITH_MISSING\]\]/g;
@@ -316,7 +313,7 @@
     a.href = url;
     a.target = "_blank";
     a.rel = "noopener noreferrer";
-    a.textContent = "[¶]";
+    a.textContent = "[Â¶]";
     a.setAttribute("aria-label", "Open source: " + title);
     a.setAttribute("data-tooltip", "Source: " + title);
     a.title = "Source: " + title;
@@ -412,7 +409,7 @@
 
     observer.observe(chat, { childList: true, subtree: true });
 
-    // app.js can replace a message's text after initially inserting it.
+    // app.js?v=53 can replace a message's text after initially inserting it.
     // A tiny delayed pass catches that without changing normal chat behavior.
     [0, 50, 150, 400, 1000].forEach(delay => {
       setTimeout(() => renderSourceTokens(chat), delay);
