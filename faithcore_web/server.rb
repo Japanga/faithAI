@@ -31,6 +31,106 @@ IMAGE_PROVIDER = ENV.fetch("FAITH_IMAGE_PROVIDER", "perchance").downcase
 PORT = Integer(ENV.fetch("PORT", "4567"))
 FAITH_SERVER_VERSION = "72-visible-actions-websearch-ruby-gguf-manager"
 ROOT = File.expand_path(__dir__)
+
+# Start the dedicated coding GGUF only when a Build/Troubleshooting request needs it.
+# The tested BAT remains the source of truth for the model path and Windows 7 flags.
+FAITH_CODER_START_BAT = File.join(ROOT, "Test_Qwen2.5-Coder-0.5B-Instruct_Q4_K_M_4Threads_KVQ8_GPU99_Win7.bat")
+FAITH_CODER_STARTUP_TIMEOUT = Integer(ENV.fetch("FAITH_CODER_STARTUP_TIMEOUT", "240"))
+$faith_coder_start_mutex = Mutex.new
+
+# Regular chat normally starts with START_FAITH_QWEN.bat. This BAT is only a
+# failsafe: if :8080 is unavailable (for example, because the coding BAT stopped
+# it to free resources), start chat again and wait for its health signal.
+FAITH_CHAT_START_BAT = File.join(ROOT, "Test_Qwen2-0_5B-Instruct_Q4_K_M_Win7.bat")
+FAITH_CHAT_STARTUP_TIMEOUT = Integer(ENV.fetch("FAITH_CHAT_STARTUP_TIMEOUT", "240"))
+$faith_chat_start_mutex = Mutex.new
+
+def faith_local_health_ready?(uri)
+  health_uri = URI::HTTP.build(host: uri.host, port: uri.port, path: "/health")
+  http = Net::HTTP.new(health_uri.host, health_uri.port)
+  http.open_timeout = 1
+  http.read_timeout = 1
+  response = http.get(health_uri.request_uri)
+  response.is_a?(Net::HTTPSuccess)
+rescue StandardError
+  false
+end
+
+def ensure_faith_chat_server!(on_status: nil)
+  endpoint = URI.parse(ENV.fetch("FAITH_LOCAL_AI_URL", "http://127.0.0.1:8080/v1/chat/completions"))
+  return true if faith_local_health_ready?(endpoint)
+
+  $faith_chat_start_mutex.synchronize do
+    # A concurrent request may have restored the server while we waited.
+    return true if faith_local_health_ready?(endpoint)
+
+    unless File.file?(FAITH_CHAT_START_BAT)
+      raise "The regular chat server is not responding on :8080, and its failsafe BAT was not found: #{FAITH_CHAT_START_BAT}."
+    end
+
+    on_status.call("The regular chat server on :8080 is not responding. Starting the chat failsafe and waiting for its ready signal…") if on_status
+    pid = Process.spawn("cmd.exe", "/c", "start", "", FAITH_CHAT_START_BAT, chdir: ROOT, out: File::NULL, err: File::NULL)
+    Process.detach(pid) rescue nil
+
+    deadline = Time.now + FAITH_CHAT_STARTUP_TIMEOUT
+    last_status_at = Time.now
+    until Time.now >= deadline
+      return true if faith_local_health_ready?(endpoint)
+      if on_status && Time.now - last_status_at >= 8
+        on_status.call("The regular chat GGUF is still loading. Faith is waiting for the :8080 ready signal…")
+        last_status_at = Time.now
+      end
+      sleep 1
+    end
+
+    raise "Timed out waiting for the regular chat GGUF on :8080 after #{FAITH_CHAT_STARTUP_TIMEOUT} seconds. Check qwen-server.log and the chat BAT."
+  end
+end
+
+def faith_coder_health_ready?(uri)
+  health_uri = URI::HTTP.build(host: uri.host, port: uri.port, path: "/health")
+  http = Net::HTTP.new(health_uri.host, health_uri.port)
+  http.open_timeout = 1
+  http.read_timeout = 1
+  response = http.get(health_uri.request_uri)
+  response.is_a?(Net::HTTPSuccess)
+rescue StandardError
+  false
+end
+
+def ensure_faith_coder_server!(on_status: nil)
+  endpoint = URI.parse(ENV.fetch("FAITH_CODER_AI_URL", "http://127.0.0.1:8090/v1/chat/completions"))
+  return true if faith_coder_health_ready?(endpoint)
+
+  $faith_coder_start_mutex.synchronize do
+    # Another simultaneous request may have started the model while we waited.
+    return true if faith_coder_health_ready?(endpoint)
+
+    unless File.file?(FAITH_CODER_START_BAT)
+      raise "The coding server is not running, and its startup BAT was not found: #{FAITH_CODER_START_BAT}. Put Test_Qwen2.5-Coder-0.5B-Instruct_Q4_K_M_4Threads_KVQ8_GPU99_Win7.bat beside server.rb."
+    end
+
+    on_status.call("Waiting for a ready signal from the coding server on :8090. Starting the tested coding BAT now…") if on_status
+    # `start` opens the dedicated BAT in its own process/window; Faith does not
+    # continue to the model request until /health confirms the server is ready.
+    pid = Process.spawn("cmd.exe", "/c", "start", "", FAITH_CODER_START_BAT, chdir: ROOT, out: File::NULL, err: File::NULL)
+    Process.detach(pid) rescue nil
+
+    deadline = Time.now + FAITH_CODER_STARTUP_TIMEOUT
+    last_status_at = Time.now
+    until Time.now >= deadline
+      return true if faith_coder_health_ready?(endpoint)
+      if on_status && Time.now - last_status_at >= 8
+        on_status.call("The coding GGUF is still loading. Faith is waiting for the :8090 ready signal…")
+        last_status_at = Time.now
+      end
+      sleep 1
+    end
+
+    raise "Timed out waiting for the coding GGUF on :8090 to become ready after #{FAITH_CODER_STARTUP_TIMEOUT} seconds. Check the dedicated coding BAT and its console/log for startup errors."
+  end
+end
+
 PUBLIC_DIR = File.join(ROOT, "public")
 GENERATED_DIR = File.join(PUBLIC_DIR, "generated")
 UPLOAD_DIR = File.join(PUBLIC_DIR, "uploads")
@@ -2076,7 +2176,8 @@ end
 # It does NOT run image search, source research, troubleshooting search, or any
 # other post-processing before returning the answer to the browser.
 direct_qwen_chat = lambda do |question, emotion, on_delta = nil|
-  # Start only the chat GGUF and stop the coding GGUF before using the relay.
+  # Do not submit a chat completion until localhost confirms :8080 is ready.
+  ensure_faith_chat_server!
   # Ordinary chat uses the shortest possible path:
   # browser :4567 -> this Ruby process -> llama-server :8080 -> back to :4567.
   # The llama-server request is STREAMING, so the browser can receive Faith's
@@ -2274,7 +2375,11 @@ server.mount_proc "/api/qwen-chat" do |req, res|
       end
 
       begin
-        write_event.call({ type: "status", message: "Connected to local Qwen stream." })
+        write_event.call({ type: "status", message: "Checking the regular chat server on :8080 before sending your request…" })
+        ensure_faith_chat_server!(on_status: lambda do |message|
+          write_event.call({ type: "status", phase: "waiting-chat", message: message })
+        end)
+        write_event.call({ type: "status", message: "The regular chat server on :8080 is ready. Sending your request now…" })
 
         answer = direct_qwen_chat.call(question, emotion, lambda do |delta|
           write_event.call({ type: "delta", text: delta })
@@ -3308,7 +3413,8 @@ server.mount_proc "/api/build-chat" do |req, res|
   res.body = proc do |out|
     emit = lambda { |event| out.write("data: #{JSON.generate(event)}\n\n") }
     begin
-      emit.call({ type: "status", phase: "connecting", message: "Getting response from Qwen code port on :8090…" })
+      ensure_faith_coder_server!(on_status: lambda { |message| emit.call({ type: "status", phase: "waiting-coder", message: message }) })
+      emit.call({ type: "status", phase: "connecting", message: "The coding server on :8090 is ready. Sending the request now…" })
       uri = URI.parse(ENV.fetch("FAITH_CODER_AI_URL", "http://127.0.0.1:8090/v1/chat/completions"))
       model_id = ENV.fetch("FAITH_CODER_AI_MODEL", "coding-local")
       history = mutex.synchronize { build_messages.map(&:dup) }
@@ -3445,7 +3551,8 @@ server.mount_proc "/api/coder-edit" do |req, res|
         end
       end
 
-      emit.call({ type: "status", phase: "connecting", message: "Getting response from Qwen code port on :8090…" })
+      ensure_faith_coder_server!(on_status: lambda { |message| emit.call({ type: "status", phase: "waiting-coder", message: message }) })
+      emit.call({ type: "status", phase: "connecting", message: "The coding server on :8090 is ready. Sending the request now…" })
       if review_only
         action = <<~ACTION
           Review the supplied source file without modifying it. Return a concise,
@@ -3611,7 +3718,8 @@ server.mount_proc "/api/coder-troubleshoot" do |req, res|
     begin
       emit.call({ type: "status", phase: "file-confirmed", filename: filename, source_chars: code_text.length,
                   message: "Faith received #{filename} (#{code_text.length} characters). Sending the source and your request to Qwen on :8090…" })
-      emit.call({ type: "status", phase: "connecting", message: "Connecting to Qwen code port on :8090…" })
+      ensure_faith_coder_server!(on_status: lambda { |message| emit.call({ type: "status", phase: "waiting-coder", message: message }) })
+      emit.call({ type: "status", phase: "connecting", message: "The coding server on :8090 is ready. Sending the request now…" })
       uri = URI.parse(ENV.fetch("FAITH_CODER_AI_URL", "http://127.0.0.1:8090/v1/chat/completions"))
       model_id = ENV.fetch("FAITH_CODER_AI_MODEL", "coding-local")
       prompt = <<~PROMPT
