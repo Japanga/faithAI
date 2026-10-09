@@ -29,8 +29,11 @@ MODEL = "auto"
 IMAGE_MODEL = ENV.fetch("FAITH_IMAGE_MODEL", "gpt-image-2")
 IMAGE_PROVIDER = ENV.fetch("FAITH_IMAGE_PROVIDER", "perchance").downcase
 PORT = Integer(ENV.fetch("PORT", "4567"))
-FAITH_SERVER_VERSION = "72-visible-actions-websearch-ruby-gguf-manager"
+FAITH_SERVER_VERSION = "74-build-request-lifecycle-reset"
 ROOT = File.expand_path(__dir__)
+
+# Raised when Clear/newer Build turn invalidates an in-flight coder stream.
+class FaithBuildRequestSuperseded < StandardError; end
 
 # Start the dedicated coding GGUF only when a Build/Troubleshooting request needs it.
 # The tested BAT remains the source of truth for the model path and Windows 7 flags.
@@ -275,6 +278,7 @@ troubleshooting_turn_count = 0
 coding_active = false
 build_active = false
 build_messages = []
+build_generation = 0
 
 normalize_text = lambda do |text|
   text.to_s.downcase
@@ -3343,6 +3347,7 @@ server.mount_proc "/api/build-chat" do |req, res|
 
   if end_build_request.call(question)
     mutex.synchronize do
+      build_generation += 1
       build_active = false
       build_messages = []
     end
@@ -3355,6 +3360,15 @@ server.mount_proc "/api/build-chat" do |req, res|
     next
   end
 
+  # Each Build request owns a generation. A newer request or Clear invalidates
+  # older streams so their late tokens cannot contaminate the current answer.
+  request_generation = mutex.synchronize do
+    build_generation += 1
+    # Discard an unanswered user turn left by an interrupted request.
+    build_messages.pop while build_messages.length > 1 && build_messages.last && build_messages.last[:role] == "user"
+    build_generation
+  end
+
   was_build_active = mutex.synchronize { build_active }
   capability_only = !was_build_active && build_capability_question.call(question) && !build_direct_request.call(question)
   mutex.synchronize do
@@ -3363,10 +3377,12 @@ server.mount_proc "/api/build-chat" do |req, res|
       build_messages = [{
         role: "system",
         content: <<~BUILD_SYSTEM.strip
-          You are Faith in Build mode, a practical coding assistant. The user wants to create software from the ground up.
-          Write real, usable code and explain key choices briefly. Prefer complete working implementations over vague outlines.
+          You are Faith in Build mode, a practical coding assistant. The user wants working software, not a planning interview.
+          Treat each concrete request as sufficient requirements to begin implementation. Make reasonable assumptions for missing details and state them briefly.
+          NEVER answer with generic deferrals such as "Please provide me with the requirements and code decisions you have in mind" or ask the user to repeat requirements they already supplied.
+          Do not merely promise to help, describe what you could build, or give a generic plan instead of building it. Produce the actual implementation now: complete usable code, file names, and concise run instructions where relevant.
+          Ask a clarifying question only if a genuinely blocking decision makes any useful implementation impossible. Otherwise choose sensible defaults and proceed.
           Keep track of requirements and code decisions across this conversation. When revising code, preserve working features unless the user asks to remove them.
-          Ask concise clarifying questions only when a missing decision prevents a useful implementation; otherwise choose sensible defaults and state them.
           Do not claim you ran code or tests unless you actually did. When outputting code, use fenced code blocks with accurate language labels.
           You are still Faith. Do not identify yourself as Qwen or as a different assistant.
         BUILD_SYSTEM
@@ -3389,7 +3405,10 @@ server.mount_proc "/api/build-chat" do |req, res|
     res["X-Faith-Server-Version"] = FAITH_SERVER_VERSION
     res.chunked = true
     res.body = proc do |out|
-      emit = lambda { |event| out.write("data: #{JSON.generate(event)}\n\n") }
+      emit = lambda do |event|
+        current = mutex.synchronize { build_generation == request_generation }
+        out.write("data: #{JSON.generate(event)}\n\n") if current
+      end
       emit.call({ type: "status", phase: "build-ready", message: "Build mode is ready." })
       emit.call({ type: "delta", text: answer })
       emit.call({ type: "text_complete", answer: answer, expression: "build", session_mode: "build" })
@@ -3400,7 +3419,10 @@ server.mount_proc "/api/build-chat" do |req, res|
 
   # A direct build request activates Build mode and immediately starts coding.
   # All later turns use the same persistent build history and :8090 endpoint.
-  mutex.synchronize { build_messages << { role: "user", content: question } }
+  mutex.synchronize do
+    build_messages.pop while build_messages.length > 1 && build_messages.last && build_messages.last[:role] == "user"
+    build_messages << { role: "user", content: question }
+  end
   res.status = 200
   res["Content-Type"] = "text/event-stream; charset=utf-8"
   res["Cache-Control"] = "no-cache, no-store, must-revalidate"
@@ -3411,69 +3433,104 @@ server.mount_proc "/api/build-chat" do |req, res|
   res["X-Faith-Build-Relay"] = "coding-stream"
   res.chunked = true
   res.body = proc do |out|
-    emit = lambda { |event| out.write("data: #{JSON.generate(event)}\n\n") }
+    emit = lambda do |event|
+      current = mutex.synchronize { build_generation == request_generation }
+      out.write("data: #{JSON.generate(event)}\n\n") if current
+    end
     begin
       ensure_faith_coder_server!(on_status: lambda { |message| emit.call({ type: "status", phase: "waiting-coder", message: message }) })
       emit.call({ type: "status", phase: "connecting", message: "The coding server on :8090 is ready. Sending the request now…" })
       uri = URI.parse(ENV.fetch("FAITH_CODER_AI_URL", "http://127.0.0.1:8090/v1/chat/completions"))
       model_id = ENV.fetch("FAITH_CODER_AI_MODEL", "coding-local")
       history = mutex.synchronize { build_messages.map(&:dup) }
-      body = { model: model_id, messages: history, stream: true, max_tokens: Integer(ENV.fetch("FAITH_BUILD_MAX_TOKENS", "4096")), temperature: 0.25 }
-      http = Net::HTTP.new(uri.host, uri.port)
-      http.open_timeout = 5
-      http.read_timeout = Integer(ENV.fetch("FAITH_BUILD_READ_TIMEOUT", "900"))
-      http.write_timeout = 30 if http.respond_to?(:write_timeout=)
-      request = Net::HTTP::Post.new(uri.request_uri)
-      request["Content-Type"] = "application/json"
-      request["Accept"] = "text/event-stream"
-      request.body = JSON.generate(body)
-      buffer = +""
-      answer_parts = []
-      first_token = false
-      response_code = nil
-      http.request(request) do |response|
-        response_code = response.code.to_i
-        unless response.is_a?(Net::HTTPSuccess)
-          detail = response.body.to_s
-          raise "Build model returned HTTP #{response.code}: #{detail[0, 500]}"
-        end
-        response.read_body do |chunk|
-          buffer << chunk.to_s
-          while (newline = buffer.index("\n"))
-            line = buffer.slice!(0, newline + 1).strip
-            next unless line.start_with?("data:")
-            data = line.sub(/\Adata:\s*/, "")
-            next if data == "[DONE]"
-            begin
-              event = JSON.parse(data)
-              delta = event.dig("choices", 0, "delta", "content").to_s
-              delta = event.dig("choices", 0, "message", "content").to_s if delta.empty?
-              next if delta.empty?
-              unless first_token
-                first_token = true
-                emit.call({ type: "status", phase: "building", message: "Qwen is writing your code…" })
+
+      # Keep the stream responsive, but detect the small coder model's common
+      # generic non-answer and automatically retry once with an explicit build-now instruction.
+      request_build_answer = lambda do |request_history|
+        body = { model: model_id, messages: request_history, stream: true, max_tokens: Integer(ENV.fetch("FAITH_BUILD_MAX_TOKENS", "4096")), temperature: 0.15 }
+        http = Net::HTTP.new(uri.host, uri.port)
+        http.open_timeout = 5
+        http.read_timeout = Integer(ENV.fetch("FAITH_BUILD_READ_TIMEOUT", "900"))
+        http.write_timeout = 30 if http.respond_to?(:write_timeout=)
+        request = Net::HTTP::Post.new(uri.request_uri)
+        request["Content-Type"] = "application/json"
+        request["Accept"] = "text/event-stream"
+        request.body = JSON.generate(body)
+        buffer = +""
+        parts = []
+        http.request(request) do |response|
+          unless response.is_a?(Net::HTTPSuccess)
+            detail = response.body.to_s
+            raise "Build model returned HTTP #{response.code}: #{detail[0, 500]}"
+          end
+          response.read_body do |chunk|
+            current_request = mutex.synchronize { build_generation == request_generation }
+            raise FaithBuildRequestSuperseded, "Build request was cleared or superseded" unless current_request
+            buffer << chunk.to_s
+            while (newline = buffer.index("\n"))
+              line = buffer.slice!(0, newline + 1).strip
+              next unless line.start_with?("data:")
+              data = line.sub(/\Adata:\s*/, "")
+              next if data == "[DONE]"
+              begin
+                event = JSON.parse(data)
+                delta = event.dig("choices", 0, "delta", "content").to_s
+                delta = event.dig("choices", 0, "message", "content").to_s if delta.empty?
+                next if delta.empty?
+                parts << delta
+                emit.call({ type: "delta", text: delta })
+              rescue JSON::ParserError
+                next
               end
-              answer_parts << delta
-              emit.call({ type: "delta", text: delta })
-            rescue JSON::ParserError
-              next
             end
           end
         end
+        parts.join.strip
       end
-      answer = answer_parts.join.strip
+
+      emit.call({ type: "status", phase: "connecting", message: "The coding server on :8090 is ready. Sending the request now…" })
+      answer = request_build_answer.call(history)
       raise "The coding model returned no text. Confirm the coding GGUF server is running on port 8090." if answer.empty?
-      mutex.synchronize do
-        build_messages << { role: "assistant", content: answer }
-        build_messages = [build_messages.first] + build_messages[1..].last(24) if build_messages.length > 25
+
+      generic_deflection = answer.match?(/please provide me with (?:the )?(?:requirements|specifications).{0,160}(?:code decisions|practical solution|in mind)/im) ||
+        answer.match?(/(?:provide|share|tell me) (?:your|the) (?:requirements|specifications|code decisions).{0,160}(?:solution|build|implement)/im)
+      if generic_deflection
+        warn "[Faith Build] Generic deflection detected; retrying once with implementation-first instruction."
+        emit.call({ type: "reset", message: "That was not a useful build response. Faith is retrying with a direct implementation instruction…" })
+        retry_history = history.map(&:dup)
+        if retry_history.last && retry_history.last[:role] == "user"
+          retry_history.last[:content] = retry_history.last[:content].to_s + "\n\nIMPORTANT: Do not ask for requirements or code decisions. The request above is your specification. Choose sensible defaults and implement it now. Return concrete working code and concise run instructions."
+        end
+        answer = request_build_answer.call(retry_history)
+        raise "The coding model returned no text on its retry. Check the coding GGUF server on port 8090." if answer.empty?
+        if answer.match?(/please provide me with (?:the )?(?:requirements|specifications).{0,160}(?:code decisions|practical solution|in mind)/im)
+          raise "The model on port 8090 repeated a generic requirements prompt even after a retry. Confirm the correct Qwen Coder GGUF is loaded on port 8090; the endpoint may be serving the wrong model."
+        end
       end
+
+      still_current = mutex.synchronize do
+        if build_generation == request_generation
+          build_messages << { role: "assistant", content: answer }
+          build_messages = [build_messages.first] + build_messages[1..].last(24) if build_messages.length > 25
+          true
+        else
+          false
+        end
+      end
+      next unless still_current
       emit.call({ type: "text_complete", answer: answer, expression: "build", session_mode: "build" })
       emit.call({ type: "done", answer: answer, expression: "build", session_mode: "build", images: [], image_mode: "none" })
+    rescue FaithBuildRequestSuperseded
+      # Expected cancellation: Clear or a newer request invalidated this stream.
+      # Closing the upstream HTTP body also asks llama-server to stop generating.
+      nil
     rescue StandardError => error
       warn "[Faith Build] #{error.class}: #{error.message}"
       # Roll back the unanswered user turn so retries don't accumulate duplicates.
       mutex.synchronize do
-        build_messages.pop if build_messages.last && build_messages.last[:role] == "user"
+        if build_generation == request_generation && build_messages.last && build_messages.last[:role] == "user"
+          build_messages.pop
+        end
       end
       emit.call({ type: "error", error: "Faith's Build model could not complete the request: #{error.message}" })
     end
@@ -3837,6 +3894,7 @@ server.mount_proc "/api/clear" do |req, res|
 
 
   mutex.synchronize do
+    build_generation += 1
     messages.replace([{ role: "system", content: SYSTEM_PROMPT }])
     latest_code_context = nil
     latest_code_filename = nil

@@ -29,9 +29,14 @@ if not defined LLAMA (
   )
 )
 
-rem Search for the exact GGUF filename anywhere below the BAT's folder.
-for /r "%~dp0" %%F in (%MODEL_NAME%) do (
-  if not defined MODEL set "MODEL=%%~fF"
+rem Models are stored in the dedicated models folder, not beside this BAT.
+if exist "%~dp0models\%MODEL_NAME%" set "MODEL=%~dp0models\%MODEL_NAME%"
+
+rem If the models folder has a nested layout, search only inside that folder.
+if not defined MODEL if exist "%~dp0models\" (
+  for /r "%~dp0models" %%F in (qwen2-0_5b-instruct-q4_k_m.gguf) do (
+    if not defined MODEL set "MODEL=%%~fF"
+  )
 )
 
 if not defined LLAMA (
@@ -47,7 +52,7 @@ if not defined MODEL (
   echo ERROR: Could not find the model file:
   echo %MODEL_NAME%
   echo.
-  echo Place the GGUF somewhere inside this BAT's folder tree, or edit
+  echo Place the GGUF in the models folder beside this BAT, or edit
   echo this BAT to set MODEL to its full path.
   echo.
   pause
