@@ -3953,7 +3953,7 @@ trap("TERM") do
   rescue StandardError
     nil
   end
-end
+end 
 
 puts " ".red
 puts "Faith Web AI".red
