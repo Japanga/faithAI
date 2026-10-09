@@ -29,8 +29,15 @@ MODEL = "auto"
 IMAGE_MODEL = ENV.fetch("FAITH_IMAGE_MODEL", "gpt-image-2")
 IMAGE_PROVIDER = ENV.fetch("FAITH_IMAGE_PROVIDER", "perchance").downcase
 PORT = Integer(ENV.fetch("PORT", "4567"))
-FAITH_SERVER_VERSION = "74-build-request-lifecycle-reset"
+FAITH_SERVER_VERSION = "75-image-rate-limit-hard-error"
 ROOT = File.expand_path(__dir__)
+
+# Pollinations/Perchance is a shared free image service. After a failed
+# generation, reject new requests for three minutes instead of pretending a
+# browser-side fallback is still generating.
+FAITH_IMAGE_COOLDOWN_SECONDS = Integer(ENV.fetch("FAITH_IMAGE_COOLDOWN_SECONDS", "180"))
+$faith_image_cooldown_until = 0.0
+$faith_image_cooldown_mutex = Mutex.new
 
 # Raised when Clear/newer Build turn invalidates an in-flight coder stream.
 class FaithBuildRequestSuperseded < StandardError; end
@@ -794,8 +801,11 @@ generate_image = lambda do |question|
           break
         else
           warn "Faith pollinations error: HTTP #{response.status}: #{response.body.to_s[0, 300]}"
-          # Only retry on rate-limit / server errors, not on bad-request.
-          break unless [429, 500, 502, 503].include?(response.status)
+          # A 429 means the shared service is rate-limiting us. Do not
+          # hammer alternate models; let the API route report a hard error.
+          break if response.status == 429
+          # Retry other transient server errors, not bad requests.
+          break unless [500, 502, 503].include?(response.status)
         end
       rescue StandardError => e
         warn "Faith pollinations attempt #{attempt + 1} exception: #{e.class}: #{e.message}"
@@ -2684,20 +2694,37 @@ server.mount_proc "/api/imagegen" do |req, res|
       next
     end
 
+    remaining_cooldown = $faith_image_cooldown_mutex.synchronize do
+      [$faith_image_cooldown_until - Process.clock_gettime(Process::CLOCK_MONOTONIC), 0].max
+    end
+    if remaining_cooldown > 0
+      seconds = remaining_cooldown.ceil
+      json_response.call(res, 429, {
+        error: "Faith cannot generate images this frequently because the free image service is rate-limiting requests. Please wait about #{[(seconds / 60.0).ceil, 1].max} minute(s) and try again.",
+        code: "image_rate_limited",
+        retry_after_seconds: seconds
+      })
+      next
+    end
+
     warn "[Faith Image Relay] IMAGE ONLY :4567 -> image generator question=#{question[0, 120].inspect}"
 
     images = generate_image.call(question)
-    image_prompt = nil
-    image_mode = "generated"
-
     if images.empty?
-      image_prompt = extract_visual_prompt.call(question)
-      image_prompt = fallback_image_topic.call(question) if image_prompt.to_s.length < 3
-      image_mode = image_prompt.to_s.length >= 3 ? "generated-pending" : "none"
-      warn "[Faith Image Relay] Server image generation unavailable; returning browser fallback prompt."
-    else
-      warn "[Faith Image Relay] Generated #{images.length} image(s) successfully."
+      cooldown_until = Process.clock_gettime(Process::CLOCK_MONOTONIC) + FAITH_IMAGE_COOLDOWN_SECONDS
+      $faith_image_cooldown_mutex.synchronize { $faith_image_cooldown_until = cooldown_until }
+      warn "[Faith Image Relay] Image generation failed; enforcing #{FAITH_IMAGE_COOLDOWN_SECONDS}s cooldown."
+      res["Retry-After"] = FAITH_IMAGE_COOLDOWN_SECONDS.to_s
+      json_response.call(res, 429, {
+        error: "Faith could not generate this image because the free image service is temporarily rate-limiting requests. Please wait a few minutes before trying again.",
+        code: "image_rate_limited",
+        retry_after_seconds: FAITH_IMAGE_COOLDOWN_SECONDS
+      })
+      next
     end
+
+    image_mode = "generated"
+    warn "[Faith Image Relay] Generated #{images.length} image(s) successfully."
 
     generation_available = if IMAGE_PROVIDER == "perchance"
       true
