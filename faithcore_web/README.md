@@ -1,9 +1,11 @@
 # Faith Qwen2 0.5B Win7 local integration
 
-This package uses the Windows-7-compatible llama-server.exe with:
+This package uses a Windows-7-compatible llama-server.exe with:
 
 - Qwen2-0.5B-Instruct Q4_K_M
+- Qwen2.5-Coder-0.5B-Instruct-GGUF
 - 127.0.0.1:8080
+- 127.0.0.1:8090
 - 4096-token context
 - Faith web server on 127.0.0.1:4567
 
