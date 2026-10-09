@@ -29,7 +29,7 @@ MODEL = "auto"
 IMAGE_MODEL = ENV.fetch("FAITH_IMAGE_MODEL", "gpt-image-2")
 IMAGE_PROVIDER = ENV.fetch("FAITH_IMAGE_PROVIDER", "perchance").downcase
 PORT = Integer(ENV.fetch("PORT", "4567"))
-FAITH_SERVER_VERSION = "63-parallel-wikimedia-during-qwen"
+FAITH_SERVER_VERSION = "72-visible-actions-websearch-ruby-gguf-manager"
 ROOT = File.expand_path(__dir__)
 PUBLIC_DIR = File.join(ROOT, "public")
 GENERATED_DIR = File.join(PUBLIC_DIR, "generated")
@@ -173,6 +173,8 @@ troubleshooting_active = false
 troubleshooting_diagnosis_ready = false
 troubleshooting_turn_count = 0
 coding_active = false
+build_active = false
+build_messages = []
 
 normalize_text = lambda do |text|
   text.to_s.downcase
@@ -2022,10 +2024,23 @@ server.mount_proc "/api/upload" do |req, res|
   begin
     payload = JSON.parse(req.body.to_s)
     question = payload["question"].to_s.strip
+    troubleshooting_upload = payload["troubleshooting"] == true
     raw_file = payload["file"]
     raw_file["question"] = question if raw_file.is_a?(Hash)
     attachment = prepare_attachment.call(raw_file)
-    status, body = local_upload_response.call(attachment, question)
+    if troubleshooting_upload && attachment && attachment[:text_content]
+      status, body = 200, {
+        ok: true,
+        mode: "troubleshooting-upload",
+        answer: "Source received. Forwarding your file and change request to the coding model.",
+        expression: "troubleshooting",
+        images: [],
+        image_mode: "none",
+        attachment: { name: attachment[:name], type: attachment[:mime], size: attachment[:size], url: attachment[:url] }
+      }
+    else
+      status, body = local_upload_response.call(attachment, question)
+    end
     if attachment && attachment[:text_content]
       mutex.synchronize do
         latest_code_filename = attachment[:name].to_s
@@ -2061,6 +2076,7 @@ end
 # It does NOT run image search, source research, troubleshooting search, or any
 # other post-processing before returning the answer to the browser.
 direct_qwen_chat = lambda do |question, emotion, on_delta = nil|
+  # Start only the chat GGUF and stop the coding GGUF before using the relay.
   # Ordinary chat uses the shortest possible path:
   # browser :4567 -> this Ruby process -> llama-server :8080 -> back to :4567.
   # The llama-server request is STREAMING, so the browser can receive Faith's
@@ -2182,6 +2198,25 @@ end
 special_image_phrase = lambda do |question|
   text = question.to_s
   text.match?(/\bpaint\s+a\b/i) || text.match?(/\bgenerate\s+a\b/i)
+end
+
+# Build mode is an intentional session: once activated, subsequent messages
+# are sent to the coding GGUF on :8090 until the user exits Build mode or clears chat.
+build_capability_question = lambda do |question|
+  text = question.to_s.strip
+  text.match?(/\b(?:can|could|would|will)\s+(?:you|faith)\s+(?:also\s+)?(?:help\s+me\s+)?(?:build|create|write|code|develop|make|program)\b/i) &&
+    text.match?(/\b(?:code|coding|program|programming|software|app|application|website|game|script|project|from scratch|for me)\b/i) &&
+    !text.match?(/\b(?:build|create|write|code|develop|make|program)\s+(?:me\s+)?(?:a|an|the)\s+.{3,}/i)
+end
+
+build_direct_request = lambda do |question|
+  text = question.to_s.strip
+  text.match?(/\b(?:build|create|write|code|develop|make|program)\s+(?:(?:me|for me)\s+)?(?:a|an|the|some|my|this|that)\b.{2,}/i) ||
+    text.match?(/\b(?:let'?s|lets)\s+(?:build|create|write|code|develop|make)\b/i)
+end
+
+end_build_request = lambda do |question|
+  question.to_s.match?(/\b(?:exit|leave|end|stop|cancel)\s+(?:the\s+)?build(?:ing)?\s*(?:session|mode)?\b|\b(?:exit|leave|end|stop)\s+build\s+mode\b/i)
 end
 
 # True only for ordinary text conversation. This helper is also used inside
@@ -2672,7 +2707,7 @@ server.mount_proc "/api/chat" do |req, res|
     # NORMAL CHAT: take the direct relay path and return immediately.
     # Specialized requests continue through Faith's existing image,
     # troubleshooting, upload, and coding paths below.
-    active_special_session = mutex.synchronize { troubleshooting_active || coding_active }
+    active_special_session = mutex.synchronize { troubleshooting_active || coding_active || build_active }
     if attachment.nil? && !generated_request && !direct_photo && !active_special_session && !troubleshooting_request.call(observation_question)
       begin
         # Compatibility path for an older/cached frontend. It must behave exactly
@@ -3188,6 +3223,371 @@ end
 # user explicitly asks Faith to troubleshoot; progress and generated tokens are
 # streamed to the visual browser as they arrive.
 # -----------------------------------------------------------------------------
+server.mount_proc "/api/build-chat" do |req, res|
+  unless req.request_method == "POST"
+    json_response.call(res, 405, { error: "POST required." })
+    next
+  end
+
+  payload = JSON.parse(req.body.to_s) rescue {}
+  question = payload["question"].to_s.strip
+  if question.empty?
+    json_response.call(res, 400, { error: "Please describe what you want Faith to build." })
+    next
+  end
+
+  if end_build_request.call(question)
+    mutex.synchronize do
+      build_active = false
+      build_messages = []
+    end
+    answer = "Build mode is now closed. Our regular Faith chat is back."
+    json_response.call(res, 200, {
+      answer: answer, expression: "explanation", session_mode: "idle",
+      images: [], image_mode: "none", image_generation_available: false,
+      image_request: false
+    })
+    next
+  end
+
+  was_build_active = mutex.synchronize { build_active }
+  capability_only = !was_build_active && build_capability_question.call(question) && !build_direct_request.call(question)
+  mutex.synchronize do
+    unless build_active
+      build_active = true
+      build_messages = [{
+        role: "system",
+        content: <<~BUILD_SYSTEM.strip
+          You are Faith in Build mode, a practical coding assistant. The user wants to create software from the ground up.
+          Write real, usable code and explain key choices briefly. Prefer complete working implementations over vague outlines.
+          Keep track of requirements and code decisions across this conversation. When revising code, preserve working features unless the user asks to remove them.
+          Ask concise clarifying questions only when a missing decision prevents a useful implementation; otherwise choose sensible defaults and state them.
+          Do not claim you ran code or tests unless you actually did. When outputting code, use fenced code blocks with accurate language labels.
+          You are still Faith. Do not identify yourself as Qwen or as a different assistant.
+        BUILD_SYSTEM
+      }]
+    end
+  end
+
+  if capability_only
+    answer = "Absolutely! I can build code with you from the ground up. Tell me what you want me to make — an app, website, game, script, tool, or something else — and describe what it should do."
+    mutex.synchronize do
+      build_messages << { role: "user", content: question }
+      build_messages << { role: "assistant", content: answer }
+      build_messages = [build_messages.first] + build_messages[1..].last(24) if build_messages.length > 25
+    end
+    res.status = 200
+    res["Content-Type"] = "text/event-stream; charset=utf-8"
+    res["Cache-Control"] = "no-cache, no-store, must-revalidate"
+    res["Connection"] = "keep-alive"
+    res["X-Accel-Buffering"] = "no"
+    res["X-Faith-Server-Version"] = FAITH_SERVER_VERSION
+    res.chunked = true
+    res.body = proc do |out|
+      emit = lambda { |event| out.write("data: #{JSON.generate(event)}\n\n") }
+      emit.call({ type: "status", phase: "build-ready", message: "Build mode is ready." })
+      emit.call({ type: "delta", text: answer })
+      emit.call({ type: "text_complete", answer: answer, expression: "build", session_mode: "build" })
+      emit.call({ type: "done", answer: answer, expression: "build", session_mode: "build", images: [], image_mode: "none" })
+    end
+    next
+  end
+
+  # A direct build request activates Build mode and immediately starts coding.
+  # All later turns use the same persistent build history and :8090 endpoint.
+  mutex.synchronize { build_messages << { role: "user", content: question } }
+  res.status = 200
+  res["Content-Type"] = "text/event-stream; charset=utf-8"
+  res["Cache-Control"] = "no-cache, no-store, must-revalidate"
+  res["Pragma"] = "no-cache"
+  res["Connection"] = "keep-alive"
+  res["X-Accel-Buffering"] = "no"
+  res["X-Faith-Server-Version"] = FAITH_SERVER_VERSION
+  res["X-Faith-Build-Relay"] = "coding-stream"
+  res.chunked = true
+  res.body = proc do |out|
+    emit = lambda { |event| out.write("data: #{JSON.generate(event)}\n\n") }
+    begin
+      emit.call({ type: "status", phase: "connecting", message: "Getting response from Qwen code port on :8090…" })
+      uri = URI.parse(ENV.fetch("FAITH_CODER_AI_URL", "http://127.0.0.1:8090/v1/chat/completions"))
+      model_id = ENV.fetch("FAITH_CODER_AI_MODEL", "coding-local")
+      history = mutex.synchronize { build_messages.map(&:dup) }
+      body = { model: model_id, messages: history, stream: true, max_tokens: Integer(ENV.fetch("FAITH_BUILD_MAX_TOKENS", "4096")), temperature: 0.25 }
+      http = Net::HTTP.new(uri.host, uri.port)
+      http.open_timeout = 5
+      http.read_timeout = Integer(ENV.fetch("FAITH_BUILD_READ_TIMEOUT", "900"))
+      http.write_timeout = 30 if http.respond_to?(:write_timeout=)
+      request = Net::HTTP::Post.new(uri.request_uri)
+      request["Content-Type"] = "application/json"
+      request["Accept"] = "text/event-stream"
+      request.body = JSON.generate(body)
+      buffer = +""
+      answer_parts = []
+      first_token = false
+      response_code = nil
+      http.request(request) do |response|
+        response_code = response.code.to_i
+        unless response.is_a?(Net::HTTPSuccess)
+          detail = response.body.to_s
+          raise "Build model returned HTTP #{response.code}: #{detail[0, 500]}"
+        end
+        response.read_body do |chunk|
+          buffer << chunk.to_s
+          while (newline = buffer.index("\n"))
+            line = buffer.slice!(0, newline + 1).strip
+            next unless line.start_with?("data:")
+            data = line.sub(/\Adata:\s*/, "")
+            next if data == "[DONE]"
+            begin
+              event = JSON.parse(data)
+              delta = event.dig("choices", 0, "delta", "content").to_s
+              delta = event.dig("choices", 0, "message", "content").to_s if delta.empty?
+              next if delta.empty?
+              unless first_token
+                first_token = true
+                emit.call({ type: "status", phase: "building", message: "Qwen is writing your code…" })
+              end
+              answer_parts << delta
+              emit.call({ type: "delta", text: delta })
+            rescue JSON::ParserError
+              next
+            end
+          end
+        end
+      end
+      answer = answer_parts.join.strip
+      raise "The coding model returned no text. Confirm the coding GGUF server is running on port 8090." if answer.empty?
+      mutex.synchronize do
+        build_messages << { role: "assistant", content: answer }
+        build_messages = [build_messages.first] + build_messages[1..].last(24) if build_messages.length > 25
+      end
+      emit.call({ type: "text_complete", answer: answer, expression: "build", session_mode: "build" })
+      emit.call({ type: "done", answer: answer, expression: "build", session_mode: "build", images: [], image_mode: "none" })
+    rescue StandardError => error
+      warn "[Faith Build] #{error.class}: #{error.message}"
+      # Roll back the unanswered user turn so retries don't accumulate duplicates.
+      mutex.synchronize do
+        build_messages.pop if build_messages.last && build_messages.last[:role] == "user"
+      end
+      emit.call({ type: "error", error: "Faith's Build model could not complete the request: #{error.message}" })
+    end
+  end
+end
+
+# -----------------------------------------------------------------------------
+# CODER EDIT RELAY (:8090)
+# Troubleshooting edits an existing uploaded source file. The user explicitly
+# enters this mode, uploads source plus requested changes, and receives streamed
+# code plus a downloadable completed file. Troubleshooting diagnosis is a separate direct :8090 request.
+# -----------------------------------------------------------------------------
+server.mount_proc "/api/coder-edit" do |req, res|
+  unless req.request_method == "POST"
+    json_response.call(res, 405, { error: "POST required." })
+    next
+  end
+
+  payload = JSON.parse(req.body.to_s) rescue {}
+  question = payload["question"].to_s.strip
+  automatic_fix = payload["automatic_fix"] == true || question.match?(/\b(?:automatic\s+fix|auto(?:matic)?ally\s+fix|search\s+(?:the\s+)?web\s+for\s+(?:a\s+)?fix|find\s+(?:a\s+)?fix\s+online)\b/i)
+  review_only = !automatic_fix && question.match?(/\b(?:review|check|inspect|analy[sz]e)\b/i) &&
+    !question.match?(/\b(?:change|modify|edit|update|fix|repair|correct|patch|refactor|add|remove|replace|implement)\b/i)
+  state = mutex.synchronize { { filename: latest_code_filename.to_s, code: latest_code_text.to_s, diagnosis: latest_troubleshooting_response.to_s } }
+  if state[:filename].empty? || state[:code].strip.empty?
+    json_response.call(res, 400, { error: "Upload an existing source-code file first, then describe the changes you want." })
+    next
+  end
+  if question.empty?
+    json_response.call(res, 400, { error: "Describe the changes you want made to the uploaded source file." })
+    next
+  end
+
+  res.status = 200
+  res["Content-Type"] = "text/event-stream; charset=utf-8"
+  res["Cache-Control"] = "no-cache, no-store, must-revalidate"
+  res["Connection"] = "keep-alive"
+  res["X-Accel-Buffering"] = "no"
+  res["X-Faith-Server-Version"] = FAITH_SERVER_VERSION
+  res.chunked = true
+  res.body = proc do |out|
+    emit = lambda { |event| out.write("data: #{JSON.generate(event)}\n\n") }
+    begin
+      research_context = ""
+      if automatic_fix
+        emit.call({ type: "status", phase: "searching", message: "Searching for relevant fixes online…" })
+        # Keep this stage strictly to a bounded web search. Do NOT call
+        # search_troubleshooting_web here: that helper also calls Faith's normal
+        # chat model to synthesize a diagnosis, which can stall the edit relay
+        # before the coding model on :8090 is ever reached.
+        begin
+          request_terms = question.gsub(/\s+/, " ")[0, 260]
+          code_clues = state[:code].to_s.lines.select { |line| line.match?(/\b(?:error|exception|traceback|undefined|cannot find symbol|not found|failed|failure|TODO|FIXME|HACK)\b/i) }.first(5).join(" ").gsub(/\s+/, " ")
+          diagnosis_clues = state[:diagnosis].to_s.gsub(/\s+/, " ")[0, 700]
+          terms = [request_terms, state[:filename], code_clues, diagnosis_clues].reject(&:empty?).join(" ")[0, 900]
+          search_connection = Faraday.new(url: "https://html.duckduckgo.com") do |f|
+            f.headers["User-Agent"] = "Mozilla/5.0 (compatible; FaithTroubleshooter/1.0)"
+            f.options.timeout = 8
+            f.options.open_timeout = 4
+          end
+          search_response = search_connection.get("/html/", { "q" => "#{terms} programming error fix Stack Overflow GitHub" })
+          if search_response.success?
+            results = []
+            search_response.body.to_s.scan(/<a[^>]+class="result__a"[^>]+href="([^"]+)"[^>]*>(.*?)<\/a>/im).first(6).each do |href, title|
+              url = href.to_s.gsub(/&amp;/, "&")
+              label = title.to_s.gsub(/<[^>]+>/, "").gsub(/&amp;/, "&").gsub(/&quot;/, '"').strip
+              results << "- #{label[0, 180]}: #{url[0, 500]}" if url.start_with?("http") && !label.empty?
+            end
+            research_context = results.join("\n")
+          end
+          research_context = "No useful web results were returned; inspect the source directly and make only a safe, well-supported repair." if research_context.empty?
+        rescue StandardError => research_error
+          warn "Faith automatic-fix research failed: #{research_error.class}: #{research_error.message}"
+          research_context = "Web research was unavailable; inspect the supplied source directly and apply a safe, well-supported repair."
+        end
+      end
+
+      emit.call({ type: "status", phase: "connecting", message: "Getting response from Qwen code port on :8090…" })
+      if review_only
+        action = <<~ACTION
+          Review the supplied source file without modifying it. Return a concise,
+          useful code review: concrete findings, severity, why each matters, and
+          suggested changes. Cite line numbers when possible. Do not output the
+          full source file or invent findings that are not supported by the code.
+        ACTION
+      elsif automatic_fix
+        action = <<~ACTION
+          Use the troubleshooting diagnosis and web research context together to
+          identify and apply the best-supported repair to the existing source file.
+          Treat the diagnosis as a lead to verify, not as unquestionable truth.
+          Do not blindly copy a fix that does not fit this source. Preserve unrelated
+          behavior. If research is inconclusive, make only changes supported by the
+          source and clearly avoid claiming that the issue was verified externally.
+        ACTION
+      else
+        action = <<~ACTION
+          Make the specific changes the user requested to the existing source file.
+          This is an edit task, not a ground-up rewrite and not just a diagnosis.
+          Treat the user's request as the requirements for the edit. Implement each
+          requested change supported by the supplied source; do not substitute an
+          automatic diagnosis or unrelated improvements. Preserve unrelated behavior
+          and existing project-specific logic. If a detail is ambiguous, choose the
+          safest reasonable interpretation rather than returning advice only.
+        ACTION
+      end
+      prompt = <<~PROMPT
+        You are Faith in Troubleshooting/Coding mode. Edit the user's EXISTING
+        source file and stream the complete revised file as your response.
+
+        RULES:
+        - For a review-only request, output a concise review report with findings
+          and suggested changes, not the source file. For an edit request, output
+          the complete final source file only: no preface, Markdown fences, diff,
+          omission markers, or commentary.
+        - For edits, preserve the file's language, filename-compatible format,
+          imports, public APIs, unrelated features, and existing behavior unless
+          the user's requested change requires otherwise.
+        - The user may request multiple exact changes. Implement them directly;
+          do not merely explain how the user could make the changes.
+        - Never replace working code with placeholders or ellipses.
+        - Do not claim that tests were run.
+
+        TASK:
+        #{action}
+
+        USER'S REQUEST:
+        #{question[0, 5000]}
+
+        #{automatic_fix ? "PRIOR TROUBLESHOOTING DIAGNOSIS (verify it against the actual source):\n#{state[:diagnosis][0, 12000]}\n\nWEB RESEARCH / DIAGNOSTIC LEADS (verify these against the source; they may be incomplete):\n#{research_context}" : ""}
+
+        ORIGINAL FILE NAME:
+        #{state[:filename]}
+
+        ORIGINAL SOURCE FILE:
+        #{state[:code][0, 120000]}
+      PROMPT
+      uri = URI.parse(ENV.fetch("FAITH_CODER_AI_URL", "http://127.0.0.1:8090/v1/chat/completions"))
+      model_id = ENV.fetch("FAITH_CODER_AI_MODEL", "coding-local")
+      body = { model: model_id, messages: [
+        { role: "system", content: SYSTEM_PROMPT + "\nReturn complete source code only. You are editing an existing file, not creating a replacement project from scratch." },
+        { role: "user", content: prompt }
+      ], stream: true, max_tokens: Integer(ENV.fetch("FAITH_TROUBLESHOOT_EDIT_MAX_TOKENS", "8192")), temperature: 0.15 }
+      http = Net::HTTP.new(uri.host, uri.port)
+      http.open_timeout = 5
+      http.read_timeout = Integer(ENV.fetch("FAITH_CODER_READ_TIMEOUT", "900"))
+      http.write_timeout = 30 if http.respond_to?(:write_timeout=)
+      request = Net::HTTP::Post.new(uri.request_uri)
+      request["Content-Type"] = "application/json"
+      request["Accept"] = "text/event-stream"
+      request.body = JSON.generate(body)
+
+      buffer = +""
+      parts = []
+      got_token = false
+      http.request(request) do |response|
+        unless response.is_a?(Net::HTTPSuccess)
+          detail = response.body.to_s
+          raise "Coding model returned HTTP #{response.code}: #{detail[0, 500]}"
+        end
+        response.read_body do |chunk|
+          buffer << chunk.to_s
+          while (newline = buffer.index("\n"))
+            line = buffer.slice!(0, newline + 1).strip
+            next unless line.start_with?("data:")
+            data = line.sub(/\Adata:\s*/, "")
+            next if data == "[DONE]"
+            begin
+              packet = JSON.parse(data)
+              delta = packet.dig("choices", 0, "delta", "content").to_s
+              delta = packet.dig("choices", 0, "message", "content").to_s if delta.empty?
+              next if delta.empty?
+              unless got_token
+                got_token = true
+                emit.call({ type: "status", phase: "coding", message: "Applying your requested changes…" })
+              end
+              parts << delta
+              emit.call({ type: "delta", text: delta })
+            rescue JSON::ParserError
+              next
+            end
+          end
+        end
+      end
+      raise "The coding model returned no source text. Confirm Qwen's coding server is running on port 8090." unless got_token
+
+      revised_code = parts.join
+      if review_only
+        raise "The coding model returned an empty code review." if revised_code.strip.empty?
+        emit.call({ type: "done", expression: "troubleshooting", session_mode: "troubleshooting", review_only: true })
+        next
+      end
+      revised_code = revised_code.sub(/\A\s*```[^\n]*\n/, "").sub(/\n?```\s*\z/, "")
+      raise "The coding model returned an empty source file." if revised_code.strip.empty?
+
+      ext = File.extname(state[:filename])
+      stem = ext.empty? ? state[:filename] : state[:filename][0...-ext.length]
+      suffix = automatic_fix ? "_fixed" : "_updated"
+      output_filename = "#{stem}#{suffix}#{ext}"
+      safe_name = output_filename.gsub(/[^0-9A-Za-z._-]/, "_")
+      stored_name = "#{SecureRandom.hex(8)}-#{safe_name}"
+      stored_path = File.join(UPLOAD_DIR, stored_name)
+      File.binwrite(stored_path, revised_code)
+      mutex.synchronize do
+        latest_code_filename = output_filename
+        latest_code_text = revised_code
+        latest_code_context = "Uploaded file: #{output_filename}\n#{revised_code}"[0, 16000]
+        latest_troubleshooting_response = nil
+        troubleshooting_active = true
+        troubleshooting_diagnosis_ready = false
+        coding_active = false
+      end
+      emit.call({ type: "done", expression: "coding", session_mode: "troubleshooting",
+                  attachment: { name: output_filename, url: "/uploads/#{stored_name}", type: "text/plain", size: revised_code.bytesize } })
+    rescue StandardError => error
+      warn "[Faith Coder Edit] #{error.class}: #{error.message}"
+      emit.call({ type: "error", error: "Faith could not finish editing the file: #{error.message}" })
+    end
+  end
+end
+
 server.mount_proc "/api/coder-troubleshoot" do |req, res|
   unless req.request_method == "POST"
     json_response.call(res, 405, { error: "POST required." })
@@ -3209,7 +3609,9 @@ server.mount_proc "/api/coder-troubleshoot" do |req, res|
   res.body = proc do |out|
     emit = lambda { |event| out.write("data: #{JSON.generate(event)}\n\n") }
     begin
-      emit.call({ type: "status", phase: "connecting", message: "Connecting to Faith's coding model..." })
+      emit.call({ type: "status", phase: "file-confirmed", filename: filename, source_chars: code_text.length,
+                  message: "Faith received #{filename} (#{code_text.length} characters). Sending the source and your request to Qwen on :8090…" })
+      emit.call({ type: "status", phase: "connecting", message: "Connecting to Qwen code port on :8090…" })
       uri = URI.parse(ENV.fetch("FAITH_CODER_AI_URL", "http://127.0.0.1:8090/v1/chat/completions"))
       model_id = ENV.fetch("FAITH_CODER_AI_MODEL", "coding-local")
       prompt = <<~PROMPT
@@ -3218,8 +3620,8 @@ server.mount_proc "/api/coder-troubleshoot" do |req, res|
         FILE: #{filename}
         USER REQUEST: #{question.empty? ? "Please troubleshoot this source file." : question}
 
-        SOURCE CODE:
-        #{code_text[0, 50000]}
+        SOURCE CODE (the exact uploaded file content received by Faith):
+        #{code_text[0, 120000]}
       PROMPT
       body = { model: model_id, messages: [{ role: "user", content: prompt }], stream: true, max_tokens: 2048, temperature: 0.2 }
       http = Net::HTTP.new(uri.host, uri.port)
@@ -3231,6 +3633,7 @@ server.mount_proc "/api/coder-troubleshoot" do |req, res|
       request.body = JSON.generate(body)
       emit.call({ type: "status", phase: "processing", message: "Processing source with the coding GGUF..." })
       buffer = +""
+      answer_parts = []
       got_token = false
       http.request(request) do |response|
         unless response.is_a?(Net::HTTPSuccess)
@@ -3247,11 +3650,13 @@ server.mount_proc "/api/coder-troubleshoot" do |req, res|
             begin
               event = JSON.parse(data)
               delta = event.dig("choices", 0, "delta", "content").to_s
+              delta = event.dig("choices", 0, "message", "content").to_s if delta.empty?
               next if delta.empty?
               unless got_token
                 got_token = true
-                emit.call({ type: "status", phase: "coding", message: "Coding response received — relaying output..." })
+                emit.call({ type: "status", phase: "coding", message: "Qwen on :8090 received the source and is returning its troubleshooting reply…" })
               end
+              answer_parts << delta
               emit.call({ type: "delta", text: delta })
             rescue JSON::ParserError
               next
@@ -3260,13 +3665,15 @@ server.mount_proc "/api/coder-troubleshoot" do |req, res|
         end
       end
       raise "The coding model returned no text. Check that the GGUF server is running on port 8090." unless got_token
+      diagnosis = answer_parts.join.strip
+      raise "Qwen on :8090 returned an empty troubleshooting reply." if diagnosis.empty?
       mutex.synchronize do
-        latest_troubleshooting_response = "Completed by coding GGUF."
+        latest_troubleshooting_response = diagnosis
         troubleshooting_active = true
         troubleshooting_diagnosis_ready = true
         troubleshooting_turn_count += 1
       end
-      emit.call({ type: "done", expression: "coding", session_mode: "troubleshooting" })
+      emit.call({ type: "done", answer: diagnosis, filename: filename, expression: "troubleshooting", session_mode: "troubleshooting" })
     rescue StandardError => error
       warn "[Faith Coder Troubleshooting] #{error.class}: #{error.message}"
       emit.call({ type: "error", error: error.message })
@@ -3330,6 +3737,8 @@ server.mount_proc "/api/clear" do |req, res|
     troubleshooting_active = false
     troubleshooting_diagnosis_ready = false
     coding_active = false
+    build_active = false
+    build_messages = []
   end
 
   json_response.call(res, 200, { ok: true })
