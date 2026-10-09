@@ -1,4 +1,4 @@
-const FAITH_CLIENT_VERSION = "63-parallel-wikimedia-during-qwen";
+const FAITH_CLIENT_VERSION = "71-build-request-lifecycle-reset";
 const expressionImages = {
   ruby: "/assets/ruby_wrench.png",
   thinking: "/assets/thinking.PNG",
@@ -9,6 +9,7 @@ const expressionImages = {
   observing: "/assets/observing.PNG",
   troubleshooting: "/assets/troubleshooting.PNG",
   coding: "/assets/coding.PNG",
+  build: "/assets/build.png",
   robotic: "/assets/robotic.PNG",
   psychotic: "/assets/psychotic.PNG",
   sad: "/assets/sad.PNG",
@@ -25,6 +26,7 @@ const expressionNames = {
   observing: "Observing",
   troubleshooting: "Troubleshooting",
   coding: "Coding",
+  build: "Build",
   robotic: "Robotic",
   psychotic: "Psychotic",
   sad: "Sad",
@@ -41,6 +43,7 @@ const expressionDetails = {
   observing: "Examining your upload...",
   troubleshooting: "Troubleshooting...",
   coding: "Coding...",
+  build: "Building from the ground up...",
   robotic: "Processing...",
   psychotic: "Something is watching...",
   sad: "I'm here with you",
@@ -61,6 +64,11 @@ const uploadStatus = document.getElementById("upload-status");
 
 let busy = false;
 let sessionMode = "idle";
+let buildRequestSequence = 0;
+let activeBuildController = null;
+let turnSequence = 0;
+let activeChatController = null;
+let troubleshootingDiagnosisReady = false;
 let pendingCodeFile = null;
 
 // These are the exact two local vision files Faith requires. They are kept in
@@ -300,16 +308,38 @@ imageMessageStyles.textContent = `
 `;
 document.head.appendChild(imageMessageStyles);
 
+let expressionSwapTimer = null;
+let displayedExpressionName = null;
+let pendingExpressionName = null;
+
 function setExpression(name, customDetail = null) {
   if (!expressionImages[name]) return;
 
-  expression.classList.add("swap");
+  // Update the caption immediately. Repeated status/token events for the same
+  // expression must not restart the image fade timer; doing so made Build
+  // appear to flicker between the old and new expression.
+  status.textContent = expressionNames[name];
+  detail.textContent = customDetail || expressionDetails[name];
 
-  window.setTimeout(() => {
+  if (pendingExpressionName === name) return;
+  if (displayedExpressionName === name && pendingExpressionName === null) {
+    expression.classList.remove("swap");
+    return;
+  }
+
+  if (expressionSwapTimer !== null) {
+    window.clearTimeout(expressionSwapTimer);
+    expressionSwapTimer = null;
+  }
+
+  pendingExpressionName = name;
+  expression.classList.add("swap");
+  expressionSwapTimer = window.setTimeout(() => {
     expression.src = expressionImages[name];
     expression.alt = `${expressionNames[name]} expression`;
-    status.textContent = expressionNames[name];
-    detail.textContent = customDetail || expressionDetails[name];
+    displayedExpressionName = name;
+    pendingExpressionName = null;
+    expressionSwapTimer = null;
     expression.classList.remove("swap");
   }, 120);
 }
@@ -458,22 +488,57 @@ function formatFaithMessage(text) {
     const rawLine = lines[i];
     const line = rawLine.trim();
 
-    if (line.startsWith("```") || line.startsWith("<code>")) {
+    const fenceMatch = line.match(/^```([^\s`]*)/);
+    const htmlCodeMatch = line.match(/^<(?:pre\s*><)?code\b([^>]*)>/i);
+    if (fenceMatch || htmlCodeMatch) {
       flushParagraph();
       closeList();
 
-      const fenced = line.startsWith("```");
-      const closeToken = fenced ? "```" : "</code>";
+      const fenced = Boolean(fenceMatch);
+      const closeToken = fenced ? "```" : (line.toLowerCase().startsWith("<pre") ? "</code></pre>" : "</code>");
+      let language = fenced ? (fenceMatch[1] || "") : "";
+      if (!fenced && htmlCodeMatch) {
+        const classMatch = htmlCodeMatch[1].match(/class\s*=\s*["'][^"']*(?:language|lang)-([a-z0-9_+#.-]+)/i);
+        if (classMatch) language = classMatch[1];
+      }
+      if (!language && pendingCodeFile && pendingCodeFile.name) {
+        const extension = String(pendingCodeFile.name).split(".").pop().toLowerCase();
+        const extensionLanguages = {
+          js: "javascript", mjs: "javascript", cjs: "javascript",
+          jsx: "javascript", ts: "typescript", tsx: "typescript",
+          rb: "ruby", py: "python", java: "java", kt: "kotlin",
+          html: "html", htm: "html", css: "css", json: "json",
+          sh: "bash", bash: "bash", bat: "dos", cmd: "dos",
+          c: "c", h: "c", cc: "cpp", cpp: "cpp", hpp: "cpp",
+          cs: "csharp", go: "go", rs: "rust", php: "php",
+          sql: "sql", xml: "xml", yml: "yaml", yaml: "yaml"
+        };
+        language = extensionLanguages[extension] || "";
+      }
+      language = String(language).toLowerCase().replace(/[^a-z0-9_+#.-]/g, "");
       let firstCodeLine = fenced
-        ? line.replace(/^```[^\s]*\s*/, "")
-        : line.replace(/^<code>\s*/, "");
+        ? line.replace(/^```[^\s`]*\s*/, "")
+        : line.replace(/^<(?:pre\s*><)?code\b[^>]*>\s*/i, "");
+
+      // Also accept complete HTML wrappers arriving on a single line, e.g.
+      // <pre><code class="language-ruby">puts "hi"</code></pre>.
+      if (!fenced && /<\/code>\s*(?:<\/pre>)?\s*$/i.test(firstCodeLine)) {
+        firstCodeLine = firstCodeLine.replace(/<\/code>\s*(?:<\/pre>)?\s*$/i, "");
+        const inlineCode = firstCodeLine ? escapeHtml(firstCodeLine) : "";
+        const inlineLanguageClass = language ? ` class="language-${escapeHtml(language)}"` : "";
+        output.push(`<pre class="faith-code-block"><code${inlineLanguageClass}>${inlineCode}</code></pre>`);
+        i += 1;
+        continue;
+      }
+
       const codeLines = [];
       if (firstCodeLine) codeLines.push(firstCodeLine);
       i += 1;
 
       while (i < lines.length) {
         const codeLine = lines[i];
-        if (codeLine.trim() === closeToken) {
+        const trimmedCodeLine = codeLine.trim().toLowerCase();
+        if (fenced ? trimmedCodeLine === "```" : trimmedCodeLine === closeToken.toLowerCase() || (!closeToken.includes("</pre>") && trimmedCodeLine === "</code>")) {
           i += 1;
           break;
         }
@@ -481,7 +546,8 @@ function formatFaithMessage(text) {
         i += 1;
       }
 
-      output.push(`<pre class="faith-code-block"><code>${escapeHtml(codeLines.join("\n"))}</code></pre>`);
+      const languageClass = language ? ` class="language-${escapeHtml(language)}"` : "";
+      output.push(`<pre class="faith-code-block"><code${languageClass}>${escapeHtml(codeLines.join("\n"))}</code></pre>`);
       continue;
     }
 
@@ -538,6 +604,37 @@ function formatFaithMessage(text) {
   return output.join("");
 }
 
+// Syntax highlighting runs in the browser because code from the :8090
+// coding stream is rendered here, after it has arrived. Language labels from
+// fenced blocks are preserved; unlabeled blocks use Highlight.js auto-detection.
+const faithCodeHighlightTimers = new WeakMap();
+
+function scheduleCodeHighlight(root) {
+  if (!root || typeof root.querySelectorAll !== "function") return;
+  const previousTimer = faithCodeHighlightTimers.get(root);
+  if (previousTimer) clearTimeout(previousTimer);
+
+  const timer = setTimeout(() => {
+    faithCodeHighlightTimers.delete(root);
+    const highlighter = window.hljs;
+    if (!highlighter || typeof highlighter.highlightElement !== "function") return;
+
+    root.querySelectorAll("pre code").forEach((code) => {
+      // Newly rendered HTML has no data-highlighted flag. Avoid reprocessing
+      // already highlighted code when only an adjacent UI element changes.
+      if (code.dataset.highlighted === "yes") return;
+      try {
+        highlighter.highlightElement(code);
+        code.dataset.highlighted = "yes";
+      } catch (error) {
+        console.warn("[Faith syntax highlighting] Could not highlight code block:", error);
+      }
+    });
+  }, 90);
+
+  faithCodeHighlightTimers.set(root, timer);
+}
+
 function appendMessage(speaker, text, type, images = [], options = {}) {
   const item = document.createElement("div");
   item.className = `message ${type}`;
@@ -551,6 +648,7 @@ function appendMessage(speaker, text, type, images = [], options = {}) {
   const textNode = document.createElement("div");
   textNode.className = "message-text";
   textNode.innerHTML = formatFaithMessage(text);
+  scheduleCodeHighlight(textNode);
   item.appendChild(textNode);
 
   appendImages(item, images, options.onGeneratedStateChange);
@@ -694,6 +792,7 @@ function applySourcedAnswerToMessage(messageItem, sourcedAnswer) {
   if (!next || next === current) return false;
 
   textNode.innerHTML = formatFaithMessage(next);
+  scheduleCodeHighlight(textNode);
   renderFaithSourceTokensIfAvailable(textNode);
   chat.scrollTop = chat.scrollHeight;
   return true;
@@ -790,12 +889,12 @@ function removeLoadingMessage(item) {
   }
 }
 
-function appendQwenRelayLoadingMessage() {
-  const item = appendLoadingMessage("Getting response from Qwen and llama_server... (0s)");
+function appendQwenRelayLoadingMessage(label = "Getting response from Qwen and llama_server...") {
+  const item = appendLoadingMessage(`${label} (0s)`);
   const startedAt = Date.now();
   const timer = setInterval(() => {
     const seconds = Math.floor((Date.now() - startedAt) / 1000);
-    updateLoadingMessage(item, `Getting response from Qwen and llama_server... (${seconds}s)`);
+    updateLoadingMessage(item, `${label} (${seconds}s)`);
   }, 250);
   return {
     item,
@@ -874,9 +973,10 @@ async function consumeQwenStream(response, qwenRelayLoading) {
       const completedExpression = [
         "robotic", "psychotic", "sad", "anger",
         "greeting", "thinking", "explanation", "confusion",
-        "troubleshooting", "observing", "coding"
+        "troubleshooting", "observing", "coding", "build"
       ].includes(event.expression) ? event.expression : "explanation";
-      if (event.session_mode === "coding") sessionMode = "coding";
+      if (event.session_mode === "build") sessionMode = "build";
+      else if (event.session_mode === "coding") sessionMode = "coding";
       else if (event.session_mode === "troubleshooting") sessionMode = "troubleshooting";
       else sessionMode = "idle";
       setExpression(completedExpression);
@@ -960,7 +1060,8 @@ async function consumeQwenStream(response, qwenRelayLoading) {
 function setBusy(value) {
   busy = value;
   send.disabled = value;
-  clear.disabled = value;
+  // Clear must remain usable even if an AI stream is stuck.
+  clear.disabled = false;
   input.disabled = value;
   if (upload) upload.disabled = value;
 }
@@ -990,7 +1091,11 @@ function appendAttachmentMessage(speaker, file, meta = null) {
 
   const textNode = document.createElement("div");
   textNode.className = "message-text";
-  textNode.textContent = (meta && meta.status) || "Uploaded file";
+  // Keep the user's actual instructions and the attachment card in one chat
+  // message; never add a generic second "Sent - filename" message.
+  const comment = (meta && meta.comment) || (meta && meta.status) || "Uploaded file";
+  textNode.innerHTML = formatFaithMessage(comment);
+  scheduleCodeHighlight(textNode);
   item.appendChild(textNode);
 
   const card = document.createElement("div");
@@ -1071,40 +1176,36 @@ function addFixCodeButton(messageItem) {
 
   const button = document.createElement("button");
   button.type = "button";
-  button.textContent = "Fix Code";
-  button.title = "Apply Faith's troubleshooting diagnosis to the uploaded source file";
+  button.className = "automatic-fix-action";
+  button.textContent = "Automatic Fix";
+  button.title = "Search for relevant fixes online, then have the coding GGUF apply the best-supported repair to this file";
   button.addEventListener("click", async () => {
     if (busy) return;
     setBusy(true);
-    sessionMode = "coding";
-    setExpression("coding", "Applying the fix...");
+    sessionMode = "troubleshooting";
     button.disabled = true;
+    setExpression("troubleshooting", "Searching for known fixes, then applying the repair with the coding model…");
 
     try {
-      const response = await fetch("/api/fix-code", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ question: "Fix the diagnosed problem in the uploaded code and return the completed corrected file." })
-      });
-      const data = await response.json();
-      if (!response.ok) throw new Error(data.error || `HTTP ${response.status}`);
-
-      sessionMode = "coding";
-      setExpression("coding", "Code fixed");
-      const faithItem = appendMessage("Faith", data.answer || "I fixed the code and prepared the completed file.", "ai");
-      if (data.attachment && data.attachment.url) {
-        const link = document.createElement("a");
-        link.href = data.attachment.url;
-        link.target = "_blank";
-        link.rel = "noopener noreferrer";
-        link.textContent = `Open fixed file: ${data.filename || data.attachment.name || "fixed source"}`;
-        link.style.display = "inline-block";
-        link.style.marginTop = "8px";
-        faithItem.appendChild(link);
-      }
+      // Automatic Fix uses the researched repair path in /api/coder-edit:
+      // server.rb searches the web, sends the source + findings to the coding
+      // GGUF on :8090, writes a complete revised file, and keeps that file as
+      // the active Troubleshooting source for follow-up edits.
+      await runCoderTroubleshooting(
+        "Automatic fix: search the web for relevant known solutions, verify them against the uploaded source, and apply the best-supported repair. Preserve unrelated behavior and return the complete corrected file.",
+        { automaticFix: true }
+      );
+      // Keep Troubleshooting as the active editing session, but do NOT reset
+      // the visible expression here: runCoderTroubleshooting switches to the
+      // original Coding expression only after the :8090 stream closes and the
+      // complete response has been received. Resetting it here immediately
+      // undid that transition, making Automatic Fix appear stuck in
+      // Troubleshooting even though the coding response had completed.
+      sessionMode = "troubleshooting";
+      troubleshootingDiagnosisReady = true;
     } catch (error) {
       sessionMode = "troubleshooting";
-      setExpression("troubleshooting", "Fix could not be completed");
+      setExpression("troubleshooting", "Automatic fix could not be completed");
       appendMessage("Error", error.message, "error");
       button.disabled = false;
     } finally {
@@ -1115,6 +1216,69 @@ function addFixCodeButton(messageItem) {
 
   wrap.appendChild(button);
   messageItem.appendChild(wrap);
+}
+
+async function runCoderDiagnosis(question) {
+  sessionMode = "troubleshooting";
+  troubleshootingDiagnosisReady = false;
+  setExpression("troubleshooting", "Sending the uploaded source to the coding GGUF for diagnosis on :8090…");
+  const faithItem = appendMessage("Faith", "I’ve received your file. I’m sending its actual contents to the coding model on :8090 for diagnosis…", "ai");
+  faithItem.classList.add("troubleshooting-pending");
+  const node = faithItem.querySelector(".message-text");
+  let answer = "";
+  let buffer = "";
+  let completed = false;
+  const response = await fetch(`/api/coder-troubleshoot?ts=${Date.now()}`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json", "Accept": "text/event-stream", "Cache-Control": "no-cache" },
+    cache: "no-store",
+    body: JSON.stringify({ question: question || "Please diagnose this uploaded source file and explain the most likely issue and repair." })
+  });
+  if (!response.ok) {
+    let data = {};
+    try { data = await response.json(); } catch (_) {}
+    throw new Error(data.error || `Troubleshooting diagnosis failed (HTTP ${response.status})`);
+  }
+  if (!response.body) throw new Error("The browser could not open the coding diagnosis stream.");
+  const reader = response.body.getReader();
+  const decoder = new TextDecoder();
+  const consume = (raw) => {
+    const line = raw.trim();
+    if (!line.startsWith("data:")) return;
+    let event;
+    try { event = JSON.parse(line.slice(5).trim()); } catch (_) { return; }
+    if (event.type === "status") {
+      setExpression("troubleshooting", event.message || "The coding model is diagnosing your source…");
+      if (!answer && node) node.textContent = event.message || "The coding model is diagnosing your source…";
+    } else if (event.type === "delta" && event.text) {
+      answer += event.text;
+      if (node) { node.innerHTML = formatFaithMessage(answer); scheduleCodeHighlight(node); }
+      chat.scrollTop = chat.scrollHeight;
+    } else if (event.type === "done") {
+      completed = true;
+      troubleshootingDiagnosisReady = true;
+      sessionMode = "troubleshooting";
+      faithItem.classList.remove("troubleshooting-pending");
+      if (node) { node.innerHTML = formatFaithMessage(answer || event.answer || "Diagnosis complete."); scheduleCodeHighlight(node); }
+      addFixCodeButton(faithItem);
+      setExpression("troubleshooting", "Diagnosis complete — Automatic Fix is ready");
+    } else if (event.type === "error") {
+      throw new Error(event.error || "The coding model could not diagnose the uploaded source.");
+    }
+  };
+  while (true) {
+    const { value, done } = await reader.read();
+    if (done) break;
+    buffer += decoder.decode(value, { stream: true });
+    let boundary;
+    while ((boundary = buffer.indexOf("\n\n")) >= 0) {
+      const frame = buffer.slice(0, boundary);
+      buffer = buffer.slice(boundary + 2);
+      frame.split("\n").forEach(consume);
+    }
+  }
+  if (buffer.trim()) buffer.split("\n").forEach(consume);
+  if (!completed || !answer.trim()) throw new Error("The coding GGUF ended before returning a complete diagnosis.");
 }
 
 async function uploadFileToFaith(file, suppliedQuestion = null) {
@@ -1135,20 +1299,30 @@ async function uploadFileToFaith(file, suppliedQuestion = null) {
   // Source code is staged like a chat attachment: selecting it alone must not
   // send it or start analysis. The next user message sends file + comment.
   if (!isImageUpload && !question) {
+    // Stage source files locally only. Do not upload them or create a chat
+    // message until the user has written the accompanying instruction and
+    // pressed Send. The selected filename is shown in the upload-status area.
     pendingCodeFile = file;
-    setUploadStatus(`Attached: ${file.name} — add a message to send`, false);
-    appendAttachmentMessage("You", file, { status: "Attached — add your comment and press Send" });
-    setExpression("thinking", "Code attached — waiting for your message");
+    setUploadStatus(`Selected: ${file.name} — write your instructions and press Send`, false);
+    setExpression(sessionMode === "troubleshooting" ? "troubleshooting" : "thinking", sessionMode === "troubleshooting" ? "Waiting for your change instructions" : "Code file selected — waiting for your message");
     return;
   }
   if (!isImageUpload) pendingCodeFile = null;
 
   setUploadStatus(`Selected: ${file.name}`);
   setBusy(true);
-  setExpression(isImageUpload ? "observing" : "thinking", isImageUpload ? "Checking vision files..." : "Reading file...");
+  setExpression(
+    isImageUpload ? "observing" : (sessionMode === "troubleshooting" ? "troubleshooting" : "thinking"),
+    isImageUpload ? "Checking vision files..." : (sessionMode === "troubleshooting" ? "Sending your file and change request to Faith…" : "Reading file...")
+  );
 
+  // Render the user's comment and attachment card together as one user message.
+  // No standalone "Sent - filename" chat message is created.
   appendAttachmentMessage("You", file, {
-    status: question ? `Uploading with question: ${question}` : "Uploading to Faith..."
+    comment: question || (isImageUpload ? "Image attachment" : `Attached ${file.name}`),
+    name: file.name,
+    type: file.type || "application/octet-stream",
+    size: file.size
   });
 
   let visionDownloads = [];
@@ -1214,6 +1388,7 @@ async function uploadFileToFaith(file, suppliedQuestion = null) {
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({
         question,
+        troubleshooting: !isImageUpload && sessionMode === "troubleshooting",
         file: {
           name: file.name,
           type: file.type || "application/octet-stream",
@@ -1248,23 +1423,17 @@ async function uploadFileToFaith(file, suppliedQuestion = null) {
 
     if (isImageUpload) {
       setExpression("observing", data.expression === "observing" ? "Examining your upload..." : "Image received");
+    } else if (sessionMode === "troubleshooting") {
+      setExpression("troubleshooting", "Sending your source and instructions to Qwen on :8090…");
     } else {
       setExpression("observing", "Examining your file...");
     }
 
-    const uploadCards = chat.querySelectorAll(".message-attachment");
-    const lastUploadCard = uploadCards[uploadCards.length - 1];
-    if (lastUploadCard) {
-      const parentMessage = lastUploadCard.closest(".message");
-      const messageText = parentMessage && parentMessage.querySelector(".message-text");
-      if (messageText) messageText.textContent = "Sent to Faith for analysis";
-    }
-
-    // If the user's attachment comment explicitly starts Troubleshooting,
-    // skip the upload-observer answer and hand the stored source directly to
-    // the coding GGUF stream. Otherwise, simply attach/read the file as normal.
-    if (!isImageUpload && /\b(?:troubleshoot|troubleshooting|debug|debugging)\b/i.test(question)) {
-      await runCoderTroubleshooting(question);
+    // Troubleshooting is a two-stage flow: upload -> diagnosis from the coding
+    // GGUF -> Automatic Fix button. Do not skip diagnosis and edit immediately.
+    if (!isImageUpload && (sessionMode === "troubleshooting" || /\b(?:troubleshoot|troubleshooting|debug|debugging|fix|repair|modify|change|edit)\b/i.test(question))) {
+      sessionMode = "troubleshooting";
+      await runCoderDiagnosis(question);
       return;
     }
 
@@ -1280,17 +1449,35 @@ async function uploadFileToFaith(file, suppliedQuestion = null) {
       offer.style.marginTop = "10px";
       offer.style.display = "flex";
       offer.style.alignItems = "center";
+      offer.style.flexWrap = "wrap";
       offer.style.gap = "8px";
       const offerText = document.createElement("span");
-      offerText.textContent = "Would you like me to troubleshoot this code?";
+      offerText.textContent = "Want to edit this existing file?";
       const troubleshootButton = document.createElement("button");
       troubleshootButton.type = "button";
-      troubleshootButton.textContent = "Troubleshoot";
+      troubleshootButton.textContent = "Enter Troubleshooting";
       troubleshootButton.addEventListener("click", () => {
-        input.value = `Please troubleshoot the uploaded code file ${file.name}. Search the web for matching errors and known fixes.`;
-        submitQuestion();
+        sessionMode = "troubleshooting";
+        setExpression("troubleshooting", "Ready for your change request");
+        appendMessage("Faith", "Troubleshooting mode is ready. I already have this uploaded file. Tell me what you want changed, checked, or reviewed. Say **Automatic fix** if you want me to search for known fixes and apply one.", "ai");
       });
-      offer.append(offerText, troubleshootButton);
+      const automaticFixButton = document.createElement("button");
+      automaticFixButton.type = "button";
+      automaticFixButton.textContent = "Automatic fix";
+      automaticFixButton.addEventListener("click", async () => {
+        if (busy) return;
+        setBusy(true);
+        try {
+          await runCoderTroubleshooting("Automatic fix: search the web for known fixes and apply the best supported repair to the uploaded file.", { automaticFix: true });
+        } catch (error) {
+          setExpression("troubleshooting", "Automatic fix could not be completed");
+          appendMessage("Error", error.message, "error");
+        } finally {
+          setBusy(false);
+          input.focus();
+        }
+      });
+      offer.append(offerText, troubleshootButton, automaticFixButton);
       const faithItemForOffer = chat.lastElementChild;
       if (faithItemForOffer) faithItemForOffer.appendChild(offer);
     }
@@ -1344,10 +1531,39 @@ async function uploadFileToFaith(file, suppliedQuestion = null) {
   }
 }
 
+function isAutomaticFixRequest(question) {
+  return /\b(?:automatic\s+fix|auto(?:matic)?ally\s+fix|search\s+(?:the\s+)?web\s+for\s+(?:a\s+)?fix|find\s+(?:a\s+)?fix\s+online)\b/i.test(String(question || ""));
+}
+
+function isTroubleshootingEntryRequest(question) {
+  const text = String(question || "").trim();
+  return /\b(?:enter|start|begin|switch\s+(?:to|into)|go\s+into|activate)\s+(?:the\s+)?troubleshooting(?:\s+mode|\s+session)?\b/i.test(text) ||
+    /\b(?:fix|debug|review|check|inspect|modify|change|edit|update|repair)\b[\s\S]{0,100}\b(?:my|this|the|existing|uploaded)?\s*(?:source\s+)?(?:code|file|script|program|class|function)\b/i.test(text) ||
+    /\b(?:code|file|script|program|class|function)\b[\s\S]{0,100}\b(?:fix|debug|review|check|inspect|modify|change|edit|update|repair)\b/i.test(text);
+}
+
 function isDirectCodeFixRequest(question) {
   const text = String(question || "");
   return /\b(?:fix|repair|correct|modify|change|edit|update|patch|resolve)\b[\s\S]*\b(?:code|file|source|error|bug|issue|problem)\b/i.test(text) ||
     /\b(?:can|could|will|would)\b[\s\S]*\b(?:you|faith)\b[\s\S]*\b(?:fix|repair|correct|modify|change|edit|patch)\b[\s\S]*\b(?:code|file|it|this)\b/i.test(text);
+}
+
+function isFaithBuildRequest(text) {
+  const value = String(text || "").trim();
+  if (!value) return false;
+
+  // Image creation belongs to Faith's Painting pipeline, not Build mode.
+  const asksForImage = /\b(?:generate|draw|paint|render|illustrate|sketch|create|make)\b[\s\S]*\b(?:image|picture|photo|portrait|drawing|painting|wallpaper)\b/i.test(value);
+  const softwareContext = /\b(?:code|coding|program|programming|software|app|application|website|web site|game|script|tool|utility|project|api|plugin|frontend|backend|html|css|javascript|typescript|python|ruby|java|c\+\+|from scratch|ground up)\b/i.test(value);
+  const explicitImageSoftwareRequest = /\b(?:code|coding|programming|script|image-processing app|image generator app|image-generation tool)\b/i.test(value) ||
+    /\b(?:app|application|website|tool|software)\b[\s\S]*\b(?:generate|draw|paint|create)\b[\s\S]*\b(?:image|picture|photo|art)\b/i.test(value);
+  if (asksForImage && !explicitImageSoftwareRequest) return false;
+
+  const capabilityAsk = /\b(?:can|could|would|will)\s+(?:you|faith)\s+(?:(?:also|please)\s+)?(?:(?:help|teach)\s+me\s+to\s+)?(?:build|create|write|code|develop|make|program)\b/i.test(value) && softwareContext;
+  const directBuild = (/\b(?:build|create|write|code|develop|make|program)\s+(?:(?:me|for me)\s+)?(?:a|an|the|some|my|this|that)\b[\s\S]{2,}/i.test(value) && softwareContext) ||
+    (/\b(?:let'?s|lets)\s+(?:build|create|write|code|develop|make|program)\b/i.test(value) && softwareContext) ||
+    (/\b(?:from scratch|ground up)\b/i.test(value) && softwareContext);
+  return capabilityAsk || directBuild;
 }
 
 function isFaithImageGenerationPhrase(text) {
@@ -1418,22 +1634,35 @@ async function runQwenPostEnrichment(messageItem, question, answer, wikimediaPro
   void Promise.allSettled([wikimediaTask, sourcesTask]);
 }
 
-async function runCoderTroubleshooting(question) {
-  // Publish progress as a real Faith chat reply immediately, then update that
-  // same bubble with each server status and finally stream the generated answer
-  // into it. Users can see the long-running processing stage in the transcript.
-  let faithItem = appendMessage("Faith", "Connecting to Faith's coding model...", "ai");
-  const showProgress = (message) => {
-    const node = faithItem && faithItem.querySelector(".message-text");
-    if (node) node.innerHTML = formatFaithMessage(message);
-    chat.scrollTop = chat.scrollHeight;
+async function runCoderTroubleshooting(question, options = {}) {
+  const automaticFix = !!options.automaticFix || isAutomaticFixRequest(question);
+  const reviewOnly = !automaticFix && /\b(?:review|check|inspect|analy[sz]e)\b/i.test(question) &&
+    !/\b(?:change|modify|edit|update|fix|repair|correct|patch|refactor|add|remove|replace|implement)\b/i.test(question);
+  sessionMode = "troubleshooting";
+  setExpression("troubleshooting", automaticFix ? "Searching for known fixes, then applying them…" : "Getting your requested code changes from Qwen on :8090…");
+
+  let faithItem = appendMessage(
+    "Faith",
+    automaticFix
+      ? "Searching for relevant fixes online, then I’ll send your file to Qwen on :8090 to apply the best fit."
+      : (reviewOnly
+        ? "Getting response from Qwen code port on :8090… I’m reviewing your file against your instructions."
+        : `Getting response from Qwen code port on :8090… I’m applying your requested changes: ${question}`),
+    "ai"
+  );
+  faithItem.classList.add("troubleshooting-pending");
+  const updateProgressMessage = (message) => {
+    if (answerHasStarted) return;
+    const node = faithItem.querySelector(".message-text");
+    if (node) node.textContent = message;
   };
-  showProgress("Connecting to Faith's coding model...");
-  const response = await fetch("/api/coder-troubleshoot", {
+  let answerHasStarted = false;
+
+  const response = await fetch(`/api/coder-edit?ts=${Date.now()}`, {
     method: "POST",
     headers: { "Content-Type": "application/json", "Accept": "text/event-stream", "Cache-Control": "no-cache" },
     cache: "no-store",
-    body: JSON.stringify({ question })
+    body: JSON.stringify({ question, automatic_fix: automaticFix })
   });
   if (!response.ok) {
     let data = {};
@@ -1441,44 +1670,65 @@ async function runCoderTroubleshooting(question) {
     throw new Error(data.error || `Coding service HTTP ${response.status}`);
   }
   if (!response.body) throw new Error("The browser could not open the coding stream.");
+
   const reader = response.body.getReader();
   const decoder = new TextDecoder();
   let buffer = "";
   let answer = "";
-  let startedCoding = false;
-  setExpression("troubleshooting", "Connecting to coding GGUF...");
+  let completed = false;
+  const paint = () => {
+    faithItem.classList.remove("troubleshooting-pending");
+    const node = faithItem.querySelector(".message-text");
+    if (node) { node.innerHTML = formatFaithMessage(reviewOnly ? answer : "```\n" + answer + "\n```"); scheduleCodeHighlight(node); }
+    chat.scrollTop = chat.scrollHeight;
+  };
   const consume = (raw) => {
     const line = raw.trim();
     if (!line.startsWith("data:")) return;
     let event;
     try { event = JSON.parse(line.slice(5).trim()); } catch (_) { return; }
     if (event.type === "status") {
-      // The progress is visible both in Faith's expression and as a chat reply.
-      if (event.phase === "processing") {
-        const message = event.message || "Processing source with the coding GGUF...";
-        setExpression("troubleshooting", message);
-        if (!startedCoding) showProgress(message);
-      }
-      if (event.phase === "connecting") {
-        const message = event.message || "Connecting...";
-        setExpression("troubleshooting", message);
-        if (!startedCoding) showProgress(message);
-      }
-      if (event.phase === "coding" && !startedCoding) {
-        startedCoding = true;
-        setExpression("coding", "Coding response received...");
+      if (event.phase === "searching") {
+        setExpression("troubleshooting", event.message || "Searching for relevant fixes online…");
+        updateProgressMessage("Searching for relevant fixes online… I’ll move on to Qwen on :8090 as soon as the search finishes.");
+      } else if (event.phase === "connecting") {
+        setExpression("troubleshooting", "Getting response from Qwen code port on :8090…");
+        updateProgressMessage("Search step finished. Getting response from Qwen code port on :8090…");
+      } else if (event.phase === "coding") {
+        // Keep the Troubleshooting expression active while code is still being
+        // relayed. Restore the original Coding expression only after the full
+        // coding response has arrived and the stream has closed successfully.
+        updateProgressMessage(automaticFix ? "Qwen is applying the fix and writing the updated file…" : "Qwen is writing the updated file…");
       }
     } else if (event.type === "delta" && event.text) {
-      if (!startedCoding) { startedCoding = true; setExpression("coding", "Coding..."); }
       answer += event.text;
-      const node = faithItem && faithItem.querySelector(".message-text");
-      if (node) node.innerHTML = formatFaithMessage(answer);
-      chat.scrollTop = chat.scrollHeight;
+      if (!answer.trimStart()) return;
+      answerHasStarted = true;
+      paint();
+    } else if (event.type === "done") {
+      completed = true;
+      sessionMode = "troubleshooting";
+      if (reviewOnly) {
+        faithItem.classList.remove("troubleshooting-pending");
+        const node = faithItem.querySelector(".message-text");
+        if (node) { node.innerHTML = formatFaithMessage(answer); scheduleCodeHighlight(node); }
+        setExpression("troubleshooting", "Code review complete");
+        return;
+      }
+      if (event.attachment && event.attachment.url) {
+        const link = document.createElement("a");
+        link.href = event.attachment.url;
+        link.target = "_blank";
+        link.rel = "noopener noreferrer";
+        link.textContent = `Open updated file: ${event.attachment.name || "updated source"}`;
+        link.style.display = "inline-block";
+        link.style.marginTop = "8px";
+        faithItem.appendChild(link);
+      }
+      // The final Coding expression is set after the entire HTTP stream has
+      // been received, not merely when the server emits its done event.
     } else if (event.type === "error") {
       throw new Error(event.error || "Coding model failed.");
-    } else if (event.type === "done") {
-      sessionMode = "troubleshooting";
-      setExpression("coding", "Troubleshooting response complete");
     }
   };
   while (true) {
@@ -1492,7 +1742,151 @@ async function runCoderTroubleshooting(question) {
       frame.split("\n").forEach(consume);
     }
   }
-  if (!answer.trim()) throw new Error("The coding server completed without returning a diagnosis.");
+  if (buffer.trim()) buffer.split("\n").forEach(consume);
+  if (!completed || !answer.trim()) throw new Error("The coding server ended before it returned the updated source file.");
+  if (!reviewOnly) {
+    setExpression("coding", automaticFix ? "Automatic fix complete — updated code fully received" : "Code changes complete — updated code fully received");
+  }
+  return answer;
+}
+
+async function runCoderBuild(question) {
+  const requestSequence = ++buildRequestSequence;
+  const controller = new AbortController();
+  activeBuildController = controller;
+  // Build mode has its own stream consumer. Do not pass this response through
+  // the general Qwen/chat post-processing, which can reset the mode or replace
+  // the streaming message after the coding model has answered.
+  sessionMode = "build";
+  setExpression("build", "Getting response from Qwen code port on :8090…");
+
+  // Show an immediate, persistent waiting reply while the coding model loads
+  // or thinks. The first streamed token replaces this same message instead of
+  // creating a second one, matching Troubleshooting's progress feedback.
+  let faithItem = appendMessage(
+    "Faith",
+    "Getting response from Qwen code port on :8090…",
+    "ai"
+  );
+  faithItem.classList.add("build-pending");
+
+  const response = await fetch(`/api/build-chat?ts=${Date.now()}`, {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+      "Accept": "text/event-stream, application/json",
+      "Cache-Control": "no-cache"
+    },
+    cache: "no-store",
+    signal: controller.signal,
+    body: JSON.stringify({ question })
+  });
+  if (requestSequence !== buildRequestSequence) return "";
+
+  const contentType = (response.headers.get("content-type") || "").toLowerCase();
+  if (!response.ok || !contentType.includes("text/event-stream")) {
+    let data = {};
+    try { data = await response.json(); } catch (_) {}
+    if (!response.ok) throw new Error(data.error || data.detail || `Build service HTTP ${response.status}`);
+
+    // Closing Build mode returns JSON because it does not start a token stream.
+    const answer = String(data.answer || "Build mode response received.");
+    faithItem.classList.remove("build-pending");
+    const node = faithItem.querySelector(".message-text");
+    if (node) { node.innerHTML = formatFaithMessage(answer); scheduleCodeHighlight(node); }
+    sessionMode = data.session_mode === "idle" ? "idle" : "build";
+    setExpression(sessionMode === "build" ? "build" : "explanation");
+    return answer;
+  }
+
+  if (!response.body) throw new Error("The browser could not open Faith's Build stream.");
+  const reader = response.body.getReader();
+  const decoder = new TextDecoder();
+  let buffer = "";
+  let answer = "";
+  let finished = false;
+
+  const paintAnswer = () => {
+    faithItem.classList.remove("build-pending");
+    const node = faithItem.querySelector(".message-text");
+    if (node) { node.innerHTML = formatFaithMessage(answer); scheduleCodeHighlight(node); }
+    chat.scrollTop = chat.scrollHeight;
+  };
+  const handleEvent = (event) => {
+    if (requestSequence !== buildRequestSequence || !event || typeof event !== "object") return;
+    if (event.type === "reset") {
+      // The first attempt may already have streamed a generic deflection.
+      // The retry starts a fresh answer; never concatenate both attempts.
+      answer = "";
+      faithItem.classList.add("build-pending");
+      const node = faithItem.querySelector(".message-text");
+      if (node) node.textContent = event.message || "Retrying with a fresh implementation request…";
+      chat.scrollTop = chat.scrollHeight;
+      return;
+    }
+    if (event.type === "status") {
+      if (event.phase === "connecting") setExpression("build", "Getting response from Qwen code port on :8090…");
+      else if (event.phase === "building") setExpression("build", "Qwen is writing your code…");
+      else if (event.phase === "build-ready") setExpression("build", "Ready for your idea");
+      return;
+    }
+    if (event.type === "delta") {
+      const delta = String(event.text || "");
+      if (!delta) return;
+      answer += delta;
+      setExpression("build", "Qwen is writing your code…");
+      paintAnswer();
+      return;
+    }
+    if (event.type === "text_complete") {
+      if (typeof event.answer === "string") answer = event.answer;
+      sessionMode = event.session_mode === "idle" ? "idle" : "build";
+      paintAnswer();
+      setExpression(sessionMode === "build" ? "build" : "explanation");
+      return;
+    }
+    if (event.type === "done") {
+      if (typeof event.answer === "string") answer = event.answer;
+      sessionMode = event.session_mode === "idle" ? "idle" : "build";
+      paintAnswer();
+      setExpression(sessionMode === "build" ? "build" : "explanation");
+      finished = true;
+      return;
+    }
+    if (event.type === "error") throw new Error(event.error || event.detail || "Faith's Build model failed.");
+  };
+
+  const processFrame = (frame) => {
+    for (const line of frame.split(/\r?\n/)) {
+      if (!line.startsWith("data:")) continue;
+      const payload = line.slice(5).trim();
+      if (!payload || payload === "[DONE]") continue;
+      try { handleEvent(JSON.parse(payload)); }
+      catch (error) {
+        if (error instanceof SyntaxError) continue;
+        throw error;
+      }
+    }
+  };
+
+  while (true) {
+    const { value, done } = await reader.read();
+    if (done) break;
+    buffer += decoder.decode(value, { stream: true });
+    let boundary;
+    while ((boundary = buffer.search(/\r?\n\r?\n/)) >= 0) {
+      const frame = buffer.slice(0, boundary);
+      const match = buffer.slice(boundary).match(/^\r?\n\r?\n/);
+      buffer = buffer.slice(boundary + (match ? match[0].length : 2));
+      processFrame(frame);
+    }
+  }
+  if (buffer.trim()) processFrame(buffer);
+  if (requestSequence !== buildRequestSequence) return "";
+  if (!finished || !answer.trim()) {
+    throw new Error("Faith's Build stream ended before a complete answer arrived. Check that the coding GGUF server is running on port 8090.");
+  }
+  if (activeBuildController === controller) activeBuildController = null;
   return answer;
 }
 
@@ -1501,53 +1895,83 @@ async function submitQuestion() {
 
   const question = input.value.trim();
   if (!question) return;
+  const turnId = ++turnSequence;
 
   input.value = "";
-  appendMessage("You", question, "you");
+  // If a file is staged, defer rendering the user turn until uploadFileToFaith
+  // can put the instruction and attachment card together in one message.
+  if (!pendingCodeFile) appendMessage("You", question, "you");
 
-  // A staged source attachment is sent together with this comment, never on
-  // file selection. The user explicitly chooses whether to troubleshoot it.
+  const isTroubleshootingEntry = isTroubleshootingEntryRequest(question) || /\b(?:troubleshoot|troubleshooting|debug|debugging)\b/i.test(question);
+  const isModeOnlyRequest = /\b(?:enter|start|begin|activate|switch\s+(?:to|into)|go\s+into)\s+(?:the\s+)?troubleshooting(?:\s+mode|\s+session)?\b/i.test(question) || /^\s*(?:let'?s\s+)?(?:do|start)\s+troubleshooting\s*$/i.test(question);
+
+  // Entering Troubleshooting is deliberate. Do not launch a diagnosis until
+  // the user has supplied the existing file and described the requested edit.
+  if (isModeOnlyRequest && !pendingCodeFile) {
+    sessionMode = "troubleshooting";
+    setExpression("troubleshooting", "Ready for your existing code and change request");
+    appendMessage("Faith", "Troubleshooting mode is ready. Upload the existing code file, then describe exactly what you want me to change. If you want the original researched repair workflow, include **Automatic fix** with your instructions.", "ai");
+    return;
+  }
+
+  if (isTroubleshootingEntry && !pendingCodeFile && sessionMode !== "troubleshooting") {
+    sessionMode = "troubleshooting";
+    setExpression("troubleshooting", "Ready for your existing code and change request");
+    appendMessage("Faith", "Absolutely. I’m in Troubleshooting mode now. Upload the existing code file and tell me what you want changed, checked, or reviewed. You can also say **Automatic fix** if you want me to search for known fixes and apply one automatically.", "ai");
+    return;
+  }
+
+  // A staged source attachment is sent together with this comment. If this is
+  // a concrete edit request, activate Troubleshooting before the upload returns.
   if (pendingCodeFile) {
+    if (isTroubleshootingEntry || sessionMode === "troubleshooting" || isDirectCodeFixRequest(question) || isAutomaticFixRequest(question)) {
+      sessionMode = "troubleshooting";
+      troubleshootingDiagnosisReady = false;
+      setExpression("troubleshooting", "Preparing your source for diagnosis");
+    }
     const stagedFile = pendingCodeFile;
     try {
       await uploadFileToFaith(stagedFile, question);
     } finally {
-      setBusy(false);
+      if (turnId === turnSequence) setBusy(false);
       input.focus();
     }
     return;
   }
 
-  // In an active troubleshooting session, natural requests such as
-  // “can you fix the code yourself?” are the same action as the Fix Code button.
-  if (sessionMode === "troubleshooting" && isDirectCodeFixRequest(question)) {
+  // Build is a persistent conversation, like Troubleshooting, but it always
+  // goes directly to /api/build-chat -> the coding GGUF on :8090. This branch
+  // must run before the general chat path so no later handler can reset mode.
+  if (sessionMode === "build" || isFaithBuildRequest(question)) {
     setBusy(true);
-    sessionMode = "coding";
-    setExpression("coding", "Applying the fix...");
     try {
-      const fixResponse = await fetch("/api/fix-code", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ question })
-      });
-      const fixData = await fixResponse.json();
-      if (!fixResponse.ok) throw new Error(fixData.error || `HTTP ${fixResponse.status}`);
-      sessionMode = "coding";
-      setExpression("coding", "Code fixed");
-      const fixedItem = appendMessage("Faith", fixData.answer || "I fixed the code and prepared the completed file.", "ai");
-      if (fixData.attachment && fixData.attachment.url) {
-        const link = document.createElement("a");
-        link.href = fixData.attachment.url;
-        link.target = "_blank";
-        link.rel = "noopener noreferrer";
-        link.textContent = `Open fixed file: ${fixData.filename || fixData.attachment.name || "fixed source"}`;
-        link.style.display = "inline-block";
-        link.style.marginTop = "8px";
-        fixedItem.appendChild(link);
+      await runCoderBuild(question);
+    } catch (error) {
+      if (turnId === turnSequence && error.name !== "AbortError" && !/stale/i.test(error.message || "")) {
+        sessionMode = "build";
+        setExpression("build", "Build request failed");
+        const pendingReply = chat.querySelector(".message.ai.build-pending");
+        if (pendingReply) pendingReply.remove();
+        appendMessage("Error", error.message, "error");
       }
+    } finally {
+      activeBuildController = null;
+      if (turnId === turnSequence) setBusy(false);
+      input.focus();
+    }
+    return;
+  }
+
+  // Troubleshooting remains an edit session: follow-up changes and an explicit
+  // Automatic fix use the same live :8090 code-edit stream against the latest file.
+  const isTroubleshootingChange = /\b(?:change|modify|edit|update|fix|repair|correct|patch|refactor|add|remove|replace|automatic\s+fix|review|check|yes|please|do that|go ahead|continue|try again|make it|also|now)\b/i.test(question);
+  if (sessionMode === "troubleshooting" && (troubleshootingDiagnosisReady || isDirectCodeFixRequest(question) || isAutomaticFixRequest(question) || isTroubleshootingChange)) {
+    setBusy(true);
+    try {
+      await runCoderTroubleshooting(question, { automaticFix: isAutomaticFixRequest(question) });
     } catch (error) {
       sessionMode = "troubleshooting";
-      setExpression("troubleshooting", "Fix could not be completed");
+      setExpression("troubleshooting", "Code edit could not be completed");
       appendMessage("Error", error.message, "error");
     } finally {
       setBusy(false);
@@ -1557,22 +1981,15 @@ async function submitQuestion() {
   }
 
   setBusy(true);
-  const isTroubleshootingPrompt = /\b(?:troubleshoot|troubleshooting|debug|debugging)\b/i.test(question);
+  const isTroubleshootingPrompt = isTroubleshootingEntryRequest(question) || /\b(?:troubleshoot|troubleshooting|debug|debugging)\b/i.test(question);
   setExpression(isTroubleshootingPrompt ? "troubleshooting" : "thinking");
 
-  // Explicit Troubleshooting requests use the dedicated :8090 coding GGUF.
-  // Keep the visual loader active during model processing, then switch to the
-  // Coding expression as soon as the first generated token arrives.
   if (isTroubleshootingPrompt) {
-    try {
-      await runCoderTroubleshooting(question);
-    } catch (error) {
-      setExpression("troubleshooting", "Coding service unavailable");
-      appendMessage("Error", error.message, "error");
-    } finally {
-      setBusy(false);
-      input.focus();
-    }
+    sessionMode = "troubleshooting";
+    setExpression("troubleshooting", "Ready for your existing code and change request");
+    appendMessage("Faith", "Troubleshooting mode is ready. Upload the existing code file, then describe the changes you want. Say **Automatic fix** if you want me to search for known fixes and apply one automatically.", "ai");
+    setBusy(false);
+    input.focus();
     return;
   }
 
@@ -1583,6 +2000,8 @@ async function submitQuestion() {
   let qwenRelayLoading = null;
   let requestModeConfirmed = false;
   let wikimediaPreflight = null;
+  const chatController = new AbortController();
+  activeChatController = chatController;
 
   try {
     // Ordinary conversation uses the dedicated direct Qwen relay. Specialized
@@ -1605,12 +2024,12 @@ async function submitQuestion() {
     // so the user always knows Faith is waiting on the local AI backend.
     // Image generation and other specialized routes keep their own loaders.
     if (isSimpleChat) {
-      qwenRelayLoading = appendQwenRelayLoadingMessage();
+      qwenRelayLoading = appendQwenRelayLoadingMessage("Getting response from Qwen and llama_server...");
 
       // START WIKIMEDIA AT THE SAME TIME AS QWEN. Do not wait for the first
       // token, a complete answer, or Explanation mode. The search now gets the
       // full Qwen generation window to find relevant Commons images.
-      wikimediaPreflight = (async () => {
+      if (isSimpleChat) wikimediaPreflight = (async () => {
         try {
           const response = await fetch(`/api/qwen-wikimedia?ts=${Date.now()}`, {
             method: "POST",
@@ -1620,6 +2039,7 @@ async function submitQuestion() {
               "Cache-Control": "no-cache"
             },
             cache: "no-store",
+            signal: chatController.signal,
             body: JSON.stringify({ question })
           });
           if (!response.ok) throw new Error(`Wikimedia HTTP ${response.status}`);
@@ -1637,6 +2057,7 @@ async function submitQuestion() {
         "Content-Type": "application/json",
         "Accept": "application/json"
       },
+      signal: chatController.signal,
       body: JSON.stringify({ question })
     });
 
@@ -1650,6 +2071,7 @@ async function submitQuestion() {
           "Content-Type": "application/json",
           "Accept": "application/json"
         },
+        signal: chatController.signal,
         body: JSON.stringify({ question })
       });
     }
@@ -1723,7 +2145,8 @@ async function submitQuestion() {
 
     requestModeConfirmed = true;
 
-    if (data.session_mode === "coding") sessionMode = "coding";
+    if (data.session_mode === "build") sessionMode = "build";
+    else if (data.session_mode === "coding") sessionMode = "coding";
     else if (data.session_mode === "troubleshooting" || isTroubleshootingPrompt) sessionMode = "troubleshooting";
     else if (data.session_mode === "idle") sessionMode = "idle";
 
@@ -1742,7 +2165,9 @@ async function submitQuestion() {
       // confirmed an actual generation request above.
       const normalExpression = ["robotic", "psychotic", "sad", "anger"].includes(data.expression)
         ? data.expression
-        : (sessionMode === "coding"
+        : (sessionMode === "build"
+          ? "build"
+          : (sessionMode === "coding"
           ? "coding"
           : (sessionMode === "troubleshooting"
             ? "troubleshooting"
@@ -1750,7 +2175,7 @@ async function submitQuestion() {
               ? "troubleshooting"
               : (["greeting", "thinking", "explanation", "confusion", "troubleshooting", "observing"].includes(data.expression)
                 ? data.expression
-                : "explanation"))));
+                : "explanation")))));
       setExpression(normalExpression);
     }
 
@@ -1853,6 +2278,7 @@ async function submitQuestion() {
       setExpression("painting", "Image ready");
     }
   } catch (error) {
+    if (error.name === "AbortError" || turnId !== turnSequence) return;
     if (qwenRelayLoading) {
       qwenRelayLoading.stop();
       qwenRelayLoading = null;
@@ -1869,7 +2295,8 @@ async function submitQuestion() {
     }
     appendMessage("Error", error.message, "error");
   } finally {
-    setBusy(false);
+    if (activeChatController === chatController) activeChatController = null;
+    if (turnId === turnSequence) setBusy(false);
     input.focus();
   }
 }
@@ -1897,20 +2324,40 @@ input.addEventListener("keydown", (event) => {
 });
 
 clear.addEventListener("click", async () => {
-  if (busy) return;
+  // Invalidate the visible Build turn first, then abort its network stream.
+  // This works even while the send button is busy/disabled.
+  turnSequence += 1;
+  buildRequestSequence += 1;
+  if (activeChatController) {
+    try { activeChatController.abort(); } catch (_) {}
+    activeChatController = null;
+  }
+  if (activeBuildController) {
+    try { activeBuildController.abort(); } catch (_) {}
+    activeBuildController = null;
+  }
+  setBusy(true);
+  chat.innerHTML = "";
+  sessionMode = "idle";
+  troubleshootingDiagnosisReady = false;
+  pendingCodeFile = null;
+  setUploadStatus("No file selected", false);
+  setExpression("ruby", "Clearing conversation and cancelling stale Build responses…");
 
   try {
-    const response = await fetch("/api/clear", { method: "POST" });
+    const response = await fetch("/api/clear", {
+      method: "POST",
+      cache: "no-store",
+      headers: { "Cache-Control": "no-cache" }
+    });
     if (!response.ok) throw new Error(`HTTP ${response.status}`);
-
-    chat.innerHTML = "";
-    sessionMode = "idle";
-    setUploadStatus("No file selected", false);
-    setExpression("ruby", "Ready");
+    setExpression("ruby", "Ready — conversation and Build context cleared");
+    setBusy(false);
     input.focus();
   } catch (error) {
-    setExpression("confusion", "Could not clear memory");
-    appendMessage("Error", error.message, "error");
+    setExpression("confusion", "Browser cleared; server reset may have failed");
+    appendMessage("Error", `The visible conversation was cleared, but the server reset failed: ${error.message}. Restart Faith if old Build context continues.`, "error");
+    setBusy(false);
   }
 });
 

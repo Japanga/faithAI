@@ -244,3 +244,44 @@ button.secondary {
     max-width: 94%;
   }
 }
+
+
+/* Faith code blocks: readable, scrollable, and syntax-coloured. */
+.message .faith-code-block {
+  display: block;
+  max-width: 100%;
+  margin: 10px 0;
+  padding: 14px 16px;
+  overflow-x: auto;
+  border: 1px solid rgba(137, 160, 196, 0.24);
+  border-radius: 10px;
+  background: #0d1117;
+  color: #e6edf3;
+  white-space: pre;
+  overflow-wrap: normal;
+  tab-size: 2;
+  -webkit-overflow-scrolling: touch;
+}
+
+.message .faith-code-block code {
+  display: block;
+  padding: 0;
+  border: 0;
+  background: transparent;
+  color: inherit;
+  font-family: Consolas, "Cascadia Code", "SFMono-Regular", Menlo, monospace;
+  font-size: 0.9rem;
+  line-height: 1.55;
+  white-space: pre;
+  overflow-wrap: normal;
+}
+
+.message .message-text code:not(.hljs) {
+  font-family: Consolas, "Cascadia Code", "SFMono-Regular", Menlo, monospace;
+}
+
+.message .message-text p code {
+  padding: 2px 5px;
+  border-radius: 4px;
+  background: rgba(135, 150, 175, 0.16);
+}
