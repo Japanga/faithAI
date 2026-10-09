@@ -37,7 +37,7 @@ class FaithBuildRequestSuperseded < StandardError; end
 
 # Start the dedicated coding GGUF only when a Build/Troubleshooting request needs it.
 # The tested BAT remains the source of truth for the model path and Windows 7 flags.
-FAITH_CODER_START_BAT = File.join(ROOT, "Test_Qwen2.5-Coder-0.5B-Instruct_Q4_K_M_4Threads_KVQ8_GPU99_Win7.bat")
+FAITH_CODER_START_BAT = File.join(ROOT, "Test_Qwen2.5-Coder-0.5B-Instruct_Q4_K_M_2Threads_KVQ8_GPU99_Win7.bat")
 FAITH_CODER_STARTUP_TIMEOUT = Integer(ENV.fetch("FAITH_CODER_STARTUP_TIMEOUT", "240"))
 $faith_coder_start_mutex = Mutex.new
 
@@ -110,7 +110,7 @@ def ensure_faith_coder_server!(on_status: nil)
     return true if faith_coder_health_ready?(endpoint)
 
     unless File.file?(FAITH_CODER_START_BAT)
-      raise "The coding server is not running, and its startup BAT was not found: #{FAITH_CODER_START_BAT}. Put Test_Qwen2.5-Coder-0.5B-Instruct_Q4_K_M_4Threads_KVQ8_GPU99_Win7.bat beside server.rb."
+      raise "The coding server is not running, and its startup BAT was not found: #{FAITH_CODER_START_BAT}. Put Test_Qwen2.5-Coder-0.5B-Instruct_Q4_K_M_2Threads_KVQ8_GPU99_Win7.bat beside server.rb."
     end
 
     on_status.call("Waiting for a ready signal from the coding server on :8090. Starting the tested coding BAT now…") if on_status
