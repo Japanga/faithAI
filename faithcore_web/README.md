@@ -4,7 +4,7 @@ This package uses a Windows-7-compatible llama-server.exe with:
 
 - Qwen2-0.5B-Instruct Q4_K_M
 - Qwen2.5-Coder-0.5B-Instruct-GGUF
-- Custom LLM Faith_Emotions_v2_Q4_K_M.gguf
+- Custom LLM Faith_Emotions_v2_Q4_K_M.gguf https://huggingface.co/Japanga/Faith_Emotions_v2_Q4_K_M
 - 127.0.0.1:8080
 - 127.0.0.1:8090
 - 4096-token context
