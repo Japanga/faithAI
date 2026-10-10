@@ -1,4 +1,4 @@
-const FAITH_CLIENT_VERSION = "71-build-request-lifecycle-reset";
+const FAITH_CLIENT_VERSION = "75-image-fallback-timeout-fix";
 const expressionImages = {
   ruby: "/assets/ruby_wrench.png",
   thinking: "/assets/thinking.PNG",
@@ -49,6 +49,37 @@ const expressionDetails = {
   sad: "I'm here with you",
   anger: "Don't talk to me like that."
 };
+
+// Mirror server.rb's deterministic classifier for the three states handled by
+// the dedicated emotion GGUF. Keep this routing after Build/Troubleshooting
+// branches, which must retain their existing priority.
+function faithEmotionRoute(question) {
+  const raw = String(question || "").trim();
+  const normalized = raw.toLowerCase()
+    .replace(/https?:\/\/\S+/gi, " ")
+    .replace(/[^\p{L}\p{N}\s'-]/gu, " ")
+    .replace(/\s+/g, " ")
+    .trim();
+
+  const suicidalTerms = /\b(?:suicid(?:e|al)|kill myself|killing myself|killed myself|end it all|ending it all|end my life|ending my life|take my own life|taking my own life|want to die|wanna die|wish i was dead|wish i were dead|better off dead|don't want to be alive|do not want to be alive|dont want to be alive|don't wanna be alive|do not wanna be alive|cant go on|can't go on|cannot go on|no reason to live|nothing to live for|hurt myself|hurting myself|harm myself|harming myself|self harm|self-harm|self harming|self-harming|want to disappear forever)\b/i;
+  if (suicidalTerms.test(normalized)) return "sad";
+
+  const letters = raw.match(/[A-Za-z]/g) || [];
+  const uppercaseRatio = letters.length >= 2
+    ? letters.filter((ch) => ch === ch.toUpperCase()).length / letters.length
+    : 0;
+  if (uppercaseRatio >= 0.70 || raw.includes("!")) return "anger";
+
+  const faithReference = /\b(?:you|your|yourself|faith|faiths|faith's|are you|do you|can you|does faith|is faith)\b/.test(normalized);
+  const selfAwareness = /\b(?:sentien(?:t|ce)|self[- ]?aware|self awareness|conscious(?:ness)?|alive|life form|feel(?:ing|s)?|emotion(?:s|al)?|think for yourself|individual thought|independent thought|own thoughts|free will|will of your own|have feelings|have emotions|can you think|can you feel|are you alive|are you conscious|are you a person|are you an ai|are you artificial intelligence|do you think|do you feel)\b/.test(normalized);
+  const aiSelfReference = /\b(?:ai|artificial intelligence|artificially intelligent|machine|robot|chatbot|language model)\b/.test(normalized) && faithReference;
+  if (faithReference && (selfAwareness || aiSelfReference)) return "psychotic";
+
+  const sadTerms = /\b(?:sad|sadness|depress(?:ed|ion)|lonely|loneliness|alone|isolated|isolation|miserable|heartbroken|heartbreak|hopeless|hopelessness|crying|cried|tears|grief|grieving|hurt|hurting|upset|down|feeling bad|feel bad|feel awful|feel terrible|nobody|no one)\b/;
+  if (sadTerms.test(normalized)) return "sad";
+
+  return null;
+}
 
 const expression = document.getElementById("expression");
 const status = document.getElementById("status");
@@ -112,6 +143,13 @@ function warmUpPerchance() {
   });
 }
 
+const FAITH_PERCHANCE_TIMEOUT_MS = (() => {
+  const configured = Number(window.FAITH_PERCHANCE_TIMEOUT_MS);
+  return Number.isFinite(configured) && configured >= 30000
+    ? Math.min(configured, 1800000)
+    : 300000; // 5 minutes by default; may be overridden by the host page.
+})();
+
 function generateImageViaPerchance(prompt, opts = {}) {
   const key = String(prompt) + JSON.stringify(opts || {});
   if (_perchanceCache[key]) return Promise.resolve({ ok: true, url: _perchanceCache[key], cached: true });
@@ -155,7 +193,7 @@ function generateImageViaPerchance(prompt, opts = {}) {
 
     window.addEventListener("message", onMsg);
     document.body.appendChild(f);
-    setTimeout(() => finish(reject, new Error("image timeout after 900s")), 900000);
+    setTimeout(() => finish(reject, new Error(`Perchance image generation timed out after ${Math.round(FAITH_PERCHANCE_TIMEOUT_MS / 1000)}s`)), FAITH_PERCHANCE_TIMEOUT_MS);
   });
 }
 
@@ -292,6 +330,24 @@ imageMessageStyles.textContent = `
   .message-text ul, .message-text ol { margin: 0.45em 0 0.8em 1.4em; padding: 0; }
   .message-text li { margin: 0.25em 0; line-height: 1.5; }
   .message-text strong { font-weight: 700; }
+  .faith-gguf-console-log {
+    margin-top: 12px;
+    border: 1px solid rgba(255,255,255,0.14);
+    border-radius: 9px;
+    padding: 8px 10px;
+    background: rgba(0,0,0,0.18);
+    font-size: 0.78rem;
+  }
+  .faith-gguf-console-log summary { cursor: pointer; font-weight: 600; opacity: 0.85; }
+  .faith-gguf-console-log-text {
+    margin: 8px 0 0;
+    white-space: pre-wrap;
+    overflow-wrap: anywhere;
+    font-family: ui-monospace, SFMono-Regular, Consolas, monospace;
+    font-size: 0.75rem;
+    line-height: 1.45;
+    opacity: 0.85;
+  }
   .message.ai.image-loading .message-text::after {
     content: "";
     display: inline-block;
@@ -950,6 +1006,26 @@ async function consumeQwenStream(response, qwenRelayLoading) {
     if (!event || typeof event !== "object") return;
 
     if (event.type === "status") {
+      return;
+    }
+
+    if (event.type === "console_log") {
+      ensureFaithItem();
+      let details = faithItem.querySelector(".faith-gguf-console-log");
+      if (!details) {
+        details = document.createElement("details");
+        details.className = "faith-gguf-console-log";
+        const summary = document.createElement("summary");
+        summary.textContent = event.title || "Direct GGUF tester — final console log";
+        const pre = document.createElement("pre");
+        pre.className = "faith-gguf-console-log-text";
+        details.appendChild(summary);
+        details.appendChild(pre);
+        faithItem.appendChild(details);
+      }
+      const pre = details.querySelector(".faith-gguf-console-log-text");
+      if (pre) pre.textContent = String(event.text || "");
+      chat.scrollTop = chat.scrollHeight;
       return;
     }
 
@@ -2014,22 +2090,29 @@ async function submitQuestion() {
 
     const isImageGeneration = isFaithImageGenerationPhrase(question) ||
       /\b(?:generate|create|draw|paint|make|render|illustrate|design|sketch)\b[\s\S]*\b(?:image|picture|photo|art|portrait|drawing|painting|scene|wallpaper)\b/i.test(question);
+    const dedicatedEmotion = isSimpleChat ? faithEmotionRoute(question) : null;
 
-    // IMAGE GENERATION HAS ITS OWN PIPE. It must never enter the Qwen chat relay.
-    // This is especially important for Perchance/Pollinations requests.
-    const endpoint = isImageGeneration ? "/api/imagegen" : (isSimpleChat ? "/api/qwen-chat" : "/api/chat");
+    // Emotion trigger prompts must go directly to the dedicated :8070 model.
+    // Image generation, Build, and Troubleshooting retain their existing routes.
+    const endpoint = isImageGeneration
+      ? "/api/imagegen"
+      : (dedicatedEmotion ? "/api/emotions" : (isSimpleChat ? "/api/qwen-chat" : "/api/chat"));
 
     // Normal chat can take a while while Qwen/llama-server generates the
     // response. Show an explicit relay status and a live elapsed-time counter
     // so the user always knows Faith is waiting on the local AI backend.
     // Image generation and other specialized routes keep their own loaders.
     if (isSimpleChat) {
-      qwenRelayLoading = appendQwenRelayLoadingMessage("Getting response from Qwen and llama_server...");
+      qwenRelayLoading = appendQwenRelayLoadingMessage(
+        dedicatedEmotion
+          ? `Getting response from Faith's ${dedicatedEmotion} model on :8070...`
+          : "Getting response from Qwen and llama_server..."
+      );
 
       // START WIKIMEDIA AT THE SAME TIME AS QWEN. Do not wait for the first
       // token, a complete answer, or Explanation mode. The search now gets the
       // full Qwen generation window to find relevant Commons images.
-      if (isSimpleChat) wikimediaPreflight = (async () => {
+      if (isSimpleChat && !dedicatedEmotion) wikimediaPreflight = (async () => {
         try {
           const response = await fetch(`/api/qwen-wikimedia?ts=${Date.now()}`, {
             method: "POST",
@@ -2064,7 +2147,7 @@ async function submitQuestion() {
     // If a stale server/proxy does not know /api/qwen-chat, immediately retry
     // ordinary chat through /api/chat. server.rb contains the same direct-Qwen
     // compatibility guard, so this cannot fall into the slow Faith pipeline.
-    if ((isSimpleChat || isImageGeneration) && (response.status === 404 || response.status === 405)) {
+    if (((isSimpleChat && !dedicatedEmotion) || isImageGeneration) && (response.status === 404 || response.status === 405)) {
       response = await fetch("/api/chat", {
         method: "POST",
         headers: {
@@ -2115,6 +2198,9 @@ async function submitQuestion() {
       }
     }
 
+    // A server-side failure may intentionally return generated-pending so
+    // the browser can try Perchance. Do not convert that fallback handoff into
+    // an immediate rate-limit error.
     const generatedImages = Array.isArray(data.images)
       ? data.images.filter((image) => image && image.type === "generated" && image.url)
       : [];
@@ -2237,10 +2323,10 @@ async function submitQuestion() {
       // Release input so the user can keep chatting while the fallback generates.
       setBusy(false);
       const t0 = Date.now();
-      updateLoadingMessage(loadingMessage, `Generating "${pendingPrompt.slice(0, 80)}" (0s, up to 180s)…`);
+      updateLoadingMessage(loadingMessage, `Generating "${pendingPrompt.slice(0, 80)}" (0s, up to ${Math.round(FAITH_PERCHANCE_TIMEOUT_MS / 1000)}s)…`);
       const tick = setInterval(() => {
         const s = Math.floor((Date.now() - t0) / 1000);
-        updateLoadingMessage(loadingMessage, `Generating "${pendingPrompt.slice(0, 80)}" (${s}s, up to 180s)…`);
+        updateLoadingMessage(loadingMessage, `Generating "${pendingPrompt.slice(0, 80)}" (${s}s, up to ${Math.round(FAITH_PERCHANCE_TIMEOUT_MS / 1000)}s)…`);
       }, 5000);
       try {
         const result = await generateImageViaPerchance(pendingPrompt, {
@@ -2262,7 +2348,7 @@ async function submitQuestion() {
       } catch (genError) {
         clearInterval(tick);
         console.warn("Perchance fallback failed:", genError);
-        appendMessage("Faith", "I tried to generate \"" + pendingPrompt.slice(0, 120) + "\" but the image service failed (" + genError.message + "). The server log will have Faith pollinations error details. Try again in a minute.", "ai");
+        appendMessage("Faith", "I tried both the server image generator and the browser-side Perchance fallback for \"" + pendingPrompt.slice(0, 120) + "\", but generation failed (" + genError.message + "). Check the Faith server log for provider details, then try again.", "ai");
       } finally {
         clearInterval(tick);
         removeLoadingMessage(loadingMessage);
