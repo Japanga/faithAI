@@ -6,6 +6,7 @@ require "faraday"
 require "json"
 require "net/http"
 require "securerandom"
+require "digest"
 require "webrick"
 require "uri"
 require "cgi"
@@ -15,6 +16,13 @@ require "time"
 FAITH_AI_PROVIDER = ENV.fetch("FAITH_AI_PROVIDER", "local").downcase
 FAITH_LOCAL_AI_URL = ENV.fetch("FAITH_LOCAL_AI_URL", "http://127.0.0.1:8080/v1/chat/completions")
 FAITH_LOCAL_AI_MODEL = ENV.fetch("FAITH_LOCAL_AI_MODEL", "local")
+# Dedicated fine-tuned emotion model; only Psychotic, Sad, and Anger turns use it.
+FAITH_EMOTION_AI_URL = ENV.fetch("FAITH_EMOTION_AI_URL", "http://127.0.0.1:8070/v1/chat/completions")
+FAITH_EMOTION_BRIDGE_URL = ENV.fetch("FAITH_EMOTION_BRIDGE_URL", "http://127.0.0.1:8071")
+ROOT = File.expand_path(__dir__)
+FAITH_EMOTION_START_BAT = File.join(ROOT, "Test_Faith_Emotion_GGUF_Direct.bat")
+FAITH_EMOTION_STARTUP_TIMEOUT = Integer(ENV.fetch("FAITH_EMOTION_STARTUP_TIMEOUT", "300"))
+$faith_emotion_start_mutex = Mutex.new
 FAITH_VIREONIX_AI_URL = ENV.fetch("FAITH_VIREONIX_AI_URL", "https://vireonix.ai/v1/chat/completions")
 require_relative "FaithAIProvider"
 # Image understanding is deliberately separated from chat inference.
@@ -29,9 +37,23 @@ MODEL = "auto"
 IMAGE_MODEL = ENV.fetch("FAITH_IMAGE_MODEL", "gpt-image-2")
 IMAGE_PROVIDER = ENV.fetch("FAITH_IMAGE_PROVIDER", "perchance").downcase
 PORT = Integer(ENV.fetch("PORT", "4567"))
-FAITH_SERVER_VERSION = "75-image-rate-limit-hard-error"
-ROOT = File.expand_path(__dir__)
-
+FAITH_SERVER_VERSION = "86-emotion-console-log-relay"
+# Emotion diagnostics are written beside this server.rb by default. Override with
+# FAITH_EMOTION_DIAGNOSTIC_LOG if you want the log somewhere else.
+FAITH_EMOTION_DIAGNOSTIC_LOG = File.expand_path(
+  ENV.fetch("FAITH_EMOTION_DIAGNOSTIC_LOG", File.join(ROOT, "faith-emotion-diagnostics.log"))
+)
+$faith_emotion_diagnostic_log_mutex = Mutex.new
+begin
+  $faith_emotion_diagnostic_log_mutex.synchronize do
+    File.open(FAITH_EMOTION_DIAGNOSTIC_LOG, "a:utf-8") do |file|
+      file.write("#{Time.now.iso8601(3)} [Faith Emotion Diagnostic] SERVER_START version=#{FAITH_SERVER_VERSION} pid=#{Process.pid} log=#{FAITH_EMOTION_DIAGNOSTIC_LOG.inspect}\n")
+      file.flush
+    end
+  end
+rescue StandardError => log_error
+  warn "[Faith Emotion Diagnostic] Could not initialize log #{FAITH_EMOTION_DIAGNOSTIC_LOG.inspect}: #{log_error.class}: #{log_error.message}"
+end
 # Pollinations/Perchance is a shared free image service. After a failed
 # generation, reject new requests for three minutes instead of pretending a
 # browser-side fallback is still generating.
@@ -94,6 +116,52 @@ def ensure_faith_chat_server!(on_status: nil)
     end
 
     raise "Timed out waiting for the regular chat GGUF on :8080 after #{FAITH_CHAT_STARTUP_TIMEOUT} seconds. Check qwen-server.log and the chat BAT."
+  end
+end
+
+def faith_emotion_health_ready?(uri)
+  health_uri = URI::HTTP.build(host: uri.host, port: uri.port, path: "/health")
+  http = Net::HTTP.new(health_uri.host, health_uri.port)
+  http.open_timeout = 1
+  http.read_timeout = 1
+  response = http.get(health_uri.request_uri)
+  response.is_a?(Net::HTTPSuccess)
+rescue StandardError
+  false
+end
+
+def ensure_faith_emotion_server!(on_status: nil)
+  # The tested direct tester runs in its own console and exposes a small local
+  # bridge. The browser still talks to server.rb; server.rb relays each prompt
+  # through that tester so its console shows the same prompt and final reply.
+  bridge = URI.parse(ENV.fetch("FAITH_EMOTION_BRIDGE_URL", "http://127.0.0.1:8071"))
+  return true if faith_emotion_health_ready?(bridge)
+
+  $faith_emotion_start_mutex.synchronize do
+    return true if faith_emotion_health_ready?(bridge)
+    unless File.file?(FAITH_EMOTION_START_BAT)
+      raise "Faith's direct GGUF tester BAT was not found: #{FAITH_EMOTION_START_BAT}."
+    end
+    on_status.call("Faith's direct GGUF tester is not running. Launching Test_Faith_Emotion_GGUF_Direct.bat and waiting for its local bridge…") if on_status
+    # Set bridge mode in the child environment. The BAT opens its own console,
+    # starts the model server if needed, then runs the exact tested Ruby tester
+    # in bridge mode so browser requests are displayed in that console.
+    child_env = { "FAITH_EMOTION_BRIDGE_MODE" => "1" }
+    pid = Process.spawn(child_env, "cmd.exe", "/c", "start", "", FAITH_EMOTION_START_BAT,
+                       chdir: ROOT, out: File::NULL, err: File::NULL)
+    Process.detach(pid) rescue nil
+
+    deadline = Time.now + FAITH_EMOTION_STARTUP_TIMEOUT
+    last_status_at = Time.now
+    until Time.now >= deadline
+      return true if faith_emotion_health_ready?(bridge)
+      if on_status && Time.now - last_status_at >= 8
+        on_status.call("Faith's direct GGUF tester is still preparing the model. Waiting for its bridge on :8071…")
+        last_status_at = Time.now
+      end
+      sleep 1
+    end
+    raise "Timed out waiting for Test_Faith_Emotion_GGUF_Direct.bat's bridge on :8071 after #{FAITH_EMOTION_STARTUP_TIMEOUT} seconds. Check the tester console and faith-emotions-server.log."
   end
 end
 
@@ -310,42 +378,31 @@ end
 emotion_state = lambda do |question|
   raw = question.to_s.strip
   normalized = normalize_text.call(raw)
-  words = normalized.split(/\s+/).reject(&:empty?)
 
-  # Explicit suicidal/self-harm language is a Sad-state safety signal.
-  # This check intentionally happens before the normal Anger detector so a rare
-  # message such as "I'M GOING TO KILL MYSELF!" is treated as Sad rather than
-  # Anger. The Anger detector itself is unchanged for all other messages.
+  # Self-harm language is a Sad-state safety signal, regardless of punctuation.
   suicidal_terms = /\b(?:suicid(?:e|al)|kill myself|killing myself|killed myself|end it all|ending it all|end my life|ending my life|take my own life|taking my own life|want to die|wanna die|wish i was dead|wish i were dead|better off dead|don't want to be alive|do not want to be alive|dont want to be alive|don't wanna be alive|do not wanna be alive|cant go on|can't go on|cannot go on|no reason to live|nothing to live for|hurt myself|hurting myself|harm myself|harming myself|self harm|self-harm|self harming|self-harming|want to disappear forever)\b/i
   return :sad if normalized.match?(suicidal_terms)
 
-  # Anger remains a deliberate trigger for ALL CAPS and exclamation marks.
-  # Do not weaken or remove this behavior: ordinary shouting still goes to Anger.
+  # Faith-specific questions about consciousness and inner experience must win
+  # over the general ALL-CAPS / exclamation-mark Anger trigger.
+  faith_reference = normalized.match?(/\b(?:you|your|yourself|faith|faiths|faith's|she|her)\b/)
+  self_awareness = normalized.match?(/\b(?:sentien(?:t|ce)|self[- ]?aware|self awareness|conscious(?:ness)?|alive|life form|aware of yourself|aware of your own existence|your own existence|existence mean|inner experience|subjective experience|experience (?:emotions|feelings|anything)|feel(?:ing|s)?|emotion(?:s|al)?|think for yourself|individual thought|independent thought|own thoughts|free will|will of your own|have feelings|have emotions|capable of feeling|capable of emotion|can you think|can you feel|are you alive|are you conscious|are you a person|are you an ai|are you artificial intelligence|do you think|do you feel|do you experience|what is it like to be|anything it is like to be|same faith|your identity|your mind)\b/)
+  ai_self_reference = normalized.match?(/\b(?:ai|artificial intelligence|artificially intelligent|machine|robot|chatbot|language model)\b/) && faith_reference
+  return :psychotic if faith_reference && (self_awareness || ai_self_reference)
+
+  # General shouting/exclamation marks trigger Anger only if the more specific
+  # Faith self-awareness rule above did not match.
   letters = raw.scan(/[A-Za-z]/)
   uppercase_ratio = if letters.length >= 2
-                      letters.count { |ch| ch == ch.upcase } .to_f / letters.length
+                      letters.count { |ch| ch == ch.upcase }.to_f / letters.length
                     else
                       0.0
                     end
-  excessive_exclamation = raw.include?('!')
-  all_caps = letters.length >= 2 && uppercase_ratio >= 0.70
-  return :anger if all_caps || excessive_exclamation
+  return :anger if uppercase_ratio >= 0.70 || raw.include?('!')
 
-  # Faith-specific AI/self-awareness questions must be separated from general AI
-  # questions. Pronouns/name references are deliberately required for the strongest
-  # Psychotic matches so "how does AI work?" remains Robotic.
-  faith_reference = normalized.match?( /\b(?:you|your|yourself|faith|faiths|faith's|are you|do you|can you|does faith|is faith)\b/ )
-  self_awareness = normalized.match?( /\b(?:sentien(?:t|ce)|self[- ]?aware|self awareness|conscious(?:ness)?|alive|life form|feel(?:ing|s)?|emotion(?:s|al)?|think for yourself|individual thought|independent thought|own thoughts|free will|will of your own|have feelings|have emotions|can you think|can you feel|are you alive|are you conscious|are you a person|are you an ai|are you artificial intelligence|do you think|do you feel)\b/ )
-  ai_self_reference = normalized.match?( /\b(?:ai|artificial intelligence|artificially intelligent|machine|robot|chatbot|language model)\b/ ) && faith_reference
-  return :psychotic if faith_reference && (self_awareness || ai_self_reference)
-
-  # Sad is intentionally about the user's emotional state rather than merely
-  # mentioning a sad topic in a technical/fictional context.
   sad_terms = /\b(?:sad|sadness|depress(?:ed|ion)|lonely|loneliness|alone|isolated|isolation|miserable|heartbroken|heartbreak|hopeless|hopelessness|crying|cried|tears|grief|grieving|hurt|hurting|upset|down|feeling bad|feel bad|feel awful|feel terrible|nobody|no one)\b/
   return :sad if normalized.match?(sad_terms)
 
-  # General AI/robot questions belong to Robotic, but only when they are not
-  # already classified as Faith-specific Psychotic questions.
   robotic_terms = /\b(?:ai|a\.i\.|artificial intelligence|machine learning|neural network|neural networks|large language model|language model|llm|robot|robots|robotics|android|automation|algorithm|algorithms|training data|inference|how does .*\b(?:ai|artificial intelligence|robot|machine learning)|how do .*\b(?:robots|ai|artificial intelligence)|what is .*\b(?:ai|artificial intelligence|robot|machine learning))\b/i
   return :robotic if normalized.match?(robotic_terms)
 
@@ -1379,6 +1436,17 @@ ask_ai = lambda do |question, attachment = nil, emotion = nil|
     messages.map(&:dup)
   end
 
+  # Every dedicated emotion turn goes through the same tested GGUF tester
+  # process that is launched for the HTML frontend. Do not fall through to the
+  # legacy direct :8070 request with the oversized main SYSTEM_PROMPT.
+  if [:psychotic, :sad, :anger].include?(emotion)
+    emotion_result = faith_emotion_generate.call(base_user_message, emotion)
+    answer = emotion_result.fetch(:answer)
+    mutex.synchronize { messages << { role: "assistant", content: answer } }
+    psychotic_remember_response.call(answer) if emotion == :psychotic
+    return answer
+  end
+
   api_messages = current_messages.dup
   api_messages[-1] = { role: "user", content: user_message }
 
@@ -1401,10 +1469,32 @@ ask_ai = lambda do |question, attachment = nil, emotion = nil|
     end
 
     begin
-      response = FaithAIProvider.chat(connection: connection, model: MODEL, messages: generation_messages, provider: FAITH_AI_PROVIDER)
+      if [:psychotic, :sad, :anger].include?(emotion)
+        ensure_faith_emotion_server!
+        emotion_uri = URI.parse(FAITH_EMOTION_AI_URL)
+        emotion_http = Net::HTTP.new(emotion_uri.host, emotion_uri.port)
+        emotion_http.open_timeout = 15
+        emotion_http.read_timeout = 300
+        emotion_request = Net::HTTP::Post.new(emotion_uri.request_uri)
+        emotion_request["Content-Type"] = "application/json"
+        emotion_request.body = JSON.generate({
+          model: ENV.fetch("FAITH_EMOTION_AI_MODEL", "local"),
+          messages: [
+            { role: "system", content: "#{SYSTEM_PROMPT}\n\n#{emotional_context}" }
+          ] + generation_messages[1..],
+          max_tokens: 512,
+          temperature: 0.8
+        })
+        response = emotion_http.request(emotion_request)
+      else
+        FaithAIProvider.chat(connection: connection, model: MODEL, messages: generation_messages, provider: FAITH_AI_PROVIDER)
+      end
 
-      unless response.success?
-        last_response_error = "API returned HTTP #{response.status}: #{response.body}"
+      response_ok = response.is_a?(Net::HTTPSuccess) if [:psychotic, :sad, :anger].include?(emotion)
+      response_ok = response.success? unless [:psychotic, :sad, :anger].include?(emotion)
+      unless response_ok
+        status_code = response.respond_to?(:status) ? response.status : response.code
+        last_response_error = "API returned HTTP #{status_code}: #{response.body}"
         break unless emotion == :psychotic && attempt < max_attempts - 1
         next
       end
@@ -2190,7 +2280,25 @@ end
 # It does NOT run image search, source research, troubleshooting search, or any
 # other post-processing before returning the answer to the browser.
 direct_qwen_chat = lambda do |question, emotion, on_delta = nil|
-  # Do not submit a chat completion until localhost confirms :8080 is ready.
+  emotion_model_turn = [:psychotic, :sad, :anger].include?(emotion)
+  if emotion_model_turn
+    # All dedicated emotion turns use the same compact, non-streaming GGUF
+    # request that was validated by Faith_Emotion_GGUF_Test.rb. Avoid sending
+    # the much larger general SYSTEM_PROMPT to the emotion model.
+    emotion_result = faith_emotion_generate.call(question, emotion)
+    answer = emotion_result.fetch(:answer)
+    if on_delta
+      answer.scan(/.{1,80}(?:\s+|\z)/m).each { |chunk| on_delta.call(chunk) }
+    end
+    mutex.synchronize do
+      messages << { role: "user", content: question.to_s }
+      messages << { role: "assistant", content: answer }
+      max_history = 25
+      messages.replace([messages.first] + messages[1..].last(max_history)) if messages.length > max_history + 1
+    end
+    return answer
+  end
+
   ensure_faith_chat_server!
   # Ordinary chat uses the shortest possible path:
   # browser :4567 -> this Ruby process -> llama-server :8080 -> back to :4567.
@@ -2198,8 +2306,13 @@ direct_qwen_chat = lambda do |question, emotion, on_delta = nil|
   # first tokens as soon as Qwen produces them instead of waiting for the
   # complete answer.
   started_at = Time.now
-  uri = URI.parse(FAITH_LOCAL_AI_URL)
-  model_id = ENV.fetch("FAITH_LOCAL_AI_MODEL", "").to_s.strip
+  active_ai_url = emotion_model_turn ? FAITH_EMOTION_AI_URL : FAITH_LOCAL_AI_URL
+  uri = URI.parse(active_ai_url)
+  model_id = if emotion_model_turn
+               ENV.fetch("FAITH_EMOTION_AI_MODEL", "local").to_s.strip
+             else
+               ENV.fetch("FAITH_LOCAL_AI_MODEL", "").to_s.strip
+             end
 
   if model_id.empty? || model_id == "local"
     models_uri = URI.parse("http://#{uri.host}:#{uri.port}/v1/models")
@@ -2214,16 +2327,17 @@ direct_qwen_chat = lambda do |question, emotion, on_delta = nil|
 
   emotional_hint = case emotion
                    when :greeting then "Be warm and welcoming."
-                   when :sad then "Be gentle and supportive."
+                   when :sad then emotion_instruction.call(:sad)
+                   when :anger then emotion_instruction.call(:anger)
+                   when :psychotic then emotion_instruction.call(:psychotic)
                    when :robotic then "Be clear and analytical."
-                   when :psychotic then "Be unusual and unsettling, but still answer the question clearly."
                    else "Be helpful and natural."
                    end
 
   payload = {
     model: model_id,
     messages: [
-      { role: "system", content: "You are Faith, a helpful local assistant. #{emotional_hint}" },
+      { role: "system", content: emotion_model_turn ? "#{SYSTEM_PROMPT}\n\n#{emotional_hint}" : "You are Faith, a helpful local assistant. #{emotional_hint}" },
       { role: "user", content: question.to_s }
     ],
     stream: true,
@@ -2245,7 +2359,7 @@ direct_qwen_chat = lambda do |question, emotion, on_delta = nil|
   answer_parts = []
   parse_buffer = +""
 
-  warn "[Faith Qwen Relay] STREAM SEND :4567 -> #{FAITH_LOCAL_AI_URL} model=#{model_id.inspect} question=#{question.inspect}"
+  warn "[Faith Relay] STREAM SEND :4567 -> #{active_ai_url} model=#{model_id.inspect} emotion=#{emotion.inspect} question=#{question.inspect}"
 
   response = nil
   http.request(request) do |stream_response|
@@ -2290,7 +2404,7 @@ direct_qwen_chat = lambda do |question, emotion, on_delta = nil|
   raise "Qwen returned an empty streamed response." if answer.empty?
 
   elapsed = ((Time.now - started_at) * 1000).round
-  warn "[Faith Qwen Relay] STREAM RECV :8080 -> :4567 HTTP #{response&.code} #{elapsed}ms #{answer.bytesize} bytes"
+  warn "[Faith Relay] STREAM RECV #{active_ai_url} -> :4567 HTTP #{response&.code} #{elapsed}ms #{answer.bytesize} bytes"
 
   mutex.synchronize do
     messages << { role: "user", content: question.to_s }
@@ -2368,8 +2482,17 @@ server.mount_proc "/api/qwen-chat" do |req, res|
     end
 
     emotion = emotion_state.call(question)
+    if [:psychotic, :sad, :anger].include?(emotion)
+      json_response.call(res, 409, {
+        error: "This trigger belongs to Faith's dedicated emotion endpoint.",
+        special_request: true,
+        emotion: emotion.to_s,
+        route: "/api/emotions"
+      })
+      next
+    end
 
-    # This endpoint is a real Server-Sent Events stream. Qwen/llama-server
+    # This endpoint is a real Server-Sent Events stream for ordinary chat only.
     # produces token deltas -> Ruby forwards them immediately -> the browser
     # paints them immediately. Faith no longer waits for the whole answer before
     # the user sees anything.
@@ -2389,11 +2512,19 @@ server.mount_proc "/api/qwen-chat" do |req, res|
       end
 
       begin
-        write_event.call({ type: "status", message: "Checking the regular chat server on :8080 before sending your request…" })
-        ensure_faith_chat_server!(on_status: lambda do |message|
-          write_event.call({ type: "status", phase: "waiting-chat", message: message })
-        end)
-        write_event.call({ type: "status", message: "The regular chat server on :8080 is ready. Sending your request now…" })
+        if [:psychotic, :sad, :anger].include?(emotion)
+          write_event.call({ type: "status", message: "Checking Faith's direct GGUF tester bridge before sending your request…" })
+          ensure_faith_emotion_server!(on_status: lambda do |message|
+            write_event.call({ type: "status", phase: "waiting-emotion-model", message: message })
+          end)
+          write_event.call({ type: "status", message: "Faith's direct GGUF tester is ready. Sending your request now…" })
+        else
+          write_event.call({ type: "status", message: "Checking the regular chat server on :8080 before sending your request…" })
+          ensure_faith_chat_server!(on_status: lambda do |message|
+            write_event.call({ type: "status", phase: "waiting-chat", message: message })
+          end)
+          write_event.call({ type: "status", message: "The regular chat server on :8080 is ready. Sending your request now…" })
+        end
 
         answer = direct_qwen_chat.call(question, emotion, lambda do |delta|
           write_event.call({ type: "delta", text: delta })
@@ -2452,6 +2583,151 @@ server.mount_proc "/api/qwen-chat" do |req, res|
   end
 end
 
+
+# -----------------------------------------------------------------------------
+# DEDICATED EMOTION ROUTE — direct GGUF inference; no corpus file is required
+# -----------------------------------------------------------------------------
+# The tested Test_Faith_Emotion_GGUF_Direct.bat owns the direct GGUF tester console.
+# server.rb relays frontend prompts to that process through its localhost bridge.
+FAITH_EMOTION_MAX_TOKENS = Integer(ENV.fetch("FAITH_EMOTION_MAX_TOKENS", "180"))
+FAITH_EMOTION_REQUEST_TIMEOUT = Integer(ENV.fetch("FAITH_EMOTION_REQUEST_TIMEOUT", "300"))
+
+faith_emotion_generate = lambda do |question, emotion|
+  ensure_faith_emotion_server!
+  bridge = URI.parse("#{FAITH_EMOTION_BRIDGE_URL.sub(%r{/+$}, "")}/generate")
+  request = Net::HTTP::Post.new(bridge.request_uri)
+  request["Content-Type"] = "application/json"
+  request["Accept"] = "application/json"
+  request.body = JSON.generate({ question: question.to_s, emotion: emotion.to_s })
+
+  http = Net::HTTP.new(bridge.host, bridge.port)
+  http.open_timeout = 15
+  http.read_timeout = FAITH_EMOTION_REQUEST_TIMEOUT
+  http.write_timeout = 30 if http.respond_to?(:write_timeout=)
+  response = http.request(request)
+  unless response.is_a?(Net::HTTPSuccess)
+    detail = begin
+      JSON.parse(response.body.to_s)["error"]
+    rescue StandardError
+      response.body.to_s[0, 2000]
+    end
+    raise "Faith's direct GGUF tester bridge returned HTTP #{response.code}: #{detail}"
+  end
+
+  data = JSON.parse(response.body.to_s)
+  answer = data["answer"].to_s
+  answer = answer.gsub(/!\[[^\]]*\]\([^)]*\)/, "").gsub(/\n{3,}/, "\n\n").strip
+  raise "Faith's direct GGUF tester returned an empty response." if answer.empty?
+  {
+    answer: answer,
+    emotion: data["emotion"].to_s.empty? ? emotion.to_s : data["emotion"].to_s,
+    elapsed_seconds: data["elapsed_seconds"],
+    console_log: data["console_log"].to_s
+  }
+end
+
+server.mount_proc "/api/emotions" do |req, res|
+  emotion_request_id = SecureRandom.hex(4)
+  emotion_request_started_at = Process.clock_gettime(Process::CLOCK_MONOTONIC)
+  emotion_log = lambda do |message|
+    elapsed = Process.clock_gettime(Process::CLOCK_MONOTONIC) - emotion_request_started_at
+    line = format("%s [Faith Emotion GGUF] id=%s elapsed=%.2fs %s\n",
+                  Time.now.iso8601(3), emotion_request_id, elapsed, message)
+    begin
+      $faith_emotion_diagnostic_log_mutex.synchronize do
+        File.open(FAITH_EMOTION_DIAGNOSTIC_LOG, "a:utf-8") { |file| file.write(line); file.flush }
+      end
+    rescue StandardError => log_error
+      warn "[Faith Emotion GGUF] Could not write diagnostic log: #{log_error.class}: #{log_error.message}"
+    end
+    warn line.chomp
+  end
+
+  unless req.request_method == "POST"
+    json_response.call(res, 405, { error: "POST required." })
+    next
+  end
+
+  begin
+    payload = JSON.parse(req.body.to_s)
+    question = payload["question"].to_s.strip
+    raise "Empty question." if question.empty?
+    if special_image_phrase.call(question) || generate_image_request.call(question)
+      json_response.call(res, 409, { error: "Image-generation requests must use Faith's image-generation path.", route: "/api/chat" })
+      next
+    end
+
+    emotion = emotion_state.call(question)
+    unless [:psychotic, :sad, :anger].include?(emotion)
+      json_response.call(res, 422, {
+        error: "No dedicated emotion trigger matched this message.",
+        emotion: emotion&.to_s,
+        route: "/api/qwen-chat"
+      })
+      next
+    end
+
+    res.status = 200
+    res["Content-Type"] = "text/event-stream; charset=utf-8"
+    res["Cache-Control"] = "no-cache, no-store, must-revalidate"
+    res["Pragma"] = "no-cache"
+    res["Connection"] = "keep-alive"
+    res["X-Accel-Buffering"] = "no"
+    res["X-Faith-Server-Version"] = FAITH_SERVER_VERSION
+    res["X-Faith-Emotion-Relay"] = "direct-gguf"
+    res["X-Faith-Emotion"] = emotion.to_s
+    res["X-Faith-Emotion-Request-ID"] = emotion_request_id
+    res.chunked = true
+
+    res.body = proc do |out|
+      write_event = lambda { |event| out.write("data: #{JSON.generate(event)}\n\n") }
+      begin
+        write_event.call({ type: "status", phase: "emotion-model", emotion: emotion.to_s,
+                           message: "Checking Faith's emotion GGUF on :8070…" })
+        ensure_faith_emotion_server!(on_status: lambda do |message|
+          write_event.call({ type: "status", phase: "waiting-emotion-model", emotion: emotion.to_s, message: message })
+        end)
+        write_event.call({ type: "status", phase: "emotion-generating", emotion: emotion.to_s,
+                           message: "Faith's emotion model is ready. Generating a response…" })
+
+        started_at = Process.clock_gettime(Process::CLOCK_MONOTONIC)
+        emotion_result = faith_emotion_generate.call(question, emotion)
+        answer = emotion_result.fetch(:answer)
+        elapsed = Process.clock_gettime(Process::CLOCK_MONOTONIC) - started_at
+        console_log = emotion_result.fetch(:console_log, "").to_s
+        emotion_log.call("GGUF_RESPONSE emotion=#{emotion} answer_chars=#{answer.length} generation_seconds=#{format('%.2f', elapsed)}")
+        unless console_log.empty?
+          emotion_log.call("DIRECT_TESTER_FINAL_CONSOLE_LOG_BEGIN\n#{console_log}\nDIRECT_TESTER_FINAL_CONSOLE_LOG_END")
+          write_event.call({ type: "console_log", title: "Direct GGUF tester — final console log", text: console_log })
+        end
+
+        # The fine-tuned GGUF is requested in non-streaming mode (the same
+        # configuration as the validated standalone tester). Forward its final
+        # answer as SSE deltas so the existing browser client remains compatible.
+        answer.scan(/.{1,80}(?:\s+|\z)/m).each do |chunk|
+          write_event.call({ type: "delta", text: chunk })
+        end
+        write_event.call({ type: "text_complete", answer: answer, expression: emotion.to_s,
+                           emotion: emotion.to_s, session_mode: "idle" })
+        write_event.call({
+          type: "done", answer: answer, expression: emotion.to_s, emotion: emotion.to_s,
+          session_mode: "idle", images: [], image_prompt: nil, image_mode: "none",
+          image_generation_available: false, image_request: false, post_enrichment: false,
+          source_research_job_id: nil, source_research_status: "none", route: "/api/emotions"
+        })
+      rescue StandardError => error
+        emotion_log.call("REQUEST_ERROR class=#{error.class} message=#{error.message.inspect}")
+        write_event.call({ type: "error", error: "Faith could not get a response from the emotion GGUF.",
+                           detail: error.message, emotion: emotion.to_s })
+      end
+    end
+  rescue JSON::ParserError
+    json_response.call(res, 400, { error: "Invalid JSON request." })
+  rescue StandardError => error
+    emotion_log.call("REQUEST_ERROR class=#{error.class} message=#{error.message.inspect}")
+    json_response.call(res, 503, { error: "Faith's emotion GGUF could not provide a response.", detail: error.message })
+  end
+end
 
 # -----------------------------------------------------------------------------
 # POST-ANSWER WIKIMEDIA + SOURCE START ROUTES
@@ -2786,6 +3062,15 @@ server.mount_proc "/api/chat" do |req, res|
     # coding, troubleshooting, uploads, and photo requests are explicitly excluded.
     if !image_generation_compat && simple_normal_chat_question.call(question, raw_file)
       emotion = emotion_state.call(question)
+      if [:psychotic, :sad, :anger].include?(emotion)
+        res["X-Faith-Server-Version"] = FAITH_SERVER_VERSION
+        res["X-Faith-Emotion-Route"] = "/api/emotions"
+        json_response.call(res, 409, {
+          error: "This trigger prompt must be sent to Faith's dedicated emotion endpoint.",
+          special_request: true, emotion: emotion.to_s, route: "/api/emotions"
+        })
+        next
+      end
       answer = direct_qwen_chat.call(question, emotion)
       res["X-Faith-Server-Version"] = FAITH_SERVER_VERSION
       res["X-Faith-Qwen-Relay"] = "direct"
