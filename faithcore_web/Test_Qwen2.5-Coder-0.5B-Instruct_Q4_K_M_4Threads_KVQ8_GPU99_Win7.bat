@@ -67,7 +67,6 @@ rem If --cache-ram is unsupported by your llama.cpp build, remove that line.
   --ubatch-size 64 ^
   --cache-type-k q8_0 ^
   --cache-type-v q8_0 ^
-  --n-gpu-layers 99 ^
   --cache-ram 0
 
 set "EXITCODE=%ERRORLEVEL%"
