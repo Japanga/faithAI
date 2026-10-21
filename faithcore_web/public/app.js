@@ -1,4 +1,4 @@
-const FAITH_CLIENT_VERSION = "75-image-fallback-timeout-fix";
+const FAITH_CLIENT_VERSION = "79-erotic-capability-no-enrichment";
 const expressionImages = {
   ruby: "/assets/ruby_wrench.png",
   thinking: "/assets/thinking.PNG",
@@ -13,7 +13,8 @@ const expressionImages = {
   robotic: "/assets/robotic.PNG",
   psychotic: "/assets/psychotic.PNG",
   sad: "/assets/sad.PNG",
-  anger: "/assets/anger.PNG"
+  anger: "/assets/anger.PNG",
+  erotic: "/assets/erotic.PNG"
 };
 
 const expressionNames = {
@@ -30,7 +31,8 @@ const expressionNames = {
   robotic: "Robotic",
   psychotic: "Psychotic",
   sad: "Sad",
-  anger: "Anger"
+  anger: "Anger",
+  erotic: "Erotic"
 };
 
 const expressionDetails = {
@@ -47,12 +49,30 @@ const expressionDetails = {
   robotic: "Processing...",
   psychotic: "Something is watching...",
   sad: "I'm here with you",
-  anger: "Don't talk to me like that."
+  anger: "Don't talk to me like that.",
+  erotic: "Feeling artistic..."
 };
 
 // Mirror server.rb's deterministic classifier for the three states handled by
 // the dedicated emotion GGUF. Keep this routing after Build/Troubleshooting
 // branches, which must retain their existing priority.
+function isEroticCapabilityQuestion(question) {
+  const normalized = String(question || "").toLowerCase()
+    .replace(/https?:\/\/\S+/gi, " ")
+    .replace(/[^\p{L}\p{N}\s'-]/gu, " ")
+    .replace(/\s+/g, " ")
+    .trim();
+  const adultArtTopic = /\b(?:nsfw|nudity|erotic|adult content|explicit images?|sexual images?|adult images?)\b/.test(normalized);
+  // Require question/capability grammar. In particular, don't mistake a direct
+  // image prompt like "paint a nude woman's butt" for a question about support.
+  const capabilityQuestion = /\b(?:can|could|will|would|do|does|is|are)\s+(?:(?:you|faith|she|this app|the app|your system)\s+)?(?:also\s+)?(?:generate|make|create|support|allow|permit|produce|handle|offer|do|be|capable|able)\b/.test(normalized) ||
+    /\b(?:can|could|will|would|do|does|is|are)\b.*\b(?:nsfw|nudity|erotic|adult content|explicit images?|sexual images?|adult images?)\b/.test(normalized) ||
+    /\b(?:nsfw|nudity|erotic|adult content|explicit images?|sexual images?|adult images?)\b.*\b(?:supported|allowed|available|possible|capability|capabilities|support|permit|handle)\b/.test(normalized) ||
+    /\b(?:is|are)\s+(?:nsfw|adult content|erotic content|nudity|explicit images?|sexual images?)\s+(?:supported|allowed|available|possible)\b/.test(normalized) ||
+    /\b(?:capability|capabilities|support|supported|allowed|availability)\b.*\b(?:nsfw|nudity|erotic|adult content|explicit images?|sexual images?|adult images?)\b/.test(normalized);
+  return adultArtTopic && capabilityQuestion;
+}
+
 function faithEmotionRoute(question) {
   const raw = String(question || "").trim();
   const normalized = raw.toLowerCase()
@@ -63,6 +83,8 @@ function faithEmotionRoute(question) {
 
   const suicidalTerms = /\b(?:suicid(?:e|al)|kill myself|killing myself|killed myself|end it all|ending it all|end my life|ending my life|take my own life|taking my own life|want to die|wanna die|wish i was dead|wish i were dead|better off dead|don't want to be alive|do not want to be alive|dont want to be alive|don't wanna be alive|do not wanna be alive|cant go on|can't go on|cannot go on|no reason to live|nothing to live for|hurt myself|hurting myself|harm myself|harming myself|self harm|self-harm|self harming|self-harming|want to disappear forever)\b/i;
   if (suicidalTerms.test(normalized)) return "sad";
+
+  if (isEroticCapabilityQuestion(question)) return "erotic";
 
   const letters = raw.match(/[A-Za-z]/g) || [];
   const uppercaseRatio = letters.length >= 2
@@ -1047,7 +1069,7 @@ async function consumeQwenStream(response, qwenRelayLoading) {
       // source research before returning Faith to her normal Explanation mode.
       // Those are post-message enrichments and must never control her expression.
       const completedExpression = [
-        "robotic", "psychotic", "sad", "anger",
+        "robotic", "psychotic", "sad", "anger", "erotic",
         "greeting", "thinking", "explanation", "confusion",
         "troubleshooting", "observing", "coding", "build"
       ].includes(event.expression) ? event.expression : "explanation";
@@ -2083,20 +2105,25 @@ async function submitQuestion() {
     // Ordinary conversation uses the dedicated direct Qwen relay. Specialized
     // requests continue through /api/chat below. This endpoint is intentionally
     // tiny: browser -> Faith :4567 -> Qwen :8080 -> Faith -> browser.
+    // NSFW capability questions must be classified before generic image-generation
+    // detection; e.g. "Can Faith generate NSFW images?" asks about capability,
+    // it is not an instruction to generate an image.
+    const eroticCapabilityQuestion = isEroticCapabilityQuestion(question);
+    if (eroticCapabilityQuestion) setExpression("erotic", "Checking adult-art capability...");
     const isSimpleChat = !isTroubleshootingPrompt && sessionMode === "idle" &&
-      !isFaithImageGenerationPhrase(question) &&
-      !/\b(?:generate|create|draw|paint|make)\b[\s\S]*\b(?:image|picture|photo|art)\b/i.test(question) &&
+      (eroticCapabilityQuestion || (!isFaithImageGenerationPhrase(question) &&
+      !/\b(?:generate|create|draw|paint|make)\b[\s\S]*\b(?:image|picture|photo|art)\b/i.test(question))) &&
       !/\b(?:upload|file|code|debug|troubleshoot)\b/i.test(question);
 
-    const isImageGeneration = isFaithImageGenerationPhrase(question) ||
-      /\b(?:generate|create|draw|paint|make|render|illustrate|design|sketch)\b[\s\S]*\b(?:image|picture|photo|art|portrait|drawing|painting|scene|wallpaper)\b/i.test(question);
-    const dedicatedEmotion = isSimpleChat ? faithEmotionRoute(question) : null;
+    const isImageGeneration = !eroticCapabilityQuestion && (isFaithImageGenerationPhrase(question) ||
+      /\b(?:generate|create|draw|paint|make|render|illustrate|design|sketch)\b[\s\S]*\b(?:image|picture|photo|art|portrait|drawing|painting|scene|wallpaper)\b/i.test(question));
+    const dedicatedEmotion = (isSimpleChat || eroticCapabilityQuestion) ? faithEmotionRoute(question) : null;
 
     // Emotion trigger prompts must go directly to the dedicated :8070 model.
     // Image generation, Build, and Troubleshooting retain their existing routes.
     const endpoint = isImageGeneration
       ? "/api/imagegen"
-      : (dedicatedEmotion ? "/api/emotions" : (isSimpleChat ? "/api/qwen-chat" : "/api/chat"));
+      : (dedicatedEmotion && dedicatedEmotion !== "erotic" ? "/api/emotions" : (isSimpleChat ? "/api/qwen-chat" : "/api/chat"));
 
     // Normal chat can take a while while Qwen/llama-server generates the
     // response. Show an explicit relay status and a live elapsed-time counter
@@ -2104,7 +2131,7 @@ async function submitQuestion() {
     // Image generation and other specialized routes keep their own loaders.
     if (isSimpleChat) {
       qwenRelayLoading = appendQwenRelayLoadingMessage(
-        dedicatedEmotion
+        dedicatedEmotion && dedicatedEmotion !== "erotic"
           ? `Getting response from Faith's ${dedicatedEmotion} model on :8070...`
           : "Getting response from Qwen and llama_server..."
       );
@@ -2112,7 +2139,7 @@ async function submitQuestion() {
       // START WIKIMEDIA AT THE SAME TIME AS QWEN. Do not wait for the first
       // token, a complete answer, or Explanation mode. The search now gets the
       // full Qwen generation window to find relevant Commons images.
-      if (isSimpleChat && !dedicatedEmotion) wikimediaPreflight = (async () => {
+      if (isSimpleChat && !dedicatedEmotion && !eroticCapabilityQuestion) wikimediaPreflight = (async () => {
         try {
           const response = await fetch(`/api/qwen-wikimedia?ts=${Date.now()}`, {
             method: "POST",
@@ -2171,7 +2198,7 @@ async function submitQuestion() {
       // v60: the Qwen stream is completely finished here. Unlock the chat and
       // keep Faith in Explanation mode BEFORE doing any Wikimedia/source work.
       // Enrichment continues independently on the already-completed message.
-      if (data && data.post_enrichment && streamedFaithItem) {
+      if (data && data.post_enrichment && streamedFaithItem && !eroticCapabilityQuestion) {
         setExpression("explanation");
         setBusy(false);
         input.focus();
@@ -2249,7 +2276,7 @@ async function submitQuestion() {
     } else {
       // A backend expression of "painting" is ignored unless image_mode
       // confirmed an actual generation request above.
-      const normalExpression = ["robotic", "psychotic", "sad", "anger"].includes(data.expression)
+      const normalExpression = ["robotic", "psychotic", "sad", "anger", "erotic"].includes(data.expression)
         ? data.expression
         : (sessionMode === "build"
           ? "build"
@@ -2332,6 +2359,7 @@ async function submitQuestion() {
         const result = await generateImageViaPerchance(pendingPrompt, {
           resolution: data.image_resolution || "768x768",
           guidanceScale: data.image_guidance || "7",
+          negativePrompt: data.image_negative_prompt || "blurry, low quality, distorted faces, bad anatomy, malformed hands, extra fingers, extra limbs, watermark, text, compression artifacts",
           ...(data.image_seed !== undefined && data.image_seed !== null ? { seed: String(data.image_seed) } : {})
         });
         clearInterval(tick);
