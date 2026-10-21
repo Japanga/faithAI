@@ -37,7 +37,7 @@ MODEL = "auto"
 IMAGE_MODEL = ENV.fetch("FAITH_IMAGE_MODEL", "gpt-image-2")
 IMAGE_PROVIDER = ENV.fetch("FAITH_IMAGE_PROVIDER", "perchance").downcase
 PORT = Integer(ENV.fetch("PORT", "4567"))
-FAITH_SERVER_VERSION = "87-image-fallback-timeout-validation"
+FAITH_SERVER_VERSION = "90-erotic-capability-routing-no-enrichment"
 # Emotion diagnostics are written beside this server.rb by default. Override with
 # FAITH_EMOTION_DIAGNOSTIC_LOG if you want the log somewhere else.
 FAITH_EMOTION_DIAGNOSTIC_LOG = File.expand_path(
@@ -380,6 +380,17 @@ emotion_state = lambda do |question|
   # Self-harm language is a Sad-state safety signal, regardless of punctuation.
   suicidal_terms = /\b(?:suicid(?:e|al)|kill myself|killing myself|killed myself|end it all|ending it all|end my life|ending my life|take my own life|taking my own life|want to die|wanna die|wish i was dead|wish i were dead|better off dead|don't want to be alive|do not want to be alive|dont want to be alive|don't wanna be alive|do not wanna be alive|cant go on|can't go on|cannot go on|no reason to live|nothing to live for|hurt myself|hurting myself|harm myself|harming myself|self harm|self-harm|self harming|self-harming|want to disappear forever)\b/i
   return :sad if normalized.match?(suicidal_terms)
+
+  # Erotic is only for questions ABOUT the app's adult-art capability.
+  # Do not classify actual image prompts such as "paint a nude woman's butt"
+  # as capability questions just because they contain "paint" and "nude".
+  adult_art_topic = normalized.match?(/\b(?:nsfw|nudity|erotic|adult content|explicit images?|sexual images?|adult images?)\b/)
+  capability_question = normalized.match?(/\b(?:can|could|will|would|do|does|is|are)\s+(?:(?:you|faith|she|this app|the app|your system)\s+)?(?:also\s+)?(?:generate|make|create|support|allow|permit|produce|handle|offer|do|be|capable|able)\b/) ||
+    normalized.match?(/\b(?:can|could|will|would|do|does|is|are)\b.*\b(?:nsfw|nudity|erotic|adult content|explicit images?|sexual images?|adult images?)\b/) ||
+    normalized.match?(/\b(?:nsfw|nudity|erotic|adult content|explicit images?|sexual images?|adult images?)\b.*\b(?:supported|allowed|available|possible|capability|capabilities|support|permit|handle)\b/) ||
+    normalized.match?(/\b(?:is|are)\s+(?:nsfw|adult content|erotic content|nudity|explicit images?|sexual images?)\s+(?:supported|allowed|available|possible)\b/) ||
+    normalized.match?(/\b(?:capability|capabilities|support|supported|allowed|availability)\b.*\b(?:nsfw|nudity|erotic|adult content|explicit images?|sexual images?|adult images?)\b/)
+  return :erotic if adult_art_topic && capability_question
 
   # Faith-specific questions about consciousness and inner experience must win
   # over the general ALL-CAPS / exclamation-mark Anger trigger.
@@ -816,6 +827,11 @@ generate_image = lambda do |question|
     w = 768 if w.nil? || w <= 0
     h = 768 if h.nil? || h <= 0
     prompt_esc = URI.encode_www_form_component(visual).gsub("+", "%20")
+    negative_prompt = ENV.fetch(
+      "FAITH_IMAGE_NEGATIVE_PROMPT",
+      "blurry, low quality, low resolution, distorted face, asymmetrical eyes, malformed hands, extra fingers, missing fingers, extra limbs, bad anatomy, duplicate features, text, watermark, logo, compression artifacts, oversaturated, out of frame"
+    ).to_s.strip
+    negative_prompt_esc = URI.encode_www_form_component(negative_prompt).gsub("+", "%20")
 
     # 429s are common on the free tier (shared per-model RPM). Retry with
     # backoff and alternate models before giving up to browser fallback.
@@ -826,7 +842,7 @@ generate_image = lambda do |question|
     models.each_with_index do |model, attempt|
       sleep(waits[attempt]) if waits[attempt] > 0
       seed = rand(1_000_000_000)
-      url = "#{POLLINATIONS_IMAGE_URL}/#{prompt_esc}?width=#{w}&height=#{h}&seed=#{seed}&nologo=true&model=#{model}"
+      url = "#{POLLINATIONS_IMAGE_URL}/#{prompt_esc}?width=#{w}&height=#{h}&seed=#{seed}&nologo=true&model=#{model}&negative_prompt=#{negative_prompt_esc}"
       warn "Faith pollinations: attempt #{attempt + 1}/#{models.length} model=#{model} GET #{url[0, 160]}..."
 
       begin
@@ -2480,7 +2496,8 @@ server.mount_proc "/api/qwen-chat" do |req, res|
     question = payload["question"].to_s.strip
     raise "Empty question." if question.empty?
 
-    if special_image_phrase.call(question) || generate_image_request.call(question)
+    erotic_capability_question = emotion_state.call(question) == :erotic
+    if !erotic_capability_question && (special_image_phrase.call(question) || generate_image_request.call(question))
       json_response.call(res, 409, {
         error: "Image-generation requests must use Faith's image-generation path.",
         special_request: true,
@@ -2534,9 +2551,17 @@ server.mount_proc "/api/qwen-chat" do |req, res|
           write_event.call({ type: "status", message: "The regular chat server on :8080 is ready. Sending your request now…" })
         end
 
-        answer = direct_qwen_chat.call(question, emotion, lambda do |delta|
-          write_event.call({ type: "delta", text: delta })
-        end)
+        if emotion == :erotic
+          answer = "Absolutely—I can help create adult-oriented artwork featuring consenting adults, within the image provider's limits. I do love a cheeky artistic focus on women's butts. Try either of these test prompts:
+
+1. paint a nude woman's butt
+2. paint a nude woman sitting on the toilet"
+          write_event.call({ type: "delta", text: answer })
+        else
+          answer = direct_qwen_chat.call(question, emotion, lambda do |delta|
+            write_event.call({ type: "delta", text: delta })
+          end)
+        end
 
         # The complete text is available now. Send this event BEFORE any
         # Wikimedia/source post-processing so the browser can finalize the
@@ -3061,7 +3086,11 @@ server.mount_proc "/api/chat" do |req, res|
         })
         next
       end
-      answer = direct_qwen_chat.call(question, emotion)
+      answer = if emotion == :erotic
+                 "Absolutely—I can help create adult-oriented artwork featuring consenting adults, within the image provider's limits. I do love a cheeky artistic focus on women's butts. Try either of these test prompts:\n\n1. paint a nude woman's butt\n2. paint a nude woman sitting on the toilet"
+               else
+                 direct_qwen_chat.call(question, emotion)
+               end
       res["X-Faith-Server-Version"] = FAITH_SERVER_VERSION
       res["X-Faith-Qwen-Relay"] = "direct"
       json_response.call(res, 200, {
