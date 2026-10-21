@@ -31,13 +31,10 @@ require_relative "FaithAIProvider"
 require_relative "FaithVisionObserver"
 VISION_MAX_TEXT = Integer(ENV.fetch("FAITH_VISION_MAX_TEXT", "60000"))
 WIKIMEDIA_API_URL = "https://commons.wikimedia.org/w/api.php"
-OPENAI_IMAGE_API_URL = "https://api.openai.com/v1/images/generations"
 POLLINATIONS_IMAGE_URL = "https://image.pollinations.ai/prompt"
 MODEL = "auto"
-IMAGE_MODEL = ENV.fetch("FAITH_IMAGE_MODEL", "gpt-image-2")
-IMAGE_PROVIDER = ENV.fetch("FAITH_IMAGE_PROVIDER", "perchance").downcase
 PORT = Integer(ENV.fetch("PORT", "4567"))
-FAITH_SERVER_VERSION = "90-erotic-capability-routing-no-enrichment"
+FAITH_SERVER_VERSION = "94-pollinations-prompt-faithful"
 # Emotion diagnostics are written beside this server.rb by default. Override with
 # FAITH_EMOTION_DIAGNOSTIC_LOG if you want the log somewhere else.
 FAITH_EMOTION_DIAGNOSTIC_LOG = File.expand_path(
@@ -304,13 +301,6 @@ image_connection = Faraday.new do |faraday|
   faraday.options.open_timeout = 5
 end
 
-openai_connection = Faraday.new do |faraday|
-  faraday.headers["Content-Type"] = "application/json"
-  faraday.options.timeout = 120
-  faraday.options.open_timeout = 10
-end
-
-
 # Faith :4567 owns the application and conversation. Qwen :8080 is the private
 # text-generation backend. Uploaded images are first inspected by the local
 # FaithVisionObserver, then their visual observation can be handed to Qwen for
@@ -560,6 +550,15 @@ photo_request = lambda do |question|
   (direct_action && image_word) || object_phrase
 end
 
+# Faith uses Pollinations as the sole image-generation provider. A trailing
+# "using Pollinations" is treated as routing metadata and removed from the prompt.
+image_provider_suffix = lambda do |question|
+  text = question.to_s.strip
+  explicit = text.match?(/\s+using\s+pollinations[.!?]*\s*\z/i)
+  clean = text.sub(/\s+using\s+pollinations[.!?]*\s*\z/i, "").strip
+  { provider: "pollinations", explicit: explicit, prompt: clean }
+end
+
 # AI generation is reserved for requests that explicitly ask Faith to CREATE an image.
 # Generation WINS over photo: "generate an image of X" contains "image of" but
 # must not be misrouted to Wikimedia. photo_request is checked with
@@ -579,10 +578,9 @@ generate_image_request = lambda do |question|
 end
 
 # Strip chat scaffolding ("please generate an image of...") down to a visual
-# prompt for perchance-ai-api. The browser generates from this - Ruby never
-# fabricates a URL because that endpoint needs JS/GPU + postMessage.
+# prompt for the Pollinations server-side image endpoint.
 extract_visual_prompt = lambda do |question|
-  q = question.to_s.dup
+  q = image_provider_suffix.call(question)[:prompt].to_s.dup
   q = q.gsub(/\bplease\b/i, " ")
   q = q.gsub(/\b(can|could|would)\s+you\s+/i, " ")
   q = q.gsub(/\b(faith|hey|hi|hello)\b[,\s]*/i, " ")
@@ -598,6 +596,20 @@ extract_visual_prompt = lambda do |question|
   end
   q = q.sub(/\A(me|my)\s+/i, "").strip
   q[0, 1000]
+end
+
+# Add only general visual-quality guidance. Do not add erotic, sexual, bondage,
+# restraint, gag, or other scenario-specific details that the user did not request.
+enhance_visual_prompt = lambda do |raw_prompt|
+  visual = raw_prompt.to_s.gsub(/\s+/, " ").strip
+  next visual if visual.empty?
+
+  quality = "well-composed framing, clear subject readability, balanced lighting, sharp focus, realistic textures, coherent perspective, high visual detail"
+  # Avoid duplicating generic guidance if the user already included it.
+  unless visual.match?(/\b(?:sharp focus|balanced lighting|well-composed|realistic textures|high visual detail)\b/i)
+    visual = "#{visual}, #{quality}"
+  end
+  visual[0, 1800]
 end
 
 # Words that describe an image subject but are not useful as search concepts.
@@ -810,26 +822,42 @@ rescue StandardError => error
 end
 
 # Generate an AI image on the SERVER and save to /generated/*.png|jpg.
-# Default provider "perchance" now uses Pollinations (free, no key, plain GET
-# returning image bytes - reliable from Ruby). The old perchance-ai-api iframe
-# flow can't run in Ruby (needs browser JS/GPU + postMessage, flaky even in
-# browsers) so it is no longer used here. OpenAI branch kept for
-# FAITH_IMAGE_PROVIDER=openai.
+# Pollinations is the sole image-generation provider. It is free to try,
+# requires no API key, and returns image bytes directly to the Ruby server.
 generate_image = lambda do |question|
-  visual = extract_visual_prompt.call(question)
+  selected_provider = image_provider_suffix.call(question)
+  provider = selected_provider[:provider]
+  prompt_question = selected_provider[:prompt]
+  visual = extract_visual_prompt.call(prompt_question)
   visual = fallback_image_topic.call(question) if visual.to_s.length < 3
-  visual = question.to_s[0, 1000] if visual.to_s.length < 3
-  warn "Faith image: visual_prompt=#{visual.inspect}"
+  visual = prompt_question.to_s[0, 1000] if visual.to_s.length < 3
+  visual = enhance_visual_prompt.call(visual)
+  # Large output is opt-in through explicit wording in the user's own request.
+  # Sensitive subject matter alone never changes the output size.
+  large_resolution_requested = question.to_s.match?( /\b(?:full\s+resolution|high\s+resolution|hi[- ]?res|large[- ]scale|large\s+size|big\s+size|big\s+resolution|large\s+resolution|maximum\s+resolution|4k|8k)\b/i )
+  warn "Faith image: provider=#{provider} explicit_provider=#{selected_provider[:explicit]} large_resolution=#{large_resolution_requested} original_request=#{question.to_s[0, 500].inspect} final_visual_prompt=#{visual.inspect}"
 
-  if IMAGE_PROVIDER == "perchance" || IMAGE_PROVIDER == "pollinations"
-    resolution = ENV.fetch("FAITH_IMAGE_RESOLUTION", "768x768")
-    w, h = resolution.split("x").map(&:to_i)
-    w = 768 if w.nil? || w <= 0
-    h = 768 if h.nil? || h <= 0
+  if provider == "pollinations"
+    # Normal default stays portrait-sized. Only explicit size wording enables
+    # the larger render; aspect-ratio hints in the prompt are respected.
+    if large_resolution_requested
+      if question.to_s.match?(/\b(?:landscape|wide|horizontal)\b/i)
+        w, h = 2048, 1152
+      elsif question.to_s.match?(/\b(?:square|1:1)\b/i)
+        w, h = 1536, 1536
+      else
+        w, h = 1536, 2048
+      end
+    else
+      w, h = 832, 1216
+    end
+    # Remove the size-control wording from the image subject so it is not
+    # interpreted as text/content to draw.
+    visual = visual.gsub(/\b(?:in\s+)?(?:full\s+resolution|high\s+resolution|hi[- ]?res|large[- ]scale|large\s+size|big\s+size|big\s+resolution|large\s+resolution|maximum\s+resolution|4k|8k)\b/i, " ").gsub(/\s+/, " ").strip
     prompt_esc = URI.encode_www_form_component(visual).gsub("+", "%20")
     negative_prompt = ENV.fetch(
       "FAITH_IMAGE_NEGATIVE_PROMPT",
-      "blurry, low quality, low resolution, distorted face, asymmetrical eyes, malformed hands, extra fingers, missing fingers, extra limbs, bad anatomy, duplicate features, text, watermark, logo, compression artifacts, oversaturated, out of frame"
+      "blurry, low quality, low resolution, out of focus, distorted face, asymmetrical eyes, malformed hands, extra fingers, missing fingers, fused fingers, extra limbs, duplicate limbs, fused body parts, bad anatomy, duplicate features, smeared details, plastic skin, text, watermark, logo, compression artifacts, oversaturated, cropped head, out of frame"
     ).to_s.strip
     negative_prompt_esc = URI.encode_www_form_component(negative_prompt).gsub("+", "%20")
 
@@ -895,42 +923,8 @@ generate_image = lambda do |question|
 
     return result || []
   else
-    api_key = ENV["OPENAI_API_KEY"].to_s.strip
-    return [] if api_key.empty?
-
-    prompt = question.to_s[0, 32000]
-
-    response = openai_connection.post(OPENAI_IMAGE_API_URL) do |request|
-      request.headers["Authorization"] = "Bearer #{api_key}"
-      request.body = {
-        model: IMAGE_MODEL,
-        prompt: prompt,
-        size: "1024x1024",
-        quality: ENV.fetch("FAITH_IMAGE_QUALITY", "medium"),
-        output_format: "png",
-        n: 1
-      }.to_json
-    end
-
-    unless response.success?
-      warn "Faith image generation error: HTTP #{response.status}: #{response.body}"
-      return []
-    end
-
-    data = JSON.parse(response.body)
-    encoded = data.dig("data", 0, "b64_json")
-    return [] if encoded.to_s.empty?
-
-    filename = "faith-#{SecureRandom.hex(10)}.png"
-    path = File.join(GENERATED_DIR, filename)
-    File.binwrite(path, encoded.unpack1("m0"))
-
-    [{
-      url: "/generated/#{filename}",
-      title: "Faith-generated image",
-      source: "Faith / #{IMAGE_MODEL}",
-      type: "generated"
-    }]
+    warn "Faith image provider is unsupported: #{provider.inspect}"
+    []
   end
 rescue StandardError => error
   warn "Faith image generation error: #{error.class}: #{error.message}"
@@ -2444,7 +2438,7 @@ direct_qwen_chat = lambda do |question, emotion, on_delta = nil|
 end
 
 # Image-generation phrases are NEVER sent to the direct Qwen chat relay.
-# Faith's existing /api/chat generation path handles these so Perchance/Pollinations
+# Faith's existing /api/chat generation path handles these so Pollinations
 # and the Painting expression remain intact. Keep this deliberately strict because
 # prompts such as "paint a sunset" and "generate a castle" may not contain the word
 # "image" at all.
@@ -3005,39 +2999,41 @@ server.mount_proc "/api/imagegen" do |req, res|
 
     warn "[Faith Image Relay] IMAGE ONLY :4567 -> image generator question=#{question[0, 120].inspect}"
 
+    selected_image_provider = image_provider_suffix.call(question)
     images = generate_image.call(question)
     image_prompt = extract_visual_prompt.call(question)
     image_prompt = fallback_image_topic.call(question) if image_prompt.to_s.length < 3
-    image_prompt = question[0, 1000] if image_prompt.to_s.length < 3
+    image_prompt = selected_image_provider[:prompt][0, 1000] if image_prompt.to_s.length < 3
 
     if images.empty?
-      # A server-side failure is not a hard stop. Return the prompt so app.js
-      # can attempt its browser-side Perchance generator instead.
-      image_mode = "generated-pending"
-      warn "[Faith Image Relay] Server generation failed; handing off to browser fallback."
+      # Pollinations is the sole provider; do not hand failed requests to a
+      # different browser-side generator.
+      image_prompt = nil
+      image_mode = "none"
+      warn "[Faith Image Relay] Pollinations failed; alternate-provider fallback is disabled."
     else
       image_mode = "generated"
       warn "[Faith Image Relay] Generated #{images.length} image(s) successfully."
     end
 
-    generation_available = ["perchance", "pollinations"].include?(IMAGE_PROVIDER) ||
-      !ENV["OPENAI_API_KEY"].to_s.strip.empty?
+    generation_available = true
 
     res["X-Faith-Server-Version"] = FAITH_SERVER_VERSION
     res["X-Faith-Qwen-Relay"] = "not-used"
     res["X-Faith-Image-Relay"] = "direct"
     json_response.call(res, 200, {
-      answer: "",
+      answer: (images.empty? && selected_image_provider[:explicit] ? "Pollinations image generation failed. No API key is needed; check the Faith server log for a Pollinations network, rate-limit, or service error." : ""),
       expression: "painting",
       emotion: nil,
       session_mode: "idle",
       images: images,
       image_prompt: image_prompt,
-      image_resolution: ENV.fetch("FAITH_IMAGE_RESOLUTION", "768x768"),
+      image_resolution: ENV.fetch("FAITH_IMAGE_RESOLUTION", "832x1216"),
       image_guidance: ENV.fetch("FAITH_IMAGE_GUIDANCE_SCALE", "7"),
       image_seed: -1,
       image_mode: image_mode,
       image_generation_available: generation_available,
+      image_provider: selected_image_provider[:provider],
       image_request: true,
       source_research_job_id: nil,
       source_research_status: "none"
@@ -3207,7 +3203,7 @@ server.mount_proc "/api/chat" do |req, res|
           source_research_status: source_job_id ? "researching" : "none",
           expression: expression_name, emotion: emotion&.to_s, session_mode: "idle",
           fix_code_available: false, images: images, image_prompt: nil,
-          image_resolution: ENV.fetch("FAITH_IMAGE_RESOLUTION", "768x768"),
+          image_resolution: ENV.fetch("FAITH_IMAGE_RESOLUTION", "832x1216"),
           image_guidance: ENV.fetch("FAITH_IMAGE_GUIDANCE_SCALE", "7"), image_seed: -1,
           image_mode: image_mode, image_generation_available: false, image_request: false
         })
@@ -3238,7 +3234,7 @@ server.mount_proc "/api/chat" do |req, res|
         fix_code_available: false,
         images: [],
         image_prompt: nil,
-        image_resolution: ENV.fetch("FAITH_IMAGE_RESOLUTION", "768x768"),
+        image_resolution: ENV.fetch("FAITH_IMAGE_RESOLUTION", "832x1216"),
         image_guidance: ENV.fetch("FAITH_IMAGE_GUIDANCE_SCALE", "7"),
         image_seed: -1,
         image_mode: "none",
@@ -3506,7 +3502,7 @@ server.mount_proc "/api/chat" do |req, res|
     session_state = mutex.synchronize { { troubleshooting: troubleshooting_active, coding: coding_active } }
     # Expression selection is based on the CURRENT request. Coding is a one-shot
     # action used only for an explicit code-fix response; it must never overwrite
-    # Painting/Perchance/Pollinations or ordinary chat on later requests.
+    # Painting/Pollinations or ordinary chat on later requests.
     expression_name = if emotion
                         emotion.to_s
                       elsif defined?(set_coding) && set_coding
@@ -3532,12 +3528,14 @@ server.mount_proc "/api/chat" do |req, res|
 
     if generated_request && !troubleshooting_request.call(question)
       warn "Faith routing: GENERATE question=#{question[0, 80].inspect}"
+      selected_image_provider = image_provider_suffix.call(question)
       images = generate_image.call(question)
       if images.empty?
-        # Server-side failed: send prompt so app.js can try browser fallback.
-        image_prompt = extract_visual_prompt.call(question)
-        image_prompt = fallback_image_topic.call(question) if image_prompt.to_s.length < 3
-        image_mode = image_prompt.to_s.length >= 3 ? "generated-pending" : "none"
+        # Pollinations is the only image-generation provider; do not switch to
+        # another provider when the free service is unavailable or rate-limited.
+        image_prompt = nil
+        image_mode = "none"
+        answer = answer.to_s.rstrip + "\n\nPollinations couldn't return an image this time. No API key is needed; check the Faith server log and try again later."
       else
         image_mode = "generated"
       end
@@ -3555,11 +3553,7 @@ server.mount_proc "/api/chat" do |req, res|
     end
 
     generation_requested = generated_request
-    generation_available = if IMAGE_PROVIDER == "perchance"
-      true
-    else
-      !ENV["OPENAI_API_KEY"].to_s.strip.empty?
-    end
+    generation_available = true
 
     # If Faith's model still tries to refuse a direct photo request, keep the
     # UI honest by adding a short acknowledgement rather than claiming she
@@ -3595,11 +3589,12 @@ server.mount_proc "/api/chat" do |req, res|
       fix_code_available: session_state[:troubleshooting] && session_state[:code_available] && session_state[:troubleshooting_ready],
       images: images,
       image_prompt: image_prompt,
-      image_resolution: ENV.fetch("FAITH_IMAGE_RESOLUTION", "768x768"),
+      image_resolution: ENV.fetch("FAITH_IMAGE_RESOLUTION", "832x1216"),
       image_guidance: ENV.fetch("FAITH_IMAGE_GUIDANCE_SCALE", "7"),
       image_seed: -1,
       image_mode: image_mode,
       image_generation_available: generation_available,
+      image_provider: image_provider_suffix.call(question)[:provider],
       image_request: direct_photo || generated_request,
       attachment: attachment && {
         name: attachment[:name],
@@ -4291,7 +4286,7 @@ puts "Faith Web AI".red
 puts "Model: #{MODEL}".red
 puts "Chat backend: local Qwen2 via #{FAITH_LOCAL_AI_URL}".red
 puts "Images: Wikimedia Commons".red
-puts "AI images: #{IMAGE_PROVIDER == "perchance" ? "Perchance" : (ENV["OPENAI_API_KEY"].to_s.empty? ? "disabled (set OPENAI_API_KEY)" : IMAGE_MODEL)}".red
+puts "AI images: Pollinations (no API key required)".red
 puts
 puts "Open http://localhost:#{PORT}".red
 puts "Press Ctrl+C to stop.".red
