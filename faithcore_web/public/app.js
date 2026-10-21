@@ -1,4 +1,4 @@
-const FAITH_CLIENT_VERSION = "79-erotic-capability-no-enrichment";
+const FAITH_CLIENT_VERSION = "81-pollinations-only";
 const expressionImages = {
   ruby: "/assets/ruby_wrench.png",
   thinking: "/assets/thinking.PNG",
@@ -138,86 +138,7 @@ const FAITH_VISION_DOWNLOADS = [
   }
 ];
 
-// ---- Perchance browser-side image generation (perchance-ai-api) ----
-// Ruby can't run text-to-image-plugin (browser GPU + JS). Backend returns
-// `image_prompt`, browser generates here via hidden iframe + postMessage.
-let _perchanceWarmed = false;
-const _perchanceCache = {};
-
-function warmUpPerchance() {
-  return new Promise((res) => {
-    if (_perchanceWarmed) return res(true);
-    try {
-      const f = document.createElement("iframe");
-      f.style.cssText = "width:1px;height:1px;border:0;position:absolute;opacity:0;pointer-events:none;";
-      f.src = "https://perchance.org";
-      f.setAttribute("aria-hidden", "true");
-      const t = setTimeout(() => { try { f.remove(); } catch (_) {} res(false); }, 15000);
-      f.onload = () => {
-        clearTimeout(t);
-        setTimeout(() => { try { f.remove(); } catch (_) {} _perchanceWarmed = true; res(true); }, 500);
-      };
-      f.onerror = () => { clearTimeout(t); try { f.remove(); } catch (_) {} res(false); };
-      document.body.appendChild(f);
-    } catch (_) {
-      res(false);
-    }
-  });
-}
-
-const FAITH_PERCHANCE_TIMEOUT_MS = (() => {
-  const configured = Number(window.FAITH_PERCHANCE_TIMEOUT_MS);
-  return Number.isFinite(configured) && configured >= 30000
-    ? Math.min(configured, 1800000)
-    : 300000; // 5 minutes by default; may be overridden by the host page.
-})();
-
-function generateImageViaPerchance(prompt, opts = {}) {
-  const key = String(prompt) + JSON.stringify(opts || {});
-  if (_perchanceCache[key]) return Promise.resolve({ ok: true, url: _perchanceCache[key], cached: true });
-
-  return new Promise((resolve, reject) => {
-    const params = new URLSearchParams({
-      prompt: String(prompt),
-      format: "json",
-      id: Math.random().toString(36).slice(2)
-    });
-    const defaults = { resolution: "768x768", guidanceScale: "7" };
-    const merged = Object.assign({}, defaults, opts || {});
-    Object.entries(merged).forEach(([k, v]) => {
-      if (v !== undefined && v !== null && v !== "") params.set(k, String(v));
-    });
-
-    const f = document.createElement("iframe");
-    f.style.cssText = "width:1px;height:1px;border:0;position:absolute;opacity:0;pointer-events:none;";
-    f.setAttribute("aria-hidden", "true");
-    f.src = "https://perchance.org/perchance-ai-api?" + params.toString();
-
-    let settled = false;
-    const finish = (cb, val) => {
-      if (settled) return;
-      settled = true;
-      window.removeEventListener("message", onMsg);
-      try { f.remove(); } catch (_) {}
-      cb(val);
-    };
-
-    function onMsg(e) {
-      const d = e.data || {};
-      if (d.api !== "perchance-image-api" || !d.result || d.result.id !== params.get("id")) return;
-      if (d.result.ok && d.result.url) {
-        _perchanceCache[key] = d.result.url;
-        finish(resolve, d.result);
-      } else {
-        finish(reject, new Error((d.result && d.result.error) || "image generation failed"));
-      }
-    }
-
-    window.addEventListener("message", onMsg);
-    document.body.appendChild(f);
-    setTimeout(() => finish(reject, new Error(`Perchance image generation timed out after ${Math.round(FAITH_PERCHANCE_TIMEOUT_MS / 1000)}s`)), FAITH_PERCHANCE_TIMEOUT_MS);
-  });
-}
+// Image generation is handled server-side by Pollinations only.
 
 const imageMessageStyles = document.createElement("style");
 imageMessageStyles.textContent = `
@@ -1667,7 +1588,7 @@ function isFaithBuildRequest(text) {
 function isFaithImageGenerationPhrase(text) {
   const value = String(text || "");
   // These two natural-language forms are explicitly reserved for Faith's
-  // existing Perchance/Pollinations image-generation pipeline. They must never
+  // existing Pollinations image-generation pipeline. They must never
   // enter the direct Qwen chat relay.
   return /\bpaint\s+a\b/i.test(value) || /\bgenerate\s+a\b/i.test(value);
 }
@@ -2225,18 +2146,27 @@ async function submitQuestion() {
       }
     }
 
-    // A server-side failure may intentionally return generated-pending so
-    // the browser can try Perchance. Do not convert that fallback handoff into
-    // an immediate rate-limit error.
+    // Image generation is server-side only and uses Pollinations exclusively.
     const generatedImages = Array.isArray(data.images)
       ? data.images.filter((image) => image && image.type === "generated" && image.url)
       : [];
 
-    const pendingPrompt = typeof data.image_prompt === "string" ? data.image_prompt.trim() : "";
-    const isPendingGenerated =
-      (data.image_mode === "generated-pending" || data.image_mode === "generated") &&
-      pendingPrompt.length > 0 &&
-      generatedImages.length === 0;
+    // Some local-model responses occasionally return a valid JSON envelope but
+    // no assistant text. Never render that as an empty Explanation bubble. A
+    // successful image-only response is allowed to have no text because the
+    // generated image itself is the response.
+    const hasAssistantText = typeof data.answer === "string" && data.answer.trim().length > 0;
+    const hasAnyImages = Array.isArray(data.images) && data.images.some((image) => image && image.url);
+    if (!hasAssistantText && !hasAnyImages) {
+      data.answer = data.image_request
+        ? "Faith couldn't generate an image this time. Please try again in a moment."
+        : "I didn't receive a text response that time. Please send that prompt again.";
+      console.warn("[Faith Chat] Empty assistant response received; showing a fallback message instead.", {
+        endpoint,
+        imageRequest: Boolean(data.image_request),
+        expression: data.expression || null
+      });
+    }
 
     // Painting is ONLY allowed when the server explicitly confirms an
     // AI-generation mode or actually returns a generated image.  Never trust
@@ -2244,7 +2174,6 @@ async function submitQuestion() {
     // response must stay in Explanation/Thinking/etc.
     const isGeneratedRequest =
       data.image_mode === "generated" ||
-      data.image_mode === "generated-pending" ||
       generatedImages.length > 0;
 
     // Wikimedia Commons results are always type="photo" and image_mode is
@@ -2265,14 +2194,11 @@ async function submitQuestion() {
 
     if (shouldPaint) {
       // This is the actual Paint Me / image-generation path. Use the Painting
-      // expression consistently for both server-side and browser-side generation.
+      // Image generation is handled by the server-side Pollinations provider.
       setExpression(
         "painting",
-        isPendingGenerated ? "Generating image..." : (generatedImages.length ? "Image ready" : "Creating your image...")
+        generatedImages.length ? "Image ready" : "Creating your image..."
       );
-      if (isPendingGenerated) {
-        loadingMessage = appendLoadingMessage(`Generating "${pendingPrompt.slice(0, 80)}"…`);
-      }
     } else {
       // A backend expression of "painting" is ignored unless image_mode
       // confirmed an actual generation request above.
@@ -2300,8 +2226,6 @@ async function submitQuestion() {
     const responseImages = (sessionMode === "troubleshooting" || sessionMode === "coding") ? [] : (data.images || []);
     const faithItem = streamedFaithItem || appendMessage("Faith", data.answer, "ai", responseImages, {
       onGeneratedStateChange: (remaining, loaded) => {
-        // Pending Perchance flow manages its own loadingMessage below - ignore backend callbacks with 0 images.
-        if (isPendingGenerated) return;
         if (remaining > 0) {
           if (loadingMessage) updateLoadingMessage(loadingMessage, "Loading your generated image…");
           if (shouldPaint) setExpression("painting", "Loading generated image…");
@@ -2343,49 +2267,8 @@ async function submitQuestion() {
       addFixCodeButton(faithItem);
     }
 
-    // Browser-side fallback (only when server-side download failed and it
-    // sent image_prompt + generated-pending). Primary path is server-side
-    // /generated/* URLs handled above via data.images.
-    if (isPendingGenerated) {
-      // Release input so the user can keep chatting while the fallback generates.
-      setBusy(false);
-      const t0 = Date.now();
-      updateLoadingMessage(loadingMessage, `Generating "${pendingPrompt.slice(0, 80)}" (0s, up to ${Math.round(FAITH_PERCHANCE_TIMEOUT_MS / 1000)}s)…`);
-      const tick = setInterval(() => {
-        const s = Math.floor((Date.now() - t0) / 1000);
-        updateLoadingMessage(loadingMessage, `Generating "${pendingPrompt.slice(0, 80)}" (${s}s, up to ${Math.round(FAITH_PERCHANCE_TIMEOUT_MS / 1000)}s)…`);
-      }, 5000);
-      try {
-        const result = await generateImageViaPerchance(pendingPrompt, {
-          resolution: data.image_resolution || "768x768",
-          guidanceScale: data.image_guidance || "7",
-          negativePrompt: data.image_negative_prompt || "blurry, low quality, distorted faces, bad anatomy, malformed hands, extra fingers, extra limbs, watermark, text, compression artifacts",
-          ...(data.image_seed !== undefined && data.image_seed !== null ? { seed: String(data.image_seed) } : {})
-        });
-        clearInterval(tick);
-        appendImages(faithItem, [{
-          url: result.url,
-          original_url: result.url,
-          title: pendingPrompt.slice(0, 120),
-          source: "Faith / Perchance",
-          type: "generated"
-        }]);
-        chat.scrollTop = chat.scrollHeight;
-        updateLoadingMessage(loadingMessage, "Image ready");
-        setExpression("painting", result.cached ? "Image ready (cached)" : "Image ready");
-      } catch (genError) {
-        clearInterval(tick);
-        console.warn("Perchance fallback failed:", genError);
-        appendMessage("Faith", "I tried both the server image generator and the browser-side Perchance fallback for \"" + pendingPrompt.slice(0, 120) + "\", but generation failed (" + genError.message + "). Check the Faith server log for provider details, then try again.", "ai");
-      } finally {
-        clearInterval(tick);
-        removeLoadingMessage(loadingMessage);
-        loadingMessage = null;
-      }
-      return;
-    }
-
-    if (isGeneratedRequest && generatedImages.length === 0 && !isPendingGenerated) {
+    // Pollinations failures are reported by the server; never invoke a second provider here.
+    if (isGeneratedRequest && generatedImages.length === 0) {
       if (loadingMessage) updateLoadingMessage(loadingMessage, "Image generated");
       removeLoadingMessage(loadingMessage);
       loadingMessage = null;
@@ -2476,5 +2359,4 @@ clear.addEventListener("click", async () => {
 });
 
 setExpression("ruby", "Ready");
-warmUpPerchance();
 input.focus();
