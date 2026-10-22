@@ -1,4 +1,4 @@
-const FAITH_CLIENT_VERSION = "94-tabbridge";
+const FAITH_CLIENT_VERSION = "95-batchupscale";
 
 // Transport rule (hard-won, 2026-10-22, proven by the v6 tab test): the image
 // backend (image-generation.perchance.org) sends
@@ -17,6 +17,10 @@ const FAITH_CLIENT_VERSION = "94-tabbridge";
 // the tab window itself — so the tab path matches answers by origin + jobId
 // (never e.source === tab) and SENDS by broadcasting to the tab plus every
 // frame in it (tab.frames[i].postMessage works cross-origin).
+// Batch + resolution (v95): one bridge job carries count (1-32, generated
+// with bounded concurrency, streamed back per image) and an optional target
+// size. The backend only renders 512/768px natively; larger sizes are
+// canvas-upscaled in the painter tab and labeled with native→delivered dims.
 function frameTransportCanGenerate() {
   try { return /\.perchance\.org$/i.test(String(location.hostname || "")); } catch (_) { return false; }
 }
@@ -149,10 +153,10 @@ if (document.readyState === "loading") {
   initFaithArtStyleSelect();
 }
 
-// How-many selector for generated images. The browser generates this many
-// images sequentially through the Perchance embed (same backend as the
-// Perchance AI image generator). Persisted in localStorage like Art Style.
-const FAITH_IMAGE_COUNTS = [1, 2, 3, 4];
+// How-many selector for generated images. One bridge job paints the whole
+// batch (bounded parallel generations, streamed back per image) — NOT N
+// sequential jobs. Persisted in localStorage like Art Style.
+const FAITH_IMAGE_COUNTS = [1, 2, 3, 4, 8, 16, 32];
 const FAITH_IMAGE_COUNT_KEY = "faithImageCount";
 
 function getFaithImageCount() {
@@ -197,6 +201,148 @@ if (document.readyState === "loading") {
   initFaithImageCountSelect();
 }
 
+// Output-size selector. "Native *" delivers backend pixels untouched (fastest,
+// smallest). Larger sizes generate at the closest native aspect, then upscale
+// in the painter tab; captions always show the delivered size + native size.
+// "Custom…" reveals W×H inputs (64–8192px; big batches share a megapixel
+// budget so 32 huge images cannot OOM the tab — the bridge reports when it
+// sizes down). Persisted in localStorage like Art Style + How-many.
+const FAITH_IMAGE_SIZES = [
+  { id: "n512", label: "Native 512²", w: 512, h: 512, isNative: true },
+  { id: "np", label: "Native portrait 512×768", w: 512, h: 768, isNative: true },
+  { id: "nl", label: "Native landscape 768×512", w: 768, h: 512, isNative: true },
+  { id: "n768", label: "Native 768²", w: 768, h: 768, isNative: true },
+  { id: "1s", label: "1K □ 1024²", w: 1024, h: 1024 },
+  { id: "1p", label: "1K ▯ 683×1024", w: 683, h: 1024 },
+  { id: "1l", label: "1K ▭ 1024×683", w: 1024, h: 683 },
+  { id: "2s", label: "2K □ 2048²", w: 2048, h: 2048 },
+  { id: "2p", label: "2K ▯ 1365×2048", w: 1365, h: 2048 },
+  { id: "2l", label: "2K ▭ 2048×1365", w: 2048, h: 1365 },
+  { id: "4s", label: "4K □ 4096²", w: 4096, h: 4096 },
+  { id: "4p", label: "4K ▯ 2731×4096", w: 2731, h: 4096 },
+  { id: "4l", label: "4K ▭ 4096×2731", w: 4096, h: 2731 },
+  { id: "8p", label: "8K ▯ 5120×7680", w: 5120, h: 7680 },
+  { id: "8l", label: "8K ▭ 7680×5120", w: 7680, h: 5120 },
+  { id: "custom", label: "Custom…", custom: true }
+];
+const FAITH_IMAGE_SIZE_KEY = "faithImageSize";
+const FAITH_IMAGE_CUSTOM_W_KEY = "faithImageCustomW";
+const FAITH_IMAGE_CUSTOM_H_KEY = "faithImageCustomH";
+
+function getFaithImageCustomDims() {
+  let w = 1024, h = 1536;
+  try {
+    const wEl = document.getElementById("image-width-input");
+    const hEl = document.getElementById("image-height-input");
+    if (wEl) { const v = parseInt(wEl.value, 10); if (isFinite(v)) w = v; }
+    if (hEl) { const v = parseInt(hEl.value, 10); if (isFinite(v)) h = v; }
+  } catch (_) {}
+  w = Math.max(64, Math.min(8192, w || 1024));
+  h = Math.max(64, Math.min(8192, h || 1536));
+  return { w, h };
+}
+
+function getFaithImageSize() {
+  let id = "np";
+  try { id = localStorage.getItem(FAITH_IMAGE_SIZE_KEY) || "np"; } catch (_) {}
+  const found = FAITH_IMAGE_SIZES.find((s) => s.id === id) || FAITH_IMAGE_SIZES[1];
+  if (found.custom) {
+    const d = getFaithImageCustomDims();
+    return { id: "custom", label: `Custom ${d.w}×${d.h}`, w: d.w, h: d.h, isNative: false, custom: true };
+  }
+  return found;
+}
+
+// Nearest legacy backend resolution string for a size (used when no upscale
+// is requested, so the proven single-image path is taken verbatim).
+function faithSizeToLegacy(size) {
+  const w = size.w || 512, h = size.h || 768;
+  if (Math.max(w, h) <= 512) return "512x512";
+  const a = w / h;
+  if (a >= 1.15) return "768x512";
+  if (a <= 0.87) return "512x768";
+  return "768x768";
+}
+
+function syncFaithCustomDimInputs() {
+  let custom = false;
+  try { custom = (localStorage.getItem(FAITH_IMAGE_SIZE_KEY) || "np") === "custom"; } catch (_) {}
+  try {
+    const wEl = document.getElementById("image-width-input");
+    const hEl = document.getElementById("image-height-input");
+    const xEl = document.getElementById("image-dim-x");
+    if (wEl) wEl.hidden = !custom;
+    if (hEl) hEl.hidden = !custom;
+    if (xEl) xEl.hidden = !custom;
+  } catch (_) {}
+}
+
+function setFaithImageSize(id) {
+  const found = FAITH_IMAGE_SIZES.find((s) => s.id === id) || FAITH_IMAGE_SIZES[1];
+  try {
+    localStorage.setItem(FAITH_IMAGE_SIZE_KEY, found.id);
+    if (found.custom) {
+      const d = getFaithImageCustomDims();
+      localStorage.setItem(FAITH_IMAGE_CUSTOM_W_KEY, String(d.w));
+      localStorage.setItem(FAITH_IMAGE_CUSTOM_H_KEY, String(d.h));
+    }
+  } catch (_) {}
+  const select = document.getElementById("image-size-select");
+  if (select && select.value !== found.id) select.value = found.id;
+  syncFaithCustomDimInputs();
+  return getFaithImageSize();
+}
+
+function initFaithImageSizeSelect() {
+  const select = document.getElementById("image-size-select");
+  if (select && !select.options.length) {
+    FAITH_IMAGE_SIZES.forEach((s) => {
+      const option = document.createElement("option");
+      option.value = s.id;
+      option.textContent = s.label;
+      select.appendChild(option);
+    });
+  }
+  let savedId = "np", savedW = 1024, savedH = 1536;
+  try {
+    savedId = localStorage.getItem(FAITH_IMAGE_SIZE_KEY) || "np";
+    savedW = parseInt(localStorage.getItem(FAITH_IMAGE_CUSTOM_W_KEY), 10) || 1024;
+    savedH = parseInt(localStorage.getItem(FAITH_IMAGE_CUSTOM_H_KEY), 10) || 1536;
+  } catch (_) {}
+  try {
+    const wEl = document.getElementById("image-width-input");
+    const hEl = document.getElementById("image-height-input");
+    if (wEl && !wEl.value) wEl.value = String(Math.max(64, Math.min(8192, savedW)));
+    if (hEl && !hEl.value) hEl.value = String(Math.max(64, Math.min(8192, savedH)));
+  } catch (_) {}
+  if (select) select.value = FAITH_IMAGE_SIZES.find((s) => s.id === savedId) ? savedId : "np";
+  syncFaithCustomDimInputs();
+  if (select && !select.dataset.faithHooked) {
+    select.dataset.faithHooked = "true";
+    select.addEventListener("change", () => setFaithImageSize(select.value));
+  }
+  const persistCustom = () => {
+    try {
+      const d = getFaithImageCustomDims();
+      localStorage.setItem(FAITH_IMAGE_CUSTOM_W_KEY, String(d.w));
+      localStorage.setItem(FAITH_IMAGE_CUSTOM_H_KEY, String(d.h));
+    } catch (_) {}
+  };
+  ["image-width-input", "image-height-input"].forEach((elId) => {
+    const el = document.getElementById(elId);
+    if (el && !el.dataset.faithHooked) {
+      el.dataset.faithHooked = "true";
+      el.addEventListener("change", persistCustom);
+    }
+  });
+}
+
+if (document.readyState === "loading") {
+  document.addEventListener("DOMContentLoaded", initFaithImageSizeSelect);
+} else {
+  initFaithImageSizeSelect();
+}
+
 // Prewarm the paint frame with the page (no click gesture needed for an
 // iframe) so the first paint usually finds a warm frame. Also re-arms after
 // the 5-minute frame-failure cooldown expires.
@@ -208,7 +354,8 @@ if (document.readyState === "loading") {
 
 // Faith paint backend: Perchance-backend pixels for a localhost Faith.
 //
-// Two transports, same bridge protocol (faith-bridge-job in, dataUrl out):
+// Two transports, same bridge protocol (faith-bridge-job in, dataUrl out;
+// batch jobs stream faith-bridge-image per image + a finished summary).
 //   1. hidden iframe (primary) — the bridge generator framed from this page.
 //      Parent/child postMessage cannot be severed the way a popup tab's
 //      opener link can, needs no click gesture, and is never popup-blocked.
@@ -328,12 +475,24 @@ function installFaithPainterListener() {
       waiters.forEach((fn) => { try { fn(); } catch (_) {} });
       return;
     }
+    // Streaming batch images: routed to the job's onImage/onImageError
+    // callbacks WITHOUT settling the job (the finished summary settles it).
+    if ((msg.type === "faith-bridge-image" || msg.type === "faith-bridge-image-error") && typeof msg.jobId === "string" && msg.jobId) {
+      const streamEntry = faithPainterPending[msg.jobId];
+      if (!streamEntry) return;
+      try {
+        if (msg.type === "faith-bridge-image") { if (streamEntry.onImage) streamEntry.onImage(msg); }
+        else if (streamEntry.onImageError) streamEntry.onImageError(msg);
+      } catch (_) {}
+      return;
+    }
     if (typeof msg.jobId !== "string" || !msg.jobId) return;
     const entry = faithPainterPending[msg.jobId];
     if (!entry) return;
     delete faithPainterPending[msg.jobId];
     if (msg.type === "faith-bridge-finished") {
-      if (!msg.dataUrl) entry.reject(new Error("The image bridge returned an empty result."));
+      if (entry.streaming) entry.resolve({ completed: msg.completed || 0, failed: msg.failed || 0, provider: msg.provider || "Perchance" });
+      else if (!msg.dataUrl) entry.reject(new Error("The image bridge returned an empty result."));
       else entry.resolve({ url: msg.dataUrl, provider: msg.provider || "Perchance" });
     } else if (msg.type === "faith-bridge-error") {
       entry.reject(new Error(String(msg.message || "The image bridge reported a failure.")));
@@ -585,6 +744,54 @@ function raceBridgeTransports(spec, jobTimeoutMs, bridgeUrl, raceState) {
   });
 }
 
+// Batched tab job (count 1-32 and/or upscale target): ONE bridge job, images
+// streamed back progressively through opts.onImage. Tab-only — the frame
+// path stays single-image. The painter tab must already exist (opened from
+// the Send click gesture); this never opens popups itself.
+function runBridgeBatchJob(spec, count, targetW, targetH, jobTimeoutMs, bridgeUrl, opts) {
+  const question = spec.question;
+  const artStyle = spec.artStyle;
+  const resolution = spec.resolution;
+  const onImage = opts && opts.onImage;
+  const onImageError = opts && opts.onImageError;
+  return new Promise((resolve, reject) => {
+    let popup = null;
+    try { popup = (faithPainterPopup && !faithPainterPopup.closed) ? faithPainterPopup : null; } catch (_) { popup = null; }
+    if (!popup) {
+      reject(new Error("The painter tab is not open. Allow popups for this page, then send your paint request again."));
+      return;
+    }
+    ensurePainterReady(45000, bridgeUrl).then(() => {
+      const jobId = "faith" + Date.now().toString(36) + Math.random().toString(36).slice(2);
+      const timer = setTimeout(() => {
+        delete faithPainterPending[jobId];
+        clearInterval(closedPoll);
+        reject(new Error("The image bridge timed out. The Perchance queue can be slow — try again, or open the painter tab to check it."));
+      }, jobTimeoutMs);
+      const closedPoll = setInterval(() => {
+        let closed = true;
+        try { closed = !faithPainterPopup || faithPainterPopup.closed; } catch (_) {}
+        if (closed) {
+          clearTimeout(timer);
+          clearInterval(closedPoll);
+          delete faithPainterPending[jobId];
+          faithPainterReady = false;
+          reject(new Error("The painter tab was closed before the images finished. Paint again and leave the painter tab open."));
+        }
+      }, 2000);
+      faithPainterPending[jobId] = {
+        streaming: true,
+        resolve: (summary) => { clearTimeout(timer); clearInterval(closedPoll); console.info("[Faith Images] Batch finished job " + jobId + ": " + summary.completed + " ok, " + summary.failed + " failed."); resolve(summary); },
+        reject: (e) => { clearTimeout(timer); clearInterval(closedPoll); reject(e); },
+        onImage, onImageError
+      };
+      console.info("[Faith Images] Batch job " + jobId + " x" + count + (targetW ? " -> " + targetW + "x" + targetH : " (native)") + " -> " + postToPainterTab({ type: "faith-bridge-job", jobId: jobId, question: question, artStyle: artStyle, resolution: resolution, stream: true, count: count, targetWidth: targetW, targetHeight: targetH }));
+    }, (readyErr) => {
+      reject(new Error("Faith's painter tab did not answer. " + (readyErr && readyErr.message ? readyErr.message : "")));
+    });
+  });
+}
+
 function generateFaithImageViaBridge(job, opts) {
   // The bridge owns visual extraction + Art Style styling, so Faith sends
   // the RAW user question plus the style name — never a pre-styled prompt.
@@ -593,8 +800,34 @@ function generateFaithImageViaBridge(job, opts) {
   const artStyle = (job && job.artStyle) ? String(job.artStyle) : "No style";
   const allowedRes = ["512x512", "512x768", "768x512", "768x768"];
   const resolution = (job && allowedRes.indexOf(job.resolution) !== -1) ? job.resolution : "512x768";
-  const timeoutMs = (opts && opts.timeoutMs) || 180000;
+  let count = 1;
+  try {
+    const c = parseInt(job && job.count, 10);
+    if (isFinite(c)) count = Math.max(1, Math.min(32, c));
+  } catch (_) {}
+  let targetW = null, targetH = null;
+  try {
+    const w = Number(job && job.targetWidth), h = Number(job && job.targetHeight);
+    if (isFinite(w) && isFinite(h) && w > 0 && h > 0) { targetW = Math.round(w); targetH = Math.round(h); }
+  } catch (_) {}
+  // Big batches take a while (bounded parallel generations + queueing):
+  // ~1min per image of headroom, capped at 20 minutes.
+  const timeoutMs = (opts && opts.timeoutMs) || Math.min(1200000, 180000 + count * 60000);
   const bridgeUrl = getFaithImageBridgeUrl();
+
+  // Batch/upscale jobs go straight to the painter tab as ONE streaming job
+  // (the frame path stays single-image). Needs the tab from the Send gesture.
+  if (count > 1 || (targetW && targetH)) {
+    return (async () => {
+      let popup = null;
+      try { popup = (faithPainterPopup && !faithPainterPopup.closed) ? faithPainterPopup : null; } catch (_) { popup = null; }
+      if (!popup) {
+        popup = openFaithPainterPopup();
+        if (!popup) throw new Error("The painter tab was blocked by the browser. Allow popups for this page (look for the blocked-popup icon in the address bar), then send your paint request again — painting opens one reusable painter tab from your Send click.");
+      }
+      return await runBridgeBatchJob({ question: question, artStyle: artStyle, resolution: resolution }, count, targetW, targetH, timeoutMs, bridgeUrl, opts);
+    })();
+  }
 
   return (async () => {
     // Transport order: the painter tab is top-level on *.perchance.org, so the
@@ -2998,18 +3231,22 @@ async function submitQuestion() {
     }
 
     // Browser-side image generation through the hosted Faith image bridge
-    // (Perchance backend). Coding/troubleshooting turns stay text-only by
-    // design (responseImages is already [] for them).
+    // (Perchance backend): ONE streaming batch job per turn, images appended
+    // as they arrive. Coding/troubleshooting turns stay text-only by design
+    // (responseImages is already [] for them).
     let paintedViaBrowser = false;
     if (shouldPaint && faithImageSpec && sessionMode !== "troubleshooting" && sessionMode !== "coding") {
       const paintTotal = getFaithImageCount();
       const paintStyleName = getFaithArtStyle();
+      const paintSize = getFaithImageSize();
       const paintTitle = String(question).slice(0, 120);
-      loadingMessage = appendLoadingMessage(`Painting 1/${paintTotal}…`);
-      let paintedOk = 0;
+      const paintIsNative = !!paintSize.isNative;
+      loadingMessage = appendLoadingMessage(paintTotal > 1 ? `Painting 1/${paintTotal}…` : "Painting…");
+      let paintedOk = 0, paintedFailed = 0;
+      const paintedIdx = new Set();
       // Live elapsed-time readout so a slow backend queue never looks stuck.
       const paintT0 = Date.now();
-      let paintLabel = `Painting 1/${paintTotal}…`;
+      let paintLabel = paintTotal > 1 ? `Painting 1/${paintTotal}…` : "Painting…";
       const paintClock = setInterval(() => {
         if (!loadingMessage) return;
         try {
@@ -3018,46 +3255,73 @@ async function submitQuestion() {
         } catch (_) {}
       }, 1000);
       const stopPaintClock = () => { try { clearInterval(paintClock); } catch (_) {} };
-      for (let paintIndex = 0; paintIndex < paintTotal; paintIndex += 1) {
+      try {
+        // The bridge owns extraction + styling: send the RAW user question
+        // and the style name (never the pre-styled spec — that would
+        // double-apply the Art Style on the bridge side).
+        const summary = await generateFaithImage({
+          question: question,
+          artStyle: paintStyleName,
+          resolution: paintIsNative ? faithSizeToLegacy(paintSize) : faithImageSpec.resolution,
+          count: paintTotal,
+          targetWidth: paintIsNative ? null : paintSize.w,
+          targetHeight: paintIsNative ? null : paintSize.h
+        }, {
+          onImage: (img) => {
+            if (turnId !== turnSequence) return;
+            const idx = (typeof img.index === "number") ? img.index : paintedOk + paintedFailed;
+            if (paintedIdx.has(idx)) return;
+            paintedIdx.add(idx);
+            paintedOk += 1;
+            paintedViaBrowser = true;
+            const dims = (img.width && img.height) ? `${img.width}×${img.height}` : "";
+            removeLoadingMessage(loadingMessage);
+            loadingMessage = null;
+            appendImages(faithItem, [{
+              url: img.dataUrl,
+              title: paintTitle + (paintTotal > 1 ? ` (${paintedOk}/${paintTotal})` : "") + (dims ? ` — ${dims}` : ""),
+              source: `Faith / ${img.provider || "Perchance"} (${paintStyleName})${img.upscaled ? " • upscaled" : ""}`,
+              type: "generated"
+            }]);
+            chat.scrollTop = chat.scrollHeight;
+            if (paintedOk + paintedFailed < paintTotal) {
+              paintLabel = `Painting ${paintedOk + paintedFailed + 1}/${paintTotal}…`;
+              loadingMessage = appendLoadingMessage(paintLabel);
+            }
+            setExpression("painting", paintedOk + paintedFailed < paintTotal ? `Painting ${paintedOk + paintedFailed + 1}/${paintTotal}…` : "Image ready");
+          },
+          onImageError: () => { if (turnId === turnSequence) paintedFailed += 1; }
+        });
         if (turnId !== turnSequence) { stopPaintClock(); return; }
-        if (paintTotal > 1) { paintLabel = `Painting ${paintIndex + 1}/${paintTotal}…`; updateLoadingMessage(loadingMessage, paintLabel); }
-        try {
-          // The bridge owns extraction + styling: send the RAW user question
-          // and the style name (never the pre-styled spec — that would
-          // double-apply the Art Style on the bridge side).
-          const paintResult = await generateFaithImage({ question: question, artStyle: paintStyleName, resolution: faithImageSpec.resolution });
-          if (turnId !== turnSequence) { stopPaintClock(); return; }
-          const paintUrl = (paintResult && paintResult.url) || paintResult;
-          const paintProvider = (paintResult && paintResult.provider) || "Perchance";
-          paintedOk += 1;
+        stopPaintClock();
+        removeLoadingMessage(loadingMessage);
+        loadingMessage = null;
+        // Legacy single-image path resolves {url} with no stream events.
+        if (summary && summary.url && paintedOk === 0) {
+          paintedOk = 1;
           paintedViaBrowser = true;
-          removeLoadingMessage(loadingMessage);
-          loadingMessage = null;
+          const dims = `${paintSize.w}×${paintSize.h}`;
           appendImages(faithItem, [{
-            url: paintUrl,
-            title: paintTitle,
-            source: `Faith / ${paintProvider} (${paintStyleName})`,
+            url: summary.url,
+            title: `${paintTitle} — ${dims}`,
+            source: `Faith / ${summary.provider || "Perchance"} (${paintStyleName})`,
             type: "generated"
           }]);
           chat.scrollTop = chat.scrollHeight;
-          if (paintIndex + 1 < paintTotal) {
-            paintLabel = `Painting ${paintIndex + 2}/${paintTotal}…`;
-            loadingMessage = appendLoadingMessage(paintLabel);
-          }
-          setExpression("painting", paintIndex + 1 < paintTotal ? `Painting ${paintIndex + 2}/${paintTotal}…` : "Image ready");
-        } catch (paintError) {
-          stopPaintClock();
-          removeLoadingMessage(loadingMessage);
-          loadingMessage = null;
-          setExpression("painting", paintedOk > 0 ? "Image ready" : "Image could not be loaded");
-          appendMessage("Error", `Faith couldn't paint that image: ${paintError.message}`, "error");
-          break;
         }
-      }
-      stopPaintClock();
-      if (paintedOk === 0 && !paintedViaBrowser) {
+        const failedTotal = (summary && summary.failed) || paintedFailed;
+        if (paintedOk === 0) {
+          setExpression("painting", "Image could not be loaded");
+          appendMessage("Error", "Faith couldn't paint that image: the image bridge reported no usable result.", "error");
+        } else {
+          setExpression("painting", failedTotal > 0 ? `Image ready (${paintedOk}/${paintTotal})` : "Image ready");
+        }
+      } catch (paintError) {
+        stopPaintClock();
         removeLoadingMessage(loadingMessage);
         loadingMessage = null;
+        setExpression("painting", paintedOk > 0 ? "Image ready" : "Image could not be loaded");
+        appendMessage("Error", `Faith couldn't paint that image: ${paintError.message}`, "error");
       }
     }
 
