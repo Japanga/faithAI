@@ -88,6 +88,38 @@
       opacity: 1;
     }
 
+    .art-style-label {
+      flex: 0 0 auto;
+      font-size: 1rem;
+      cursor: help;
+    }
+
+    .art-style-select {
+      flex: 0 1 150px;
+      width: 150px;
+      max-width: 150px;
+      min-width: 110px;
+      padding: 8px 6px;
+      border: 1px solid rgba(128, 128, 128, 0.28);
+      border-radius: 8px;
+      font-size: 0.82rem;
+      opacity: 0.9;
+      overflow: hidden;
+      text-overflow: ellipsis;
+      white-space: nowrap;
+    }
+
+    .image-count-select {
+      flex: 0 0 auto;
+      width: 92px;
+      max-width: 92px;
+      padding: 8px 6px;
+      border: 1px solid rgba(128, 128, 128, 0.28);
+      border-radius: 8px;
+      font-size: 0.82rem;
+      opacity: 0.9;
+    }
+
     .hint {
       flex: 0 0 auto;
     }
@@ -278,6 +310,10 @@
       <div class="composer-row">
         <button id="upload" type="button" class="secondary">Upload</button>
         <span id="upload-status" class="upload-status" aria-live="polite">No file selected</span>
+        <label for="art-style-select" class="art-style-label" title="Art Style is applied to Faith's generated images (paint/draw/generate requests). Chat, vision, troubleshooting and build modes are unaffected.">🎨</label>
+        <select id="art-style-select" class="art-style-select" aria-label="Art Style for generated images" title="Art Style is applied to Faith's generated images (paint/draw/generate requests). Chat, vision, troubleshooting and build modes are unaffected."></select>
+        <label for="image-count-select" class="art-style-label" title="How many images Faith paints per generation request.">🔢</label>
+        <select id="image-count-select" class="image-count-select" aria-label="How many images to generate" title="How many images Faith paints per generation request."></select>
         <button id="send" type="submit">Send</button>
         <button id="clear" type="button" class="secondary">Clear</button>
         <input id="file-input"
@@ -290,7 +326,7 @@
     <div class="hint">Press Enter to send, Shift+Enter for a new line</div>
   </main>
 
-  <script src="/app.js?v=70-rouge-style-code-highlighting"></script>
+  <script src="/app.js?v=94-tabbridge"></script>
   <script>
   (() => {
   "use strict";

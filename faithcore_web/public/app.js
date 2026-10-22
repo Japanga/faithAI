@@ -1,4 +1,686 @@
-const FAITH_CLIENT_VERSION = "81-pollinations-only";
+const FAITH_CLIENT_VERSION = "94-tabbridge";
+
+// Transport rule (hard-won, 2026-10-22, proven by the v6 tab test): the image
+// backend (image-generation.perchance.org) sends
+//   frame-ancestors 'self' https://*.perchance.org https://perchance.org
+// and the text-to-image plugin generates INSIDE a nested iframe on that host.
+// So generation can only complete when every ancestor of the bridge page is a
+// perchance.org page. From this Ruby host (localhost/file) a hidden bridge
+// frame loads and answers "ready" fine, but its backend iframe is refused and
+// the job hangs forever — while a top-level painter TAB (pure perchance.org
+// ancestry) paints fine (v6: READY at 20s, image back in 33s). Hence: TAB
+// FIRST here; the frame is only used when this page itself runs on
+// *.perchance.org.
+// Wrapper wrinkle: the bridge URL serves a WRAPPER page (top-level viewers
+// are bounced to canonical), so the bridge always runs nested in a frame
+// inside the painter tab. Its messages come from that inner frame, NOT from
+// the tab window itself — so the tab path matches answers by origin + jobId
+// (never e.source === tab) and SENDS by broadcasting to the tab plus every
+// frame in it (tab.frames[i].postMessage works cross-origin).
+function frameTransportCanGenerate() {
+  try { return /\.perchance\.org$/i.test(String(location.hostname || "")); } catch (_) { return false; }
+}
+
+// Shared Art Style dropdown for image generation. The selected style is sent
+// as "art_style" with /api/imagegen (and the /api/chat fallback) and applied
+// server-side in server.rb. "No style" = legacy unstyled behavior.
+const FAITH_ART_STYLES = [
+  "No style",
+  "Painted Anime",
+  "Casual Photo",
+  "Cinematic",
+  "Digital Painting",
+  "Concept Art",
+  "3D Disney Character",
+  "2D Disney Character",
+  "Disney Sketch",
+  "Concept Sketch",
+  "Painterly",
+  "Oil Painting",
+  "Oil Painting - Realism",
+  "Oil Painting - Old",
+  "Oil Painting - 70s Pulp",
+  "Professional Photo",
+  "Anime",
+  "Drawn Anime",
+  "Anime Screencap",
+  "Cute Anime",
+  "Soft Anime",
+  "Fantasy Painting",
+  "Fantasy Landscape",
+  "Fantasy Portrait",
+  "Studio Ghibli",
+  "50s Enamel Sign",
+  "Vintage Comic",
+  "Franco-Belgian Comic",
+  "Tintin Comic",
+  "Medieval",
+  "Pixel Art",
+  "Furry - Oil",
+  "Furry - Cinematic",
+  "Furry - Painted",
+  "Furry - Drawn",
+  "Cute Figurine",
+  "3D Emoji",
+  "Illustration",
+  "Cute Illustration",
+  "Flat Illustration",
+  "Watercolor",
+  "1990s Photo",
+  "1980s Photo",
+  "1970s Photo",
+  "1960s Photo",
+  "1950s Photo",
+  "1940s Photo",
+  "1930s Photo",
+  "1920s Photo",
+  "Vintage Pulp Art",
+  "50s Infomercial Anime",
+  "3D Pokemon",
+  "Painted Pokemon",
+  "2D Pokemon",
+  "Vintage Anime",
+  "Neon Vintage Anime",
+  "Manga",
+  "Fantasy World Map",
+  "Fantasy City Map",
+  "Old World Map",
+  "3D Isometric Icon",
+  "Flat Style Icon",
+  "Flat Style Logo",
+  "Game Art Icon",
+  "Digital Painting Icon",
+  "Concept Art Icon",
+  "Cute 3D Icon",
+  "Cute 3D Icon Set",
+  "Crayon Drawing",
+  "Pencil",
+  "Tattoo Design",
+  "Waifu",
+  "YuGiOh Art",
+  "Traditional Japanese",
+  "Nihonga Painting",
+  "Claymation",
+  "Cartoon",
+  "Cursed Photo",
+  "MTG Card",
+];
+const FAITH_ART_STYLE_KEY = "faithArtStyle";
+
+function getFaithArtStyle() {
+  try {
+    const saved = localStorage.getItem(FAITH_ART_STYLE_KEY);
+    if (saved && FAITH_ART_STYLES.includes(saved)) return saved;
+  } catch (_) {}
+  return "No style";
+}
+
+function setFaithArtStyle(name) {
+  const style = FAITH_ART_STYLES.includes(name) ? name : "No style";
+  try {
+    localStorage.setItem(FAITH_ART_STYLE_KEY, style);
+  } catch (_) {}
+  const select = document.getElementById("art-style-select");
+  if (select && select.value !== style) select.value = style;
+  return style;
+}
+
+function initFaithArtStyleSelect() {
+  const select = document.getElementById("art-style-select");
+  if (!select) return;
+  if (!select.options.length) {
+    FAITH_ART_STYLES.forEach((style) => {
+      const option = document.createElement("option");
+      option.value = style;
+      option.textContent = (style === "No style" ? "No style" : "🎨 " + style);
+      select.appendChild(option);
+    });
+  }
+  select.value = getFaithArtStyle();
+  if (!select.dataset.faithHooked) {
+    select.dataset.faithHooked = "true";
+    select.addEventListener("change", () => setFaithArtStyle(select.value));
+  }
+}
+
+if (document.readyState === "loading") {
+  document.addEventListener("DOMContentLoaded", initFaithArtStyleSelect);
+} else {
+  initFaithArtStyleSelect();
+}
+
+// How-many selector for generated images. The browser generates this many
+// images sequentially through the Perchance embed (same backend as the
+// Perchance AI image generator). Persisted in localStorage like Art Style.
+const FAITH_IMAGE_COUNTS = [1, 2, 3, 4];
+const FAITH_IMAGE_COUNT_KEY = "faithImageCount";
+
+function getFaithImageCount() {
+  try {
+    const saved = parseInt(localStorage.getItem(FAITH_IMAGE_COUNT_KEY), 10);
+    if (FAITH_IMAGE_COUNTS.includes(saved)) return saved;
+  } catch (_) {}
+  return 1;
+}
+
+function setFaithImageCount(count) {
+  const n = FAITH_IMAGE_COUNTS.includes(count) ? count : 1;
+  try {
+    localStorage.setItem(FAITH_IMAGE_COUNT_KEY, String(n));
+  } catch (_) {}
+  const select = document.getElementById("image-count-select");
+  if (select && select.value !== String(n)) select.value = String(n);
+  return n;
+}
+
+function initFaithImageCountSelect() {
+  const select = document.getElementById("image-count-select");
+  if (!select) return;
+  if (!select.options.length) {
+    FAITH_IMAGE_COUNTS.forEach((n) => {
+      const option = document.createElement("option");
+      option.value = String(n);
+      option.textContent = n === 1 ? "1 image" : n + " images";
+      select.appendChild(option);
+    });
+  }
+  select.value = String(getFaithImageCount());
+  if (!select.dataset.faithHooked) {
+    select.dataset.faithHooked = "true";
+    select.addEventListener("change", () => setFaithImageCount(parseInt(select.value, 10)));
+  }
+}
+
+if (document.readyState === "loading") {
+  document.addEventListener("DOMContentLoaded", initFaithImageCountSelect);
+} else {
+  initFaithImageCountSelect();
+}
+
+// Prewarm the paint frame with the page (no click gesture needed for an
+// iframe) so the first paint usually finds a warm frame. Also re-arms after
+// the 5-minute frame-failure cooldown expires.
+if (document.readyState === "loading") {
+  document.addEventListener("DOMContentLoaded", prewarmBridgeFrame);
+} else {
+  prewarmBridgeFrame();
+}
+
+// Faith paint backend: Perchance-backend pixels for a localhost Faith.
+//
+// Two transports, same bridge protocol (faith-bridge-job in, dataUrl out):
+//   1. hidden iframe (primary) — the bridge generator framed from this page.
+//      Parent/child postMessage cannot be severed the way a popup tab's
+//      opener link can, needs no click gesture, and is never popup-blocked.
+//   2. top-level painter TAB (fallback) — opened in the user's Send click
+//      (see submitQuestion) so the browser cannot block it as a popup.
+// The generator's own Art Style list + backend do the painting; sequential
+// jobs matched by unguessable jobIds.
+const FAITH_IMAGE_BRIDGE_URL_DEFAULT = "https://null.perchance.org/faith-image-bridge";
+const FAITH_IMAGE_BRIDGE_URL_KEY = "faithImageBridgeUrl";
+
+function getFaithImageBridgeUrl() {
+  try {
+    const saved = (localStorage.getItem(FAITH_IMAGE_BRIDGE_URL_KEY) || "").trim();
+    if (saved && /^https:\/\/[^/]+\.perchance\.org\//.test(saved)) return saved;
+  } catch (_) {}
+  return FAITH_IMAGE_BRIDGE_URL_DEFAULT;
+}
+
+let faithPainterPopup = null;
+let faithPainterReady = false;
+let faithPainterOrigin = "";
+const faithPainterPending = {};
+const faithPainterReadyWaiters = [];
+let faithPainterListening = false;
+
+// Persistent warm paint frame (primary transport). ONE hidden iframe to the
+// bridge, created once in the background and REUSED for every paint — a fresh
+// frame per paint would replay the generator's full 20s+ cold load every time
+// (that cold load per image is what made paints take over a minute). The frame
+// stays warm across paints and across the images of one paint request, so jobs
+// are posted straight to it with zero handshake wait.
+let faithBridgeFrame = null;
+let faithBridgeFrameReady = false;
+let faithBridgeFrameCoolUntil = 0; // skip the frame while a block/failure is fresh
+const faithBridgeFrameWaiters = [];
+
+function bridgeFrameCoolMs() { return Date.now() < faithBridgeFrameCoolUntil; }
+
+function noteBridgeFrameBroken(reason) {
+  console.warn("[Faith Images] Paint frame unavailable (" + reason + "); using the painter tab for a while.");
+  faithBridgeFrameReady = false;
+  try { if (faithBridgeFrame && faithBridgeFrame.parentNode) faithBridgeFrame.parentNode.removeChild(faithBridgeFrame); } catch (_) {}
+  faithBridgeFrame = null;
+  // 5-minute cooldown: environments whose framing policy blocks the embed
+  // stop paying a dead ready-timeout on every single paint; after the
+  // cooldown the next paint warms a fresh frame in the background again.
+  faithBridgeFrameCoolUntil = Date.now() + 5 * 60 * 1000;
+  const waiters = faithBridgeFrameWaiters.splice(0, faithBridgeFrameWaiters.length);
+  waiters.forEach((fn) => { try { fn(new Error("paint frame unavailable")); } catch (_) {} });
+}
+
+function onBridgeFrameReadyEvent() {
+  if (!faithBridgeFrameReady) {
+    faithBridgeFrameReady = true;
+    console.info("[Faith Images] Paint frame warm.");
+  }
+  const waiters = faithBridgeFrameWaiters.splice(0, faithBridgeFrameWaiters.length);
+  waiters.forEach((fn) => { try { fn(null); } catch (_) {} });
+}
+
+function ensureBridgeFrame() {
+  installFaithPainterListener(); // single shared message router (tab + frame)
+  const wantUrl = getFaithImageBridgeUrl();
+  try {
+    if (faithBridgeFrame && document.contains(faithBridgeFrame) && faithBridgeFrame.contentWindow &&
+        faithBridgeFrame.dataset.bridgeUrl === wantUrl) return faithBridgeFrame;
+  } catch (_) {}
+  try { if (faithBridgeFrame && faithBridgeFrame.parentNode) faithBridgeFrame.parentNode.removeChild(faithBridgeFrame); } catch (_) {}
+  faithBridgeFrame = null;
+  faithBridgeFrameReady = false;
+  const frame = document.createElement("iframe");
+  frame.setAttribute("data-faith-paint", "frame");
+  frame.dataset.bridgeUrl = wantUrl;
+  frame.style.cssText = "position:fixed;left:0;top:0;width:10px;height:10px;opacity:0;pointer-events:none;";
+  frame.src = wantUrl;
+  document.body.appendChild(frame);
+  faithBridgeFrame = frame;
+  try {
+    if (!frame.contentWindow) noteBridgeFrameBroken("blocked by CSP/extension");
+  } catch (_) {}
+  return frame;
+}
+
+// Background prewarm: start loading the frame with the page so it is already
+// warm by the time the user paints. Needs no click gesture (unlike the tab).
+// Skipped entirely where the frame can never generate (see above) — no point
+// paying a page load for a transport that the backend's framing policy blocks.
+function prewarmBridgeFrame() {
+  if (!frameTransportCanGenerate()) return;
+  if (bridgeFrameCoolMs()) return;
+  try {
+    if (!faithBridgeFrame || !document.contains(faithBridgeFrame)) ensureBridgeFrame();
+  } catch (_) {}
+}
+
+function installFaithPainterListener() {
+  if (faithPainterListening) return;
+  faithPainterListening = true;
+  window.addEventListener("message", (event) => {
+    if (typeof event.origin !== "string" || !/\.perchance\.org$/.test(event.origin)) return;
+    const msg = event.data;
+    if (!msg || typeof msg !== "object") return;
+    if (msg.type === "faith-bridge-ready") {
+      // Warm-frame announcement from the persistent hidden iframe.
+      try {
+        if (faithBridgeFrame && event.source === faithBridgeFrame.contentWindow) { onBridgeFrameReadyEvent(); return; }
+      } catch (_) {}
+      // Painter-tab announcement. The bridge runs nested inside the wrapper
+      // tab, so the READY source is the inner frame, never the tab window —
+      // accept it whenever our tab is open (origin already filtered above).
+      try {
+        if (!faithPainterPopup || faithPainterPopup.closed) return;
+      } catch (_) { return; }
+      faithPainterReady = true;
+      faithPainterOrigin = event.origin;
+      const waiters = faithPainterReadyWaiters.splice(0, faithPainterReadyWaiters.length);
+      waiters.forEach((fn) => { try { fn(); } catch (_) {} });
+      return;
+    }
+    if (typeof msg.jobId !== "string" || !msg.jobId) return;
+    const entry = faithPainterPending[msg.jobId];
+    if (!entry) return;
+    delete faithPainterPending[msg.jobId];
+    if (msg.type === "faith-bridge-finished") {
+      if (!msg.dataUrl) entry.reject(new Error("The image bridge returned an empty result."));
+      else entry.resolve({ url: msg.dataUrl, provider: msg.provider || "Perchance" });
+    } else if (msg.type === "faith-bridge-error") {
+      entry.reject(new Error(String(msg.message || "The image bridge reported a failure.")));
+    }
+  });
+}
+
+// Must run inside the user's click/keypress gesture (called from the sync
+// part of submitQuestion) or the browser blocks the tab as a popup. Reuses
+// the named tab across paints. Returns the tab, or null when blocked.
+function openFaithPainterPopup() {
+  try {
+    if (faithPainterPopup && !faithPainterPopup.closed) return faithPainterPopup;
+  } catch (_) {}
+  faithPainterReady = false;
+  faithPainterOrigin = "";
+  let popup = null;
+  try { popup = window.open(getFaithImageBridgeUrl(), "faith-painter"); } catch (_) { popup = null; }
+  if (popup) {
+    faithPainterPopup = popup;
+    installFaithPainterListener();
+    return popup;
+  }
+  return null;
+}
+
+// The bridge runs in a frame inside the wrapper tab, so jobs and pings must
+// be broadcast to the tab window AND every frame in it (cross-origin
+// postMessage to popup.frames[i] is allowed; each post is fenced so one
+// blocked frame cannot break the rest). Returns a short delivery summary.
+function postToPainterTab(obj) {
+  let popup = null;
+  try { popup = (faithPainterPopup && !faithPainterPopup.closed) ? faithPainterPopup : null; } catch (_) { popup = null; }
+  if (!popup) return "no open tab";
+  let n = 0;
+  const problems = [];
+  try { popup.postMessage(obj, "*"); n++; } catch (err) { problems.push("tab: " + (err && err.message)); }
+  let len = 0, lenOk = false;
+  try { len = popup.frames.length; lenOk = true; } catch (err) { problems.push("frames.length blocked"); }
+  if (lenOk) {
+    for (let i = 0; i < len; i++) {
+      try { popup.frames[i].postMessage(obj, "*"); n++; }
+      catch (err) { problems.push("frame" + i + " blocked"); }
+    }
+  }
+  return "posted to " + n + " window(s)" + (problems.length ? " [" + problems.join("; ") + "]" : "");
+}
+
+// Resolves once the painter tab announces itself. Fresh tabs announce on
+// load; reused tabs answer the ping (the bridge implements both). Always
+// re-verified so a tab the user navigated elsewhere cannot swallow a job.
+function ensurePainterReady(timeoutMs, bridgeUrl) {
+  try {
+    // Warm tab: already handshaked and still open — no ping roundtrip.
+    if (faithPainterPopup && !faithPainterPopup.closed && faithPainterReady && faithPainterOrigin) return Promise.resolve();
+    if (faithPainterPopup && !faithPainterPopup.closed) faithPainterReady = false;
+    else throw new Error("painter tab is not open");
+  } catch (err) {
+    return Promise.reject(new Error("Faith's painter tab is not open. Allow popups for this page, then send your paint request again."));
+  }
+  return new Promise((resolve, reject) => {
+    const timer = setTimeout(() => {
+      const i = faithPainterReadyWaiters.indexOf(done);
+      if (i !== -1) faithPainterReadyWaiters.splice(i, 1);
+      reject(new Error("Faith's painter tab did not answer. Open " + bridgeUrl + " in a tab — it should show the bridge page. If a painter tab opened but shows the wrong page, close it and paint again."));
+    }, timeoutMs);
+    function done() { clearTimeout(timer); resolve(); }
+    faithPainterReadyWaiters.push(done);
+    try {
+      if (faithPainterPopup && !faithPainterPopup.closed) postToPainterTab({ type: "faith-bridge-ping" });
+    } catch (_) {}
+  });
+}
+
+// Paint job over the persistent warm frame. The frame is created once and
+// reused (never destroyed here): a warm frame takes the job immediately with
+// no handshake wait; a cold (still loading) frame resolves the job as soon as
+// its honest-ready arrives. Never touches the tab flow.
+function runBridgeFrameJob(spec, jobTimeoutMs, bridgeUrl) {
+  const question = (spec && (spec.question || spec.visual || spec.prompt) ? String(spec.question || spec.visual || spec.prompt) : "").slice(0, 1500);
+  if (!question.trim()) return Promise.reject(new Error("Faith did not build an image prompt."));
+  const artStyle = (spec && spec.artStyle) ? String(spec.artStyle) : "No style";
+  const resolution = (spec && spec.resolution) ? String(spec.resolution) : "512x768";
+  if (bridgeFrameCoolMs()) return Promise.reject(new Error("Paint frame cooling down after a failure."));
+  return new Promise((resolve, reject) => {
+    let settled = false;
+    const t0 = Date.now();
+    const jobId = "faith" + Date.now().toString(36) + Math.random().toString(36).slice(2);
+    let frameEl = null;
+    try { frameEl = ensureBridgeFrame(); } catch (_) { frameEl = null; }
+    if (!frameEl) { reject(new Error("Paint frame unavailable.")); return; }
+    let readyTimer = null;
+    let jobTimer = null;
+    let posted = false;
+    function finishOk(value) {
+      if (settled) return;
+      settled = true;
+      if (readyTimer) clearTimeout(readyTimer);
+      if (jobTimer) clearTimeout(jobTimer);
+      window.removeEventListener("message", onMessage);
+      console.info("[Faith Images] Paint frame job " + jobId + " done (" + (Date.now() - t0) + "ms).");
+      resolve(value);
+    }
+    function finishErr(err, markBroken) {
+      if (settled) return;
+      settled = true;
+      if (readyTimer) clearTimeout(readyTimer);
+      if (jobTimer) clearTimeout(jobTimer);
+      window.removeEventListener("message", onMessage);
+      if (markBroken) noteBridgeFrameBroken(err && err.message ? err.message : "no answer");
+      reject(err);
+    }
+    function postJob() {
+      // The bridge announces ready twice per load (boot + post-load re-announce
+      // for late attachers); send the job exactly once.
+      if (posted) return;
+      posted = true;
+      console.info("[Faith Images] Paint frame job " + jobId + " sending (" + artStyle + ", " + resolution + ").");
+      jobTimer = setTimeout(() => {
+        finishErr(new Error("The embedded paint frame timed out."), false);
+      }, jobTimeoutMs);
+      try {
+        frameEl.contentWindow.postMessage({ type: "faith-bridge-job", jobId: jobId, question: question, artStyle: artStyle, resolution: resolution }, "*");
+      } catch (_) {
+        finishErr(new Error("Could not talk to the embedded paint frame."), true);
+      }
+    }
+    function onMessage(event) {
+      if (typeof event.origin !== "string" || !/\.perchance\.org$/.test(event.origin)) return;
+      const msg = event.data;
+      if (!msg || typeof msg !== "object" || typeof msg.type !== "string") return;
+      try { if (event.source !== frameEl.contentWindow) return; } catch (_) { return; }
+      if (msg.type === "faith-bridge-ready") {
+        if (readyTimer) { clearTimeout(readyTimer); readyTimer = null; }
+        postJob();
+        return;
+      }
+      if (msg.jobId !== jobId) return;
+      if (msg.type === "faith-bridge-finished") {
+        if (!msg.dataUrl) finishErr(new Error("The embedded paint frame returned an empty result."), false);
+        else finishOk({ url: msg.dataUrl, provider: msg.provider || "Perchance" });
+      } else if (msg.type === "faith-bridge-error") {
+        finishErr(new Error(String(msg.message || "The embedded paint frame reported a failure.")), false);
+      }
+    }
+    window.addEventListener("message", onMessage);
+    if (faithBridgeFrameReady) {
+      postJob(); // warm frame: straight to generation, no handshake
+    } else {
+      readyTimer = setTimeout(() => {
+        finishErr(new Error("The embedded paint frame did not answer (" + bridgeUrl + ")."), true);
+      }, 30000);
+    }
+  });
+}
+
+// Frame-vs-tab race. The warm frame gets a head start (it is fastest when
+// healthy); if it stays silent past the head start, the same job is ALSO sent
+// to the already-open painter tab and the first answer wins. This is for
+// browsers where framed generation never resolves while top-level pages paint
+// fine: without the race every paint would burn the full frame timeout before
+// the tab is even tried. The loser is ignored and cleaned up; the extra
+// backend spend only happens when the frame is already effectively dead.
+const FAITH_FRAME_HEAD_START_MS = 60000;
+
+function existingPainterPopup() {
+  try { return (faithPainterPopup && !faithPainterPopup.closed) ? faithPainterPopup : null; } catch (_) { return null; }
+}
+
+function raceBridgeTransports(spec, jobTimeoutMs, bridgeUrl, raceState) {
+  return new Promise((resolve, reject) => {
+    let settled = false;
+    let frameFinished = false, tabStarted = false, tabFinished = false;
+    let frameError = null, tabError = null;
+    let tabTimer = null, tabClosedPoll = null, tabJobId = null;
+    function cleanupTab() {
+      if (tabTimer) { clearTimeout(tabTimer); tabTimer = null; }
+      if (tabClosedPoll) { clearInterval(tabClosedPoll); tabClosedPoll = null; }
+      if (tabJobId && faithPainterPending[tabJobId]) delete faithPainterPending[tabJobId];
+      tabJobId = null;
+    }
+    function win(value) {
+      if (settled) return;
+      settled = true;
+      clearTimeout(headTimer);
+      cleanupTab();
+      resolve(value);
+    }
+    function maybeLose() {
+      if (settled) return;
+      if (frameFinished && (!tabStarted || tabFinished)) {
+        settled = true;
+        clearTimeout(headTimer);
+        cleanupTab();
+        reject(tabError || frameError || new Error("Paint bridge failed."));
+      }
+    }
+    // Frame leg: full timeout, self-cleaning listener.
+    runBridgeFrameJob(spec, jobTimeoutMs, bridgeUrl).then(
+      (v) => { frameFinished = true; win(v); },
+      (e) => { frameFinished = true; frameError = e; maybeLose(); }
+    );
+    // Tab leg joins after the head start if the frame is still silent. The tab
+    // must already exist (opened from the Send click gesture); it is never
+    // opened here, long after the gesture, where the browser would block it.
+    const headTimer = setTimeout(() => {
+      if (settled || frameFinished) return;
+      const popup = existingPainterPopup();
+      if (!popup) return; // no tab to race with; frame leg continues solo
+      console.info("[Faith Images] Frame silent for 60s — racing the painter tab.");
+      ensurePainterReady(30000, bridgeUrl).then(() => {
+        if (settled || frameFinished) return;
+        tabStarted = true;
+        if (raceState) raceState.tabStarted = true;
+        tabJobId = "faith" + Date.now().toString(36) + Math.random().toString(36).slice(2);
+        tabTimer = setTimeout(() => {
+          tabError = new Error("The painter tab timed out.");
+          tabFinished = true;
+          const id = tabJobId; tabJobId = null; cleanupTab();
+          if (id) console.warn("[Faith Images] Tab leg timed out.");
+          maybeLose();
+        }, jobTimeoutMs);
+        tabClosedPoll = setInterval(() => {
+          let closed = true;
+          try { closed = !faithPainterPopup || faithPainterPopup.closed; } catch (_) {}
+          if (closed) {
+            tabError = new Error("The painter tab was closed before the image finished.");
+            tabFinished = true;
+            tabJobId = null; cleanupTab();
+            maybeLose();
+          }
+        }, 2000);
+        faithPainterPending[tabJobId] = {
+          resolve: (v) => { console.info("[Faith Images] Tab leg won the race."); win(v); },
+          reject: (e) => { tabError = e; tabFinished = true; tabJobId = null; cleanupTab(); maybeLose(); }
+        };
+        try {
+          console.info("[Faith Images] Tab leg sending job " + tabJobId + " -> " + postToPainterTab({ type: "faith-bridge-job", jobId: tabJobId, question: spec.question, artStyle: spec.artStyle, resolution: spec.resolution }));
+        } catch (_) {
+          tabError = new Error("Could not talk to the painter tab.");
+          tabFinished = true; tabJobId = null; cleanupTab();
+          maybeLose();
+        }
+      }, (tabReadyErr) => {
+        if (!settled && !frameFinished) console.warn("[Faith Images] Tab leg not ready:", tabReadyErr && tabReadyErr.message);
+        // Frame leg continues solo; its own settle decides the race.
+      });
+    }, FAITH_FRAME_HEAD_START_MS);
+  });
+}
+
+function generateFaithImageViaBridge(job, opts) {
+  // The bridge owns visual extraction + Art Style styling, so Faith sends
+  // the RAW user question plus the style name — never a pre-styled prompt.
+  const question = (job && (job.question || job.prompt) ? String(job.question || job.prompt) : "").slice(0, 1500);
+  if (!question.trim()) return Promise.reject(new Error("Faith did not build an image prompt."));
+  const artStyle = (job && job.artStyle) ? String(job.artStyle) : "No style";
+  const allowedRes = ["512x512", "512x768", "768x512", "768x768"];
+  const resolution = (job && allowedRes.indexOf(job.resolution) !== -1) ? job.resolution : "512x768";
+  const timeoutMs = (opts && opts.timeoutMs) || 180000;
+  const bridgeUrl = getFaithImageBridgeUrl();
+
+  return (async () => {
+    // Transport order: the painter tab is top-level on *.perchance.org, so the
+    // backend's framing policy allows it everywhere — it goes first whenever
+    // the frame cannot generate here (localhost/file host). The frame only
+    // leads where it can actually generate (this page on *.perchance.org).
+    // A warm painter tab (opened by an earlier Send click) serves immediately.
+    const frameUsable = frameTransportCanGenerate() && !bridgeFrameCoolMs();
+    let tabWarm = false;
+    try { tabWarm = !!(faithPainterReady && faithPainterOrigin && faithPainterPopup && !faithPainterPopup.closed); } catch (_) {}
+    if (!frameUsable) {
+      console.info("[Faith Images] Frame transport blocked here (backend framing policy) — using painter tab.");
+    } else if (!tabWarm) {
+      const readyPopup = existingPainterPopup();
+      if (readyPopup) {
+        // Both transports available: race them. The frame gets a 60s head start
+        // (fastest when healthy); if it stays silent the already-open tab joins
+        // and the first answer wins. If the race already tried the tab, there is
+        // nothing left to fall back to — otherwise fall through to the tab below.
+        const raceState = { tabStarted: false };
+        try {
+          return await raceBridgeTransports({ question: question, artStyle: artStyle, resolution: resolution }, timeoutMs, bridgeUrl, raceState);
+        } catch (raceErr) {
+          if (raceState.tabStarted) throw raceErr;
+          console.warn("[Faith Images] Frame leg failed, trying painter tab:", raceErr && raceErr.message);
+        }
+      } else {
+        try {
+          return await runBridgeFrameJob({ question: question, artStyle: artStyle, resolution: resolution }, timeoutMs, bridgeUrl);
+        } catch (frameErr) {
+          console.warn("[Faith Images] Embedded frame bridge failed, trying painter tab:", frameErr && frameErr.message);
+        }
+      }
+    } else {
+      console.info("[Faith Images] Painter tab already warm — using it.");
+    }
+    let popup = null;
+    try { popup = (faithPainterPopup && !faithPainterPopup.closed) ? faithPainterPopup : null; } catch (_) { popup = null; }
+    if (!popup) {
+      popup = openFaithPainterPopup();
+      if (!popup) throw new Error("The painter tab was blocked by the browser. Allow popups for this page (look for the blocked-popup icon in the address bar), then send your paint request again — painting opens one reusable painter tab from your Send click.");
+    }
+    await ensurePainterReady(45000, bridgeUrl);
+    console.info("[Faith Images] Painter tab ready — sending prompt (" + question.length + " chars, style " + artStyle + ")");
+    const jobId = "faith" + Date.now().toString(36) + Math.random().toString(36).slice(2);
+    console.info("[Faith Images] Painter job " + jobId + " -> " + bridgeUrl);
+    return await new Promise((resolve, reject) => {
+      const timer = setTimeout(() => {
+        delete faithPainterPending[jobId];
+        clearInterval(closedPoll);
+        reject(new Error("The image bridge timed out. The Perchance queue can be slow — try again, or open the painter tab to check it."));
+      }, timeoutMs);
+      const closedPoll = setInterval(() => {
+        let closed = true;
+        try { closed = !faithPainterPopup || faithPainterPopup.closed; } catch (_) {}
+        if (closed) {
+          clearTimeout(timer);
+          clearInterval(closedPoll);
+          delete faithPainterPending[jobId];
+          faithPainterReady = false;
+          reject(new Error("The painter tab was closed before the image finished. Paint again and leave the painter tab open."));
+        }
+      }, 2000);
+      faithPainterPending[jobId] = {
+        resolve: (v) => { clearTimeout(timer); clearInterval(closedPoll); console.info("[Faith Images] Painter finished job " + jobId); resolve(v); },
+        reject: (e) => { clearTimeout(timer); clearInterval(closedPoll); reject(e); }
+      };
+      try {
+        console.info("[Faith Images] Painter job " + jobId + " -> " + postToPainterTab({ type: "faith-bridge-job", jobId: jobId, question: question, artStyle: artStyle, resolution: resolution }));
+      } catch (_) {
+        delete faithPainterPending[jobId];
+        clearTimeout(timer);
+        clearInterval(closedPoll);
+        reject(new Error("Could not talk to the painter tab."));
+      }
+    });
+  })();
+}
+
+// Perchance-backend generation for Faith (hidden frame primary, painter tab
+// fallback). job = { question (raw user text), artStyle, resolution }.
+// Resolves {url, provider}. Faith paints with the generator's art styles +
+// backend; the server only builds the styled spec, never any image bytes.
+function generateFaithImage(job, opts) {
+  return generateFaithImageViaBridge(job, opts);
+}
 const expressionImages = {
   ruby: "/assets/ruby_wrench.png",
   thinking: "/assets/thinking.PNG",
@@ -138,7 +820,8 @@ const FAITH_VISION_DOWNLOADS = [
   }
 ];
 
-// Image generation is handled server-side by Pollinations only.
+// Image bytes are generated browser-side through the Perchance embed (same
+// backend as the Perchance AI image generator).
 
 const imageMessageStyles = document.createElement("style");
 imageMessageStyles.textContent = `
@@ -1588,9 +2271,26 @@ function isFaithBuildRequest(text) {
 function isFaithImageGenerationPhrase(text) {
   const value = String(text || "");
   // These two natural-language forms are explicitly reserved for Faith's
-  // existing Pollinations image-generation pipeline. They must never
+  // Perchance-embed image-generation pipeline. They must never
   // enter the direct Qwen chat relay.
   return /\bpaint\s+a\b/i.test(value) || /\bgenerate\s+a\b/i.test(value);
+}
+
+// Paint-family detector: mirrors server.rb generate_image_request's two
+// noun-free rules — a bare draw/paint/illustrate/sketch action ("draw a cat",
+// "paint me a sunset", "sketch a dragon") or a leading generate/create/make
+// + article ("generate me a dragon", "make a logo"). Anything this matches is
+// an image request on the server too, so without this the browser sends it to
+// /api/qwen-chat where the server 409-rejects it and the user only gets an
+// error bubble. Routing it to the paint backend turns those errors into
+// paintings. Qwen chat, build, coding, troubleshooting and emotions are
+// untouched: those branches all run before this routing (and the
+// paintActionRequest below is idle-gated, so active coding/troubleshooting
+// sessions keep their existing /api/chat behavior byte-for-byte).
+function isFaithPaintAction(text) {
+  const n = String(text || "").toLowerCase();
+  if (/\b(?:draw|paint|illustrate|sketch)\b/.test(n)) return true;
+  return /^\s*(?:please\s+)?(?:generate|create|make)\s+(?:me\s+)?(?:a|an|some)\b/.test(n);
 }
 
 async function runQwenPostEnrichment(messageItem, question, answer, wikimediaPromise = null) {
@@ -2031,12 +2731,16 @@ async function submitQuestion() {
     // it is not an instruction to generate an image.
     const eroticCapabilityQuestion = isEroticCapabilityQuestion(question);
     if (eroticCapabilityQuestion) setExpression("erotic", "Checking adult-art capability...");
+    // Idle-only: active coding/troubleshooting sessions keep existing behavior.
+    const paintActionRequest = sessionMode === "idle" && isFaithPaintAction(question);
     const isSimpleChat = !isTroubleshootingPrompt && sessionMode === "idle" &&
       (eroticCapabilityQuestion || (!isFaithImageGenerationPhrase(question) &&
+      !paintActionRequest &&
       !/\b(?:generate|create|draw|paint|make)\b[\s\S]*\b(?:image|picture|photo|art)\b/i.test(question))) &&
       !/\b(?:upload|file|code|debug|troubleshoot)\b/i.test(question);
 
     const isImageGeneration = !eroticCapabilityQuestion && (isFaithImageGenerationPhrase(question) ||
+      paintActionRequest ||
       /\b(?:generate|create|draw|paint|make|render|illustrate|design|sketch)\b[\s\S]*\b(?:image|picture|photo|art|portrait|drawing|painting|scene|wallpaper)\b/i.test(question));
     const dedicatedEmotion = (isSimpleChat || eroticCapabilityQuestion) ? faithEmotionRoute(question) : null;
 
@@ -2082,6 +2786,18 @@ async function submitQuestion() {
       })();
     }
 
+    // Open Faith's painter tab NOW, inside the user's click/keypress gesture,
+    // so the browser cannot block it as a popup. The tab is top-level on
+    // *.perchance.org, which is exactly what the image backend's framing
+    // policy requires (a hidden localhost iframe can never satisfy it).
+    // Closed again below if this turn turns out not to paint.
+    let painterOpenedThisTurn = false;
+    if (isImageGeneration && sessionMode !== "build" && sessionMode !== "coding" && sessionMode !== "troubleshooting") {
+      let hadOpen = false;
+      try { hadOpen = !!(faithPainterPopup && !faithPainterPopup.closed); } catch (_) {}
+      if (!hadOpen) painterOpenedThisTurn = !!openFaithPainterPopup();
+    }
+
     let response = await fetch(endpoint, {
       method: "POST",
       headers: {
@@ -2089,7 +2805,7 @@ async function submitQuestion() {
         "Accept": "application/json"
       },
       signal: chatController.signal,
-      body: JSON.stringify({ question })
+      body: JSON.stringify({ question, art_style: getFaithArtStyle() })
     });
 
     // If a stale server/proxy does not know /api/qwen-chat, immediately retry
@@ -2103,7 +2819,7 @@ async function submitQuestion() {
           "Accept": "application/json"
         },
         signal: chatController.signal,
-        body: JSON.stringify({ question })
+        body: JSON.stringify({ question, art_style: getFaithArtStyle() })
       });
     }
 
@@ -2146,10 +2862,25 @@ async function submitQuestion() {
       }
     }
 
-    // Image generation is server-side only and uses Pollinations exclusively.
+    // Image bytes are generated browser-side through the Perchance embed (the
+    // same backend as the Perchance AI image generator). The server returns a
+    // styled prompt spec (image_prompt / image_negative / image_resolution /
+    // image_guidance) and the browser below turns it into actual images.
     const generatedImages = Array.isArray(data.images)
       ? data.images.filter((image) => image && image.type === "generated" && image.url)
       : [];
+
+    // Styled prompt spec for browser-side generation. Only trusted when the
+    // server explicitly confirms image_mode "generated".
+    const faithImageSpec = (data.image_mode === "generated" &&
+      typeof data.image_prompt === "string" && data.image_prompt.trim().length > 0)
+      ? {
+          prompt: data.image_prompt,
+          negative: typeof data.image_negative === "string" ? data.image_negative : "",
+          resolution: typeof data.image_resolution === "string" ? data.image_resolution : "512x768",
+          guidance: Number(data.image_guidance) || 7
+        }
+      : null;
 
     // Some local-model responses occasionally return a valid JSON envelope but
     // no assistant text. Never render that as an empty Explanation bubble. A
@@ -2157,7 +2888,7 @@ async function submitQuestion() {
     // generated image itself is the response.
     const hasAssistantText = typeof data.answer === "string" && data.answer.trim().length > 0;
     const hasAnyImages = Array.isArray(data.images) && data.images.some((image) => image && image.url);
-    if (!hasAssistantText && !hasAnyImages) {
+    if (!hasAssistantText && !hasAnyImages && !faithImageSpec) {
       data.answer = data.image_request
         ? "Faith couldn't generate an image this time. Please try again in a moment."
         : "I didn't receive a text response that time. Please send that prompt again.";
@@ -2185,6 +2916,14 @@ async function submitQuestion() {
 
     const shouldPaint = isGeneratedRequest && !isWikimediaOnly;
 
+    // The painter tab was opened speculatively in the click gesture. If this
+    // turn is not actually painting, close it again so stray tabs do not pile up.
+    if (!shouldPaint && painterOpenedThisTurn) {
+      painterOpenedThisTurn = false;
+      try { if (faithPainterPopup && !faithPainterPopup.closed) faithPainterPopup.close(); } catch (_) {}
+      faithPainterReady = false;
+    }
+
     requestModeConfirmed = true;
 
     if (data.session_mode === "build") sessionMode = "build";
@@ -2193,12 +2932,22 @@ async function submitQuestion() {
     else if (data.session_mode === "idle") sessionMode = "idle";
 
     if (shouldPaint) {
-      // This is the actual Paint Me / image-generation path. Use the Painting
-      // Image generation is handled by the server-side Pollinations provider.
+      // This is the actual Paint Me / image-generation path. The painter tab
+      // (same backend as the Perchance AI image generator) paints each image,
+      // honoring the How-many dropdown. The tab stays open for reuse.
+      const paintCount = getFaithImageCount();
+      const paintStyle = getFaithArtStyle();
       setExpression(
         "painting",
-        generatedImages.length ? "Image ready" : "Creating your image..."
+        paintCount > 1
+          ? `Creating ${paintCount} images${paintStyle !== "No style" ? " (" + paintStyle + ")" : ""}...`
+          : ("Creating your image" + (paintStyle !== "No style" ? " (" + paintStyle + ")" : "") + "...")
       );
+      if (!data.answer || !data.answer.trim()) {
+        data.answer = paintCount > 1
+          ? `Painting ${paintCount} images in ${paintStyle} style...`
+          : `Painting in ${paintStyle} style...`;
+      }
     } else {
       // A backend expression of "painting" is ignored unless image_mode
       // confirmed an actual generation request above.
@@ -2248,6 +2997,70 @@ async function submitQuestion() {
       appendImages(streamedFaithItem, responseImages);
     }
 
+    // Browser-side image generation through the hosted Faith image bridge
+    // (Perchance backend). Coding/troubleshooting turns stay text-only by
+    // design (responseImages is already [] for them).
+    let paintedViaBrowser = false;
+    if (shouldPaint && faithImageSpec && sessionMode !== "troubleshooting" && sessionMode !== "coding") {
+      const paintTotal = getFaithImageCount();
+      const paintStyleName = getFaithArtStyle();
+      const paintTitle = String(question).slice(0, 120);
+      loadingMessage = appendLoadingMessage(`Painting 1/${paintTotal}…`);
+      let paintedOk = 0;
+      // Live elapsed-time readout so a slow backend queue never looks stuck.
+      const paintT0 = Date.now();
+      let paintLabel = `Painting 1/${paintTotal}…`;
+      const paintClock = setInterval(() => {
+        if (!loadingMessage) return;
+        try {
+          const s = Math.round((Date.now() - paintT0) / 1000);
+          updateLoadingMessage(loadingMessage, `${paintLabel} (${s}s)`);
+        } catch (_) {}
+      }, 1000);
+      const stopPaintClock = () => { try { clearInterval(paintClock); } catch (_) {} };
+      for (let paintIndex = 0; paintIndex < paintTotal; paintIndex += 1) {
+        if (turnId !== turnSequence) { stopPaintClock(); return; }
+        if (paintTotal > 1) { paintLabel = `Painting ${paintIndex + 1}/${paintTotal}…`; updateLoadingMessage(loadingMessage, paintLabel); }
+        try {
+          // The bridge owns extraction + styling: send the RAW user question
+          // and the style name (never the pre-styled spec — that would
+          // double-apply the Art Style on the bridge side).
+          const paintResult = await generateFaithImage({ question: question, artStyle: paintStyleName, resolution: faithImageSpec.resolution });
+          if (turnId !== turnSequence) { stopPaintClock(); return; }
+          const paintUrl = (paintResult && paintResult.url) || paintResult;
+          const paintProvider = (paintResult && paintResult.provider) || "Perchance";
+          paintedOk += 1;
+          paintedViaBrowser = true;
+          removeLoadingMessage(loadingMessage);
+          loadingMessage = null;
+          appendImages(faithItem, [{
+            url: paintUrl,
+            title: paintTitle,
+            source: `Faith / ${paintProvider} (${paintStyleName})`,
+            type: "generated"
+          }]);
+          chat.scrollTop = chat.scrollHeight;
+          if (paintIndex + 1 < paintTotal) {
+            paintLabel = `Painting ${paintIndex + 2}/${paintTotal}…`;
+            loadingMessage = appendLoadingMessage(paintLabel);
+          }
+          setExpression("painting", paintIndex + 1 < paintTotal ? `Painting ${paintIndex + 2}/${paintTotal}…` : "Image ready");
+        } catch (paintError) {
+          stopPaintClock();
+          removeLoadingMessage(loadingMessage);
+          loadingMessage = null;
+          setExpression("painting", paintedOk > 0 ? "Image ready" : "Image could not be loaded");
+          appendMessage("Error", `Faith couldn't paint that image: ${paintError.message}`, "error");
+          break;
+        }
+      }
+      stopPaintClock();
+      if (paintedOk === 0 && !paintedViaBrowser) {
+        removeLoadingMessage(loadingMessage);
+        loadingMessage = null;
+      }
+    }
+
     // Faith's answer is already visible. If finite background source research
     // was started, update THIS SAME message when that job completes.
     if (data.source_research_job_id) {
@@ -2267,8 +3080,10 @@ async function submitQuestion() {
       addFixCodeButton(faithItem);
     }
 
-    // Pollinations failures are reported by the server; never invoke a second provider here.
-    if (isGeneratedRequest && generatedImages.length === 0) {
+    // Server-confirmed generation requests without server-side images are
+    // fulfilled by the browser loop above; this only covers turns where the
+    // browser loop did not run (e.g. text-only coding/troubleshooting turns).
+    if (isGeneratedRequest && generatedImages.length === 0 && !paintedViaBrowser) {
       if (loadingMessage) updateLoadingMessage(loadingMessage, "Image generated");
       removeLoadingMessage(loadingMessage);
       loadingMessage = null;
@@ -2325,6 +3140,18 @@ clear.addEventListener("click", async () => {
   // This works even while the send button is busy/disabled.
   turnSequence += 1;
   buildRequestSequence += 1;
+  // Drop any in-flight Perchance paint iframe so a stuck "Painting 1/N" turn
+  // cannot resolve into the cleared conversation later.
+  try { document.querySelectorAll('iframe[data-faith-paint]').forEach((f) => f.remove()); } catch (_) {}
+  // Same for the painter tab: reject its pending jobs so a late finish cannot
+  // repaint the cleared conversation, and reset its ready state.
+  try {
+    Object.keys(faithPainterPending).forEach((id) => {
+      try { faithPainterPending[id].reject(new Error("Cleared.")); } catch (_) {}
+      delete faithPainterPending[id];
+    });
+  } catch (_) {}
+  try { faithPainterReady = false; } catch (_) {}
   if (activeChatController) {
     try { activeChatController.abort(); } catch (_) {}
     activeChatController = null;
@@ -2360,3 +3187,4 @@ clear.addEventListener("click", async () => {
 
 setExpression("ruby", "Ready");
 input.focus();
+console.info("[Faith] frontend " + FAITH_CLIENT_VERSION + " ready; bridge: " + getFaithImageBridgeUrl());
