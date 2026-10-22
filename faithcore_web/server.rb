@@ -2289,6 +2289,45 @@ server.mount_proc "/api/vision-status" do |req, res|
   end
 end
 
+server.mount_proc "/api/tts" do |req, res|
+  unless req.request_method == "GET"
+    json_response.call(res, 405, { error: "GET required." })
+    next
+  end
+  begin
+    text = req.query["q"].to_s.strip
+    if text.empty?
+      json_response.call(res, 400, { error: "Missing q parameter." })
+      next
+    end
+    text = text[0, 600]
+    uri = URI("https://translate.google.com/translate_tts")
+    uri.query = URI.encode_www_form({ "ie" => "UTF-8", "tl" => "en-AU", "client" => "tw-ob", "q" => text })
+    http = Net::HTTP.new(uri.host, uri.port)
+    http.use_ssl = true
+    http.open_timeout = 10
+    http.read_timeout = 20
+    tts_req = Net::HTTP::Get.new(uri.request_uri)
+    tts_req["User-Agent"] = "Mozilla/5.0"
+    tts_res = http.request(tts_req)
+    unless tts_res.is_a?(Net::HTTPSuccess)
+      json_response.call(res, 502, { error: "Voice backend HTTP #{tts_res.code}." })
+      next
+    end
+    audio = tts_res.body.to_s.dup.force_encoding("BINARY")
+    if audio.empty?
+      json_response.call(res, 502, { error: "Voice backend returned no audio." })
+      next
+    end
+    res.status = 200
+    res["Content-Type"] = "audio/mpeg"
+    res["Cache-Control"] = "public, max-age=86400"
+    res.body = audio
+  rescue StandardError => error
+    json_response.call(res, 502, { error: "Voice backend unavailable: #{error.message}" })
+  end
+end
+
 server.mount_proc "/api/upload" do |req, res|
   unless req.request_method == "POST"
     json_response.call(res, 405, { error: "POST required." })
