@@ -349,6 +349,13 @@
         max-width: min(280px, 70vw);
       }
     }
+    /* Faith voice (optional): AI replies render in cyan so the standalone
+       voice module can spot them. Purely visual otherwise — remove this
+       rule and the faith-voice-cyan.js tag to drop the feature entirely. */
+    .message.ai .message-text {
+      color: #00e5ff;
+      text-shadow: 0 0 14px rgba(0, 229, 255, 0.35);
+    }
   </style>
   <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.11.1/styles/github-dark.min.css">
   <script src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.11.1/highlight.min.js"></script>
@@ -546,6 +553,7 @@
 })();
 </script>
 
+  <script src="/faith-voice-cyan.js?v=1" defer></script>
   <script src="/faith-ptt.js" defer></script>
 
 </body>
