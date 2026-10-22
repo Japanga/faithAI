@@ -31,10 +31,16 @@ require_relative "FaithAIProvider"
 require_relative "FaithVisionObserver"
 VISION_MAX_TEXT = Integer(ENV.fetch("FAITH_VISION_MAX_TEXT", "60000"))
 WIKIMEDIA_API_URL = "https://commons.wikimedia.org/w/api.php"
-POLLINATIONS_IMAGE_URL = "https://image.pollinations.ai/prompt"
+# Image bytes are generated browser-side through the hosted Faith image bridge
+# (a tiny Perchance generator running the same text-to-image backend as the
+# Perchance AI image generator). The Ruby server only builds the styled prompt
+# spec (art style + size + guidance); it never downloads or proxies image
+# bytes. No Pollinations parts exist anywhere: the user wants the Perchance
+# backend's art styles and photo quality.
+PERCHANCE_IMAGE_EMBED_ORIGIN = "https://image-generation.perchance.org"
 MODEL = "auto"
 PORT = Integer(ENV.fetch("PORT", "4567"))
-FAITH_SERVER_VERSION = "94-pollinations-prompt-faithful"
+FAITH_SERVER_VERSION = "99-tabbridge"
 # Emotion diagnostics are written beside this server.rb by default. Override with
 # FAITH_EMOTION_DIAGNOSTIC_LOG if you want the log somewhere else.
 FAITH_EMOTION_DIAGNOSTIC_LOG = File.expand_path(
@@ -200,12 +206,10 @@ def ensure_faith_coder_server!(on_status: nil)
 end
 
 PUBLIC_DIR = File.join(ROOT, "public")
-GENERATED_DIR = File.join(PUBLIC_DIR, "generated")
 UPLOAD_DIR = File.join(PUBLIC_DIR, "uploads")
 MAX_UPLOAD_BYTES = Integer(ENV.fetch("FAITH_MAX_UPLOAD_BYTES", "12000000"))
 PUBLIC_BASE_URL = ENV.fetch("FAITH_PUBLIC_BASE_URL", "").to_s.strip.sub(%r{/\z}, "")
 
-Dir.mkdir(GENERATED_DIR) unless Dir.exist?(GENERATED_DIR)
 Dir.mkdir(UPLOAD_DIR) unless Dir.exist?(UPLOAD_DIR)
 
 SYSTEM_PROMPT = <<~PROMPT
@@ -309,17 +313,6 @@ multimodal_connection = Faraday.new do |faraday|
   faraday.headers["Content-Type"] = "application/json"
   faraday.options.timeout = 120
   faraday.options.open_timeout = 10
-end
-
-# Image services can be slow or temporarily congested. Keep the limits
-# configurable so a deployment can tune them without editing source.
-FAITH_POLLINATIONS_TIMEOUT = Integer(ENV.fetch("FAITH_POLLINATIONS_TIMEOUT", "180"))
-FAITH_POLLINATIONS_OPEN_TIMEOUT = Integer(ENV.fetch("FAITH_POLLINATIONS_OPEN_TIMEOUT", "15"))
-
-pollinations_connection = Faraday.new do |faraday|
-  faraday.headers["User-Agent"] = "FaithWebAI/1.0"
-  faraday.options.timeout = FAITH_POLLINATIONS_TIMEOUT
-  faraday.options.open_timeout = FAITH_POLLINATIONS_OPEN_TIMEOUT
 end
 
 messages = [
@@ -550,13 +543,15 @@ photo_request = lambda do |question|
   (direct_action && image_word) || object_phrase
 end
 
-# Faith uses Pollinations as the sole image-generation provider. A trailing
-# "using Pollinations" is treated as routing metadata and removed from the prompt.
+# A trailing "using Pollinations" is treated as routing metadata and removed
+# from the prompt. (Historical provider wording; image bytes are now generated
+# browser-side through the hosted Faith image bridge running the Perchance
+# backend. This only strips words — it makes zero network calls.)
 image_provider_suffix = lambda do |question|
   text = question.to_s.strip
   explicit = text.match?(/\s+using\s+pollinations[.!?]*\s*\z/i)
   clean = text.sub(/\s+using\s+pollinations[.!?]*\s*\z/i, "").strip
-  { provider: "pollinations", explicit: explicit, prompt: clean }
+  { provider: "perchance", explicit: explicit, prompt: clean }
 end
 
 # AI generation is reserved for requests that explicitly ask Faith to CREATE an image.
@@ -578,7 +573,7 @@ generate_image_request = lambda do |question|
 end
 
 # Strip chat scaffolding ("please generate an image of...") down to a visual
-# prompt for the Pollinations server-side image endpoint.
+# prompt for the browser-side Perchance-embed image generation.
 extract_visual_prompt = lambda do |question|
   q = image_provider_suffix.call(question)[:prompt].to_s.dup
   q = q.gsub(/\bplease\b/i, " ")
@@ -610,6 +605,115 @@ enhance_visual_prompt = lambda do |raw_prompt|
     visual = "#{visual}, #{quality}"
   end
   visual[0, 1800]
+end
+
+# Art Styles for Faith's image generation, ported from the Perchance
+# t2i-styles set so the Faith UI can offer the same picker. "{visual}" is
+# replaced with the extracted visual subject at generation time. "No style"
+# is a pure passthrough and preserves the exact pre-style behavior.
+FAITH_ART_STYLES = {
+  "No style" => { wrap: "{visual}", negative_add: "" },
+"Painted Anime" => { wrap: "{visual}, art in the style of atey ghailan, painterly anime style at pixiv, art in the style of kantoku, in art style of redjuice/necömi/rella/tiv pixiv collab, your name anime art style, masterpiece digital painting, exquisite lighting and composition, inspired by wlop art style, 8k, sharp, very detailed, high resolution, illustration.\n\nOverall, it's an absolute world-class masterpiece painterly anime-inspired digital art. It's an aesthetically pleasing painterly anime-inspired digital artwork with impeccable attention to detail and impressive composition.", negative_add: "" },
+  "Casual Photo" => { wrap: "A casual real-life photograph. A casual photo of {visual}. It's a casual photo. Overall it's an actual real-life photograph.", negative_add: "" },
+  "Cinematic" => { wrap: "{visual}, cinematic shot, dynamic lighting, 75mm, Technicolor, Panavision, cinemascope, sharp focus, fine details, 8k, HDR, realism, realistic, key visual, film still, cinematic color grading, depth of field.\n\nOverall, it's an absolute world-class cinematic masterpiece. It's an aesthetically pleasing cinematic shot with impeccable attention to detail and impressive composition.", negative_add: "" },
+  "Digital Painting" => { wrap: "{visual}, breathtaking digital art, trending on artstation, in the style of atey ghailan, in the style of greg rutkowski, in the style of greg tocchini, in the style of james gilleard, 8k, high resolution, best quality.\n\nOverall, it's an absolute world-class masterpiece digital painting. It's an aesthetically pleasing digital painting with impeccable attention to detail and impressive composition.", negative_add: "" },
+  "Concept Art" => { wrap: "{visual}, concept art, digital art, illustration, inspired by wlop style, 8k, fine details, sharp, very detailed, high resolution, world-class masterpiece.\n\nOverall, it's absolute world-class masterpiece concept art. It's an aesthetically pleasing concept art with impeccable attention to detail and impressive composition.", negative_add: "" },
+  "3D Disney Character" => { wrap: "3D cartoon Disney character portrait render. {visual}, bokeh, 4k, highly detailed, Pixar render, CGI Animation, Disney, cute big circular reflective eyes, dof, cinematic film, Disney realism, subtle details, breathtaking Pixar short, fine details, close up, sharp focus, HDR, Disney-style octane render, incredible composition, superb lighting and detail, {visual}.\n\nOverall, it's an absolute world-class masterpiece 3D Disney-inspired Character. It's an aesthetically pleasing 3D Disney-inspired piece with impeccable attention to detail and impressive composition.", negative_add: "" },
+  "2D Disney Character" => { wrap: "2D cartoon Disney character digital art of {visual}. superb linework, classic 2D Disney style art, inspired in the style of the art styles of Glen Keane and Aaron Blaise, Disney-style character concept with a Disney-style face, trending on artstation, Disney-style version of {visual}.\n\nOverall, it's an absolute world-class masterpiece 2D Disney-inspired Character. It's an aesthetically pleasing 2D Disney-inspired piece with impeccable attention to detail and impressive composition.", negative_add: "" },
+  "Disney Sketch" => { wrap: "Glen Keane character concept art black and white pencil sketch of {visual}. rough pencil sketch in the style of Glen Keane, rough pencil sketch, close up, loose Disney-style character concept art sketch, nice sketchy pencil strokes, Disney character design sketch, pencil texture, a concept art pencil sketch of {visual}, in the style of Glen Keane.\n\nOverall, it's an charmingly aesthetic and well-composed Disney-style sketch.", negative_add: "" },
+  "Concept Sketch" => { wrap: "black and white technical drawing showcasing a {visual}, annotation details, world-class masterpiece black and white, pencil strokes, annotated technical concept art sketch, pencil texture.\n\nOverall, it's a charmingly aesthetic and well-composed concept sketch.", negative_add: "" },
+  "Painterly" => { wrap: "painterly digital painting, {visual}, digital painting in the style of Ilya Kuvshinov with painterly brush strokes, in the style of Ilya Kuvshinov, world-class painterly masterpiece.\n\nOverall, it's an absolute world-class masterpiece painterly digital painting. It's an aesthetically pleasing painterly digital painting with impeccable attention to detail and impressive composition.", negative_add: "" },
+  "Oil Painting" => { wrap: "breathtaking alla prima oil painting, {visual}, close up, alla prima style, oil on linen, painterly oil on canvas, painterly style, exquisite composition and lighting, modern painterly masterpiece, in the style of alexi zaitsev, award-winning painterly alla prima oil painting.\n\nOverall, it's an absolute world-class masterpiece oil painting. It's an aesthetically pleasing oil painting with impeccable attention to detail and impressive composition.", negative_add: "" },
+  "Oil Painting - Realism" => { wrap: "breathtaking oil painting, {visual}, photorealistic oil painting, in the style of charlie bowater, fine details, in the style of wlop, trending on artstation, very detailed.\n\nOverall, it's an absolute world-class masterpiece realism oil painting. It's an aesthetically pleasing realism oil painting with impeccable attention to detail and impressive composition.", negative_add: "" },
+  "Oil Painting - Old" => { wrap: "{visual}, Oil painting in the style of Jean-François Millet and Gustave Courbet and Jules Breton", negative_add: "" },
+  "Oil Painting - 70s Pulp" => { wrap: "1970s vintage pulp art, ultra realistic, fully restored, exquisite lighting and composition, polished, masterpiece, vintage pulp art, in the style of Earle K. Bergey, in the style of Kelly Freas, in the style of Alex Schomburg, in the style of H. J. Ward, glossy pulp art, Amazing Stories, Weird Tales, 8k, high resolution, best quality, hyper-realistic, Mattias Adolfsson style, detailed stylization, {visual}, ultra realistic, wlop-style, exquisite lighting and composition, polished, world-class masterpiece, digitally enhanced, breathtaking shot, subtle details, superb quality, art in the style of Kuvshinov, Kuvshinov style, detailed stylization.\n\nOverall, it's an absolute world-class masterpiece artwork. It's an aesthetically pleasing restored 1970s vintage pulp art with impeccable attention to detail and impressive composition. It has perfect contrast and color balance. Almost photorealism.", negative_add: "" },
+  "Professional Photo" => { wrap: "{visual}, sharp focus, depth of field, 8k photo, HDR, professional lighting, taken with Canon EOS R5, DSLR, 75mm lens", negative_add: "" },
+  "Anime" => { wrap: "anime art of {visual}, world-class masterpiece, 4k, best quality, anime art.\n\nOverall, it's an absolute world-class masterpiece anime-inspired artwork. It's an aesthetically pleasing anime art with impeccable attention to detail and beautiful composition.", negative_add: "" },
+  "Drawn Anime" => { wrap: "anime-style illustration with perfect clean lines, illustration of {visual}, anime drawing/art, bold linework, illustration, cel shaded, anime-style digital illustration. It's an anime-inspired 2D-style anime illustration. Aesthetic high-skill, professional anime illustration, which looks like a screencap from an anime series. It has clean line work and a pleasant, appealing drawn aesthetic style. Overall, it's a world-class illustration with flawless line work, perfect composition, and impeccable attention to detail.", negative_add: "" },
+  "Anime Screencap" => { wrap: "Anime screencap, {visual}. It's an anime screencap from a popular anime. Beautiful visual quality, remastered, extremely high quality, very aesthetic, high production value, high-skill masterpiece. The image shows impeccable and beautiful composition and contrast. It's an exquisite anime screencap style image.", negative_add: "" },
+  "Cute Anime" => { wrap: "adorable, cute, kawaii, {visual}, cute moe anime character portrait, adorable, featured on pixiv, kawaii moé masterpiece, cuteness overload, very detailed, sooooo adorable.\n\nOverall, it's an absolute world-class masterpiece anime-inspired artwork. It's an aesthetically pleasing anime art with impeccable attention to detail and beautiful composition.", negative_add: "" },
+  "Soft Anime" => { wrap: "{visual}, anime masterpiece with soft lighting, gentle intricate style, highly detailed, pixiv, anime art, 4k, art from your name anime, garden of words style art, high quality.\n\nOverall, it's an absolute world-class masterpiece soft beautiful anime-inspired artwork. It's an aesthetically pleasing, soft, beautiful anime art with impeccable attention to detail and beautiful composition.", negative_add: "" },
+  "Fantasy Painting" => { wrap: "{visual}, d&d, fantasy, highly detailed, digital painting, artstation, sharp focus, fantasy art, illustration, 8k, in the style of greg rutkowski. It's an absolute world-class masterpiece artwork. It's an aesthetically pleasing artwork with impeccable attention to detail and impressive composition.", negative_add: "" },
+  "Fantasy Landscape" => { wrap: "{visual}, fantasy matte painting, absolute masterpiece, detailed matte painting in the style of andreas rocha and greg rutkowski, in the style of Brothers Hildebrandt, superb composition, vivid fantasy art, breathtaking fantasy masterpiece. It's an absolute world-class masterpiece artwork. It's an aesthetically pleasing artwork with impeccable attention to detail and impressive composition.", negative_add: "" },
+  "Fantasy Portrait" => { wrap: "{visual}, d&d, fantasy, highly detailed, digital painting, artstation, sharp focus, fantasy art, character art, illustration, 8k, art in the style of artgerm and greg rutkowski. It's an absolute world-class masterpiece artwork. It's an aesthetically pleasing artwork with impeccable attention to detail and impressive composition.", negative_add: "" },
+  "Studio Ghibli" => { wrap: "Studio Ghibli style artwork of {visual}, Studio Ghibli style art film still, sharp, very detailed, high resolution, inspired by the style of Hayao Miyazaki, anime, film still from Spirited Away. In the style of Kiki Delivery Service, with a similar art style to Princess Mononoke. Aesthetically similar to My Neighbor Totoro's art style.\n\nOverall, it's an absolute world-class masterpiece Studio Ghibli-inspired artwork. It's an aesthetically pleasing classic Studio Ghibli style artwork with impeccable attention to detail and impressive composition.", negative_add: "" },
+  "50s Enamel Sign" => { wrap: "50s enamel sign of {visual}, 50s advert enamel sign, masterpiece, authentic vintage enamel sign", negative_add: "" },
+  "Vintage Comic" => { wrap: "comic book style art of {visual}, drawing, in the style of Dave Stevens, in the style of Adam Hughes, 1940's, 1950's, hand-drawn, color, high resolution, best quality, closeup", negative_add: "" },
+  "Franco-Belgian Comic" => { wrap: "franco-belgian color comic about {visual}, bande dessinée, franco-belgian comic panel, masterpiece, breathtaking composition, intricate, detailed, best quality", negative_add: "" },
+  "Tintin Comic" => { wrap: "color comic panel in the style of Hergé about {visual}, in the style of Hergé, tintin style, french comic panel, franco-belgian style, masterpiece, high-resolution Hergé style", negative_add: "" },
+  "Medieval" => { wrap: "medieval illuminated manuscript picture of {visual}, medieval illuminated manuscript art, masterpiece medieval color illustration, 16th century, 8k high-resolution scan of 16th century illuminated manuscript painting, detailed medieval masterpiece.", negative_add: "" },
+  "Pixel Art" => { wrap: "{visual}{visual}, best pixel art, neo-geo graphical style, retro nostalgic masterpiece, 128px, 16-bit pixel art {visual}, 2D pixel art style, adventure game pixel art, inspired by the art style of hyper light drifter, masterful dithering, superb composition, beautiful palette, exquisite pixel detail", negative_add: "" },
+  "Furry - Oil" => { wrap: "{visual}, crisp vibrant detailed soft painterly digital art, volumetric lighting, natural lighting, realistic lighting, vibrant colors, crisp oil painting, painterly realism, depth of field, subtle soft details, vivid, fresh, striking, in the style of chunie, in the style of darkgem, in the style of honovy, inspired by zaush, inspired by anhes, inspired by puinkey, in the style of caraid, in the style of dagasi, inspired by taranfiddler, in the style of atey ghailan, in the style of MilletGustave, in the style of Curbet, inspired by Charlie Bowater style, lol art.\n\nOverall, it's a world-class painterly masterpiece. It's aesthetically pleasing digitial art with impeccable attention to detail and impressive composition.", negative_add: "" },
+  "Furry - Cinematic" => { wrap: "{visual}, cinematic shot, dynamic lighting, 75mm, Technicolor, Panavision, cinemascope, sharp focus, fine details, 8k, HDR, realism, realistic, key visual, film still, cinematic color grading, depth of field.\n\nOverall, it's an absolute world-class masterpiece. It's an aesthetically pleasing image with impeccable attention to detail and impressive composition.", negative_add: "" },
+  "Furry - Painted" => { wrap: "anthro {visual} digital art, masterpiece, 4k, fine details. It's an absolute world-class masterpiece artwork.\n\nOverall, it's an aesthetically pleasing artwork with impeccable attention to detail and impressive composition.", negative_add: "" },
+  "Furry - Drawn" => { wrap: "anthro {visual} illustration, hand-drawn, bold linework, anthro illustration, cel shaded, 4k, fine details, masterpiece.\n\nOverall, it's an absolute world-class masterpiece artwork. It's an aesthetically pleasing artwork with impeccable attention to detail and impressive composition.", negative_add: "" },
+  "Cute Figurine" => { wrap: "{visual}, figurine, modern Disney style, octane render, chibi", negative_add: "" },
+  "3D Emoji" => { wrap: "masterpiece {visual} cartoon 3D emoji concept render, close-up, facing forward, matte finish, 3D emoji render, app icon, simple design, new iOS 18.4 style {visual} emoji render, simple background, centered, world-class masterpiece work of art, crisp render, sharp focus, charmingly aesthetic design, 4k, soft lighting, masterpiece emoji-style figurine 3D render, pure white background", negative_add: "" },
+  "Illustration" => { wrap: "breathtaking illustration of {visual}, illustration, masterpiece, breathtaking illustration.\n\nOverall, it's an absolute world-class masterpiece illustration. It's an aesthetically pleasing illustration with impeccable attention to detail and impressive composition.", negative_add: "" },
+  "Cute Illustration" => { wrap: "A cute cartoon showing {visual}, in a soft, cute, minimalist, webcomic-style illustration. Line art is somewhat bold but gentle, with clean lines, and subtle variation. Colors are soft, flat, with gentle pastel tones. No shading except for light inner shadows or simple highlights. The background is plain white or contains a light wash of color with subtle textured style. The overall scene is wholesome and endearing like a page from a Liz Climo comic. Composition is centered with space around the character, evoking authentic warmth through the wholesome, soft, web comic style.\n\nIt's an aesthetically pleasing masterpiece, showing high skill in evoking an authentic and beautifully minimalist style.", negative_add: "" },
+  "Flat Illustration" => { wrap: "{visual}, illustration, flat, 2D, vector art, masterpiece, made with adobe illustrator, behance competition winner, trending on dribble, 4k, high resolution, crisp lines.\n\nOverall, it's an absolute world-class masterpiece flat-style illustration. It's an aesthetically pleasing flat-style illustration with impeccable attention to detail and impressive composition.", negative_add: "" },
+  "Watercolor" => { wrap: "{visual}, (watercolor), high resolution, intricate details, 4k, wallpaper, concept art, watercolor on textured paper.\n\nOverall, it's an absolute world-class masterpiece watercolor artwork. It's an aesthetically pleasing watercolor artwork with impeccable attention to detail and impressive composition.", negative_add: "" },
+  "1990s Photo" => { wrap: "{visual}, 90s home video, nostalgic 90s photo, taken with kodak disposable camera", negative_add: "" },
+  "1980s Photo" => { wrap: "famous vintage 80s photo, {visual}, grainy photograph, 80s photo with film grain, Kodacolor II 80s photo with vignetting, retro, r/OldSchoolCool, 80s photo with wear and tear and minor creasing and scratches, vintage color photo", negative_add: "" },
+  "1970s Photo" => { wrap: "famous vintage 70s photo, {visual}, grainy photograph, 1970s photo with film grain, 70s photo with vignetting, retro, r/OldSchoolCool, 70s photo, vintage photo", negative_add: "" },
+  "1960s Photo" => { wrap: "famous vintage 60s photo, {visual}, grainy photograph, 1960s photo with film grain, 60s photo with vignetting, retro, r/OldSchoolCool, 60s photo, vintage photo", negative_add: "" },
+  "1950s Photo" => { wrap: "famous vintage 50s photo, {visual}, grainy photograph, 1950s photo with film grain, 1950s photo with vignetting, retro, r/OldSchoolCool, 1950s photo, vintage photo", negative_add: "" },
+  "1940s Photo" => { wrap: "famous vintage 1940s photo, {visual}, grainy photograph, 1940s photo with film grain, 1940s photo with vignetting, retro, r/OldSchoolCool, 1940s photo, vintage photo", negative_add: "" },
+  "1930s Photo" => { wrap: "famous vintage 1930s photo, {visual}, grainy photograph, 1930s photo with film grain, 1930s photo with vignetting, retro, r/OldSchoolCool, 1930s photo, vintage photo", negative_add: "" },
+  "1920s Photo" => { wrap: "famous vintage 1920s photo, {visual}, 1920s photo, restored photograph, sepia, historical archive photo", negative_add: "" },
+  "Vintage Pulp Art" => { wrap: "1970s vintage pulp art, {visual}, vintage pulp art, in the style of Earle K. Bergey, in the style of Kelly Freas, in the style of Alex Schomburg, in the style of H. J. Ward, glossy pulp art, Amazing Stories, Weird Tales, 8k, high resolution, best quality", negative_add: "" },
+  "50s Infomercial Anime" => { wrap: "{visual}, 1950s infomercial style, delicate linework, paprika anime art style, chromatic aberration glow, 2d painted cel animation, soft focus, 2D pixiv 1950s", negative_add: "" },
+  "3D Pokemon" => { wrap: "An incredibly perfect high-quality 3D render of a pokemon creature, {visual}, 8k render, beautiful pokemon digital art, fakemon, pokemon creature, cryptid, fakemon, masterpiece, soft focus, best quality, high quality. Perfect soft lighting, beautiful composition. It's an impressive CGI image from the upcoming Pokemon Movie \(2026\).\n\nOverall, it's an absolute world-class masterpiece 3D-rendered Pokemon-inspired creature. It's an aesthetically pleasing 3D Pokemon-inspired piece with impeccable attention to detail and impressive composition.", negative_add: "" },
+  "Painted Pokemon" => { wrap: "Beautiful, very high-quality painterly digital concept art, {visual}, 8k digital painting of a pokemon, amazing pokemon creature art in the style of piperdraws, cryptid creations in the style of Piper Thibodeau, in the style of Naoki Saito and Tokiya, incredible composition.\n\nOverall, it's an absolute world-class masterpiece painterly Pokemon-inspired artwork. It's an aesthetically pleasing painterly Pokemon-inspired artwork with impeccable attention to detail and impressive composition.", negative_add: "" },
+  "2D Pokemon" => { wrap: "{visual}, pokemon creature concept, superb line art, beautiful colors and composition, 2D art style, beautiful pokemon digital art, fakemon, in the style of Sowsow, pokemon creature, cryptid, fakemon, masterpiece, in the style of Yuu Nishida, 4k. The Pokémon-like creature is centered within this anime-style 2D image. It's from the upcoming Pokemon Movie \(2026\) which has the classic 2D Pokemon art style.\n\nOverall, it's an absolute world-class masterpiece 2D Pokemon-inspired artwork. It's an aesthetically pleasing 2D Pokemon-inspired artwork with impeccable attention to detail and impressive composition. Clean, perfect linework, impeccable clean 2D anime-inspired art style.", negative_add: "" },
+  "Vintage Anime" => { wrap: "{visual}, 1990s anime, vintage anime, 90's anime style, in the style of hajime sorayama, in the style of greg tocchini, anime masterpiece, pixiv, akira-style art, akira anime art, 4k, high quality.\n\nOverall, it's an absolute world-class masterpiece vintage anime artwork. It's an aesthetically pleasing vintage anime artwork with impeccable attention to detail and impressive composition.", negative_add: "" },
+  "Neon Vintage Anime" => { wrap: "{visual}, neon vintage anime style, 90's anime style, 1990s anime, hajime sorayama, greg tocchini, neon vintage anime masterpiece, anime art, 4k, high quality.\n\nOverall, it's an absolute world-class masterpiece neon vintage anime artwork. It's an aesthetically pleasing neon vintage anime artwork with impeccable attention to detail and impressive composition.", negative_add: "" },
+  "Manga" => { wrap: "{visual}, incredible hand-drawn manga, black and white, in the style of Takehiko Inoue, in the style of Katsuhiro Otomo and akira toriyama manga, hand-drawn art in the style of rumiko takahashi and Inio Asano, Ken Akamatsu manga art.\n\nOverall, it's an absolute world-class masterpiece black and white manga-style artwork. It's an aesthetically pleasing black and white manga artwork with impeccable attention to detail and impressive composition.", negative_add: "" },
+  "Fantasy World Map" => { wrap: "beautiful fantasy map of {visual}, beautiful fantasy map inspired by middle earth and azeroth and discworld and westeros and essos and the witcher world and tamriel and faerûn and thedas, 4k, beautiful colors, crisp, high-resolution artistic map, topographic 3D terrain, artistic map.\n\nOverall, it's an absolute world-class masterpiece fantasy world map. It's an aesthetically pleasing fantasy world map artwork with impeccable attention to detail and impressive composition.", negative_add: "" },
+  "Fantasy City Map" => { wrap: "an aerial view of a city, TTRPG city map showing the full city, {visual}, fantasy art, highly-skilled senior environment artist piece, beautiful fantasy map.\n\nOverall, it's an absolute world-class masterpiece fantasy city map. It's an aesthetically pleasing fantasy city map artwork with impeccable attention to detail and impressive composition.", negative_add: "" },
+  "Old World Map" => { wrap: "fantasy world map of {visual}, fantasy world map, highly detailed digital painting, fantasy art, map illustration, 8k.\n\nOverall, it's an absolute world-class masterpiece old world map. It's an aesthetically pleasing old world style map artwork with impeccable attention to detail and impressive composition.", negative_add: "" },
+  "3D Isometric Icon" => { wrap: "{visual}, 3D isometric render of cute {visual}, 3D app icon, clean isometric design, beautiful design, soft gradient background, soft colors, centered, 3D blender render, masterpiece, best quality, high resolution, 8k octane render, beautiful color scheme, soft smooth lighting, physically based rendering, square image, high polycount", negative_add: "" },
+  "Flat Style Icon" => { wrap: "{visual}, creative icon, flat style icon, masterpiece, high resolution, crisp, beautiful composition and color choice, beautiful flat painted style, behance contest-winner, award winning icon illustration, 8k, best quality", negative_add: "" },
+  "Flat Style Logo" => { wrap: "beautiful flat-style logo design depicting {visual}, creative flat-style logo design, trending on dribbble, featured on behance, portfolio piece, minimal flat design, breathtaking graphic design, 8k, high resolution vector logo, plain background, amazingly beautiful logo design, winner of best logo award", negative_add: "" },
+  "Game Art Icon" => { wrap: "{visual}, a concept art icon for league of legends, a digital art logo, illustration, league of legends style icon, inspired by wlop style, 8k, dota 2 style icon, fine details, sharp, very detailed icon, high resolution rpg ability/spell/item icon", negative_add: "" },
+  "Digital Painting Icon" => { wrap: "{visual}, app logo icon, digital art pictogram icon, trending on artstation, app icon in the style of atey ghailan, app icon in the style of greg rutkowski, app icon in the style of greg tocchini, app icon in the style of james gilleard, 8k, high resolution, best quality", negative_add: "" },
+  "Concept Art Icon" => { wrap: "{visual}, a concept art icon, a digital art logo, illustration, league of legends style concept art logo icon, inspired by wlop style, 8k, fine details, sharp, very detailed, high resolution logo icon", negative_add: "" },
+  "Cute 3D Icon" => { wrap: "{visual}, a cute 3D icon of {visual}, cartoon 3D icon, very cute shape, stylized octane render, 8k, masterpiece, soooo cute, beautiful cute perfection, beautiful soft lighting, soft colors, centered, high resolution, {visual}, soft gradient background", negative_add: "" },
+  "Cute 3D Icon 𝗦𝗲𝘁" => { wrap: "{visual}, a set of lovely little 3D icons, cute 3D icons, very cute shapes, stylized octane render, 8k, masterpiece, soooo cute, beautiful cute perfection, beautiful soft lighting, soft colors, centered, high resolution, {visual}, cute icon set", negative_add: "" },
+  "Crayon Drawing" => { wrap: "{visual}, crayon drawing", negative_add: "" },
+  "Pencil" => { wrap: "black and white pencil drawing, {visual}, black and white, breathtaking pencil illustration, highly detailed, 4k, textured paper, pencil texture, sketch", negative_add: "" },
+  "Tattoo Design" => { wrap: "amazing tattoo design, {visual}, breathtaking tattoo design, incredible tattoo design", negative_add: "" },
+  "Waifu" => { wrap: "{visual}, waifu character portrait, 1girl, very high resolution, semi-realistic anime art. Intricate and impressive anime artwork with stunningly beautiful composition and style.\n\nOverall, it's an absolute world-class masterpiece anime artwork. It's an aesthetically pleasing waifu artwork with impeccable attention to detail and impressive composition. It's an aesthetically pleasing character portrait. It's an aesthetically pleasing image. It's an aesthetically pleasing image. It's an aesthetically pleasing image. It's an aesthetically pleasing image.", negative_add: "" },
+  "YuGiOh Art" => { wrap: "yugioh card art for {visual}, art in the style of genzoman, in the style of Akina Fujiwara, in the style of rossdraws, yugioh monster, close up, painterly details, breathtaking art, centered, masterpiece, amazing composition, {visual}.\n\nOverall, it's an absolute world-class masterpiece \"Yu-Gi-Oh!\"-inspired artwork. It's an aesthetically pleasing Yu-Gi-Oh inspired artwork with impeccable attention to detail and impressive composition.", negative_add: "" },
+  "Traditional Japanese" => { wrap: "{visual}, in ukiyo-e art style, traditional japanese masterpiece", negative_add: "" },
+  "Nihonga Painting" => { wrap: "japanese nihonga painting about {visual}, Nihonga, ancient japanese painting, intricate, detailed", negative_add: "" },
+  "Claymation" => { wrap: "{visual}, claymation, incredible claymation style, kubo and the two strings style art, Missing Link 2019 art style, clay texture, clay animation, stop-motion clay", negative_add: "" },
+  "Cartoon" => { wrap: "{visual}, cartoon-style art, superb linework, nice colors and composition, bold linework, masterpiece, cute art in the style of Dana Terrace, in the style of Rebecca Sugar, in the style of ry-spirit, amazing and wholesome cartoon-style art, cute art style, (trending on artstation)", negative_add: "" },
+  "Cursed Photo" => { wrap: "cursed photo of {visual}, creepy and cursed, absolutely cursed photo, nope nope nope nope, what the actual f, unsettling photo, cursed_thing, cursedimages, no context, cursed image, bad photo, weird photo, very strange, color photo, creepy photo, nightmare fuel", negative_add: "" },
+  "MTG Card" => { wrap: "magic the gathering card, {visual}, incredible magic the gathering artwork", negative_add: "low-quality, deformed, blurry, bad art" },
+}.freeze
+FAITH_DEFAULT_ART_STYLE = "No style"
+
+normalize_art_style = lambda do |name|
+  n = name.to_s.strip
+  return FAITH_DEFAULT_ART_STYLE if n.empty?
+  # Unicode-tolerant match: the generator's list contains styled-unicode names
+  # (e.g. "Cute 3D Icon Set" with a mathematical-bold "Set"), so compare the
+  # NFKD letter/digit skeletons instead of raw case equality.
+  canon = lambda do |s|
+    begin
+      s.to_s.unicode_normalize(:nfkd).gsub(/[^a-z0-9]/i, "").downcase
+    rescue StandardError
+      s.to_s.gsub(/[^a-z0-9]/i, "").downcase
+    end
+  end
+  FAITH_ART_STYLES.keys.find { |k| canon.call(k) == canon.call(n) } || FAITH_DEFAULT_ART_STYLE
+end
+
+apply_art_style = lambda do |visual, art_style|
+  key = normalize_art_style.call(art_style)
+  style = FAITH_ART_STYLES[key]
+  [style[:wrap].gsub("{visual}", visual.to_s)[0, 1800], key, style[:negative_add].to_s]
 end
 
 # Words that describe an image subject but are not useful as search concepts.
@@ -821,114 +925,61 @@ rescue StandardError => error
   []
 end
 
-# Generate an AI image on the SERVER and save to /generated/*.png|jpg.
-# Pollinations is the sole image-generation provider. It is free to try,
-# requires no API key, and returns image bytes directly to the Ruby server.
-generate_image = lambda do |question|
-  selected_provider = image_provider_suffix.call(question)
-  provider = selected_provider[:provider]
-  prompt_question = selected_provider[:prompt]
+# Build the styled image spec for browser-side generation.
+# Returns a Hash (never image bytes): {prompt, negative_prompt, resolution,
+# guidance_scale, art_style}. The browser turns it into actual images through
+# the hosted Faith image bridge (Perchance backend), so Faith serves zero
+# provider traffic.
+build_image_spec = lambda do |question, art_style = nil|
+  prompt_question = image_provider_suffix.call(question)[:prompt]
   visual = extract_visual_prompt.call(prompt_question)
   visual = fallback_image_topic.call(question) if visual.to_s.length < 3
   visual = prompt_question.to_s[0, 1000] if visual.to_s.length < 3
   visual = enhance_visual_prompt.call(visual)
+  # Shared Art Style dropdown: wrap the enhanced visual subject in the
+  # selected style. "No style" (default) leaves the prompt untouched.
+  art_style_key = normalize_art_style.call(art_style)
+  style_negative_add = ""
+  if art_style_key != "No style"
+    styled, art_style_key, style_negative_add = apply_art_style.call(visual, art_style_key)
+    visual = styled
+  end
   # Large output is opt-in through explicit wording in the user's own request.
   # Sensitive subject matter alone never changes the output size.
-  large_resolution_requested = question.to_s.match?( /\b(?:full\s+resolution|high\s+resolution|hi[- ]?res|large[- ]scale|large\s+size|big\s+size|big\s+resolution|large\s+resolution|maximum\s+resolution|4k|8k)\b/i )
-  warn "Faith image: provider=#{provider} explicit_provider=#{selected_provider[:explicit]} large_resolution=#{large_resolution_requested} original_request=#{question.to_s[0, 500].inspect} final_visual_prompt=#{visual.inspect}"
-
-  if provider == "pollinations"
-    # Normal default stays portrait-sized. Only explicit size wording enables
-    # the larger render; aspect-ratio hints in the prompt are respected.
-    if large_resolution_requested
-      if question.to_s.match?(/\b(?:landscape|wide|horizontal)\b/i)
-        w, h = 2048, 1152
-      elsif question.to_s.match?(/\b(?:square|1:1)\b/i)
-        w, h = 1536, 1536
-      else
-        w, h = 1536, 2048
-      end
+  # Sizes are mapped onto the Perchance embed's documented resolutions.
+  resolution =
+    if question.to_s.match?(/\b(?:landscape|wide|horizontal)\b/i)
+      "768x512"
+    elsif question.to_s.match?(/\b(?:square|1:1)\b/i)
+      "768x768"
     else
-      w, h = 832, 1216
+      "512x768"
     end
-    # Remove the size-control wording from the image subject so it is not
-    # interpreted as text/content to draw.
-    visual = visual.gsub(/\b(?:in\s+)?(?:full\s+resolution|high\s+resolution|hi[- ]?res|large[- ]scale|large\s+size|big\s+size|big\s+resolution|large\s+resolution|maximum\s+resolution|4k|8k)\b/i, " ").gsub(/\s+/, " ").strip
-    prompt_esc = URI.encode_www_form_component(visual).gsub("+", "%20")
-    negative_prompt = ENV.fetch(
-      "FAITH_IMAGE_NEGATIVE_PROMPT",
-      "blurry, low quality, low resolution, out of focus, distorted face, asymmetrical eyes, malformed hands, extra fingers, missing fingers, fused fingers, extra limbs, duplicate limbs, fused body parts, bad anatomy, duplicate features, smeared details, plastic skin, text, watermark, logo, compression artifacts, oversaturated, cropped head, out of frame"
-    ).to_s.strip
-    negative_prompt_esc = URI.encode_www_form_component(negative_prompt).gsub("+", "%20")
+  warn "Faith image spec: art_style=#{art_style_key.inspect} resolution=#{resolution} original_request=#{question.to_s[0, 500].inspect} final_visual_prompt=#{visual.inspect}"
 
-    # 429s are common on the free tier (shared per-model RPM). Retry with
-    # backoff and alternate models before giving up to browser fallback.
-    models = ["flux", "turbo", "flux"]
-    waits = [0, 6, 14]
-    result = nil
-
-    models.each_with_index do |model, attempt|
-      sleep(waits[attempt]) if waits[attempt] > 0
-      seed = rand(1_000_000_000)
-      url = "#{POLLINATIONS_IMAGE_URL}/#{prompt_esc}?width=#{w}&height=#{h}&seed=#{seed}&nologo=true&model=#{model}&negative_prompt=#{negative_prompt_esc}"
-      warn "Faith pollinations: attempt #{attempt + 1}/#{models.length} model=#{model} GET #{url[0, 160]}..."
-
-      begin
-        response = nil
-        5.times do
-          response = pollinations_connection.get(url)
-          break unless [301, 302, 303, 307, 308].include?(response.status)
-          loc = response.headers["location"].to_s
-          warn "Faith pollinations: redirect #{response.status} -> #{loc[0, 200]}"
-          break if loc.empty?
-          url = loc.start_with?("http") ? loc : "https://image.pollinations.ai#{loc}"
-        end
-        warn "Faith pollinations: HTTP #{response.status} content-type=#{response.headers['content-type']} bytes=#{response.body.to_s.length}"
-
-        body = response.body.to_s
-        content_type = response.headers["content-type"].to_s.downcase
-        image_format =
-          if body.start_with?("\x89PNG\r\n\x1A\n".b)
-            "png"
-          elsif body.start_with?("\xFF\xD8\xFF".b)
-            "jpg"
-          elsif body.bytesize >= 12 && body.byteslice(0, 4) == "RIFF" && body.byteslice(8, 4) == "WEBP"
-            "webp"
-          else
-            nil
-          end
-
-        if response.success? && image_format && body.bytesize >= 5_000 &&
-           (content_type.start_with?("image/") || content_type.empty? || content_type.include?("octet-stream"))
-          filename = "faith-#{SecureRandom.hex(10)}.#{image_format}"
-          path = File.join(GENERATED_DIR, filename)
-          File.binwrite(path, body)
-          result = [{
-            url: "/generated/#{filename}",
-            title: visual[0, 120],
-            source: "Faith / Pollinations (#{model})",
-            type: "generated"
-          }]
-          break
-        else
-          warn "Faith pollinations error: HTTP #{response.status} content-type=#{content_type.inspect} bytes=#{body.bytesize}: #{body[0, 200].inspect}"
-          # Try another model after transient failures and rate limits. The
-          # bounded model list prevents an unending retry loop.
-          break unless [429, 500, 502, 503, 504].include?(response.status)
-        end
-      rescue StandardError => e
-        warn "Faith pollinations attempt #{attempt + 1} exception: #{e.class}: #{e.message}"
-      end
-    end
-
-    return result || []
-  else
-    warn "Faith image provider is unsupported: #{provider.inspect}"
-    []
+  # Remove size-control wording from the image subject so it is not
+  # interpreted as text/content to draw.
+  visual = visual.gsub(/\b(?:in\s+)?(?:full\s+resolution|high\s+resolution|hi[- ]?res|large[- ]scale|large\s+size|big\s+size|big\s+resolution|large\s+resolution|maximum\s+resolution|4k|8k)\b/i, " ").gsub(/\s+/, " ").strip
+  negative_prompt = ENV.fetch(
+    "FAITH_IMAGE_NEGATIVE_PROMPT",
+    "blurry, low quality, low resolution, out of focus, distorted face, asymmetrical eyes, malformed hands, extra fingers, missing fingers, fused fingers, extra limbs, duplicate limbs, fused body parts, bad anatomy, duplicate features, smeared details, plastic skin, text, watermark, logo, compression artifacts, oversaturated, cropped head, out of frame"
+  ).to_s.strip
+  unless style_negative_add.to_s.strip.empty? || negative_prompt.downcase.include?(style_negative_add.to_s.strip.downcase.split(",").first.to_s.strip)
+    negative_prompt = "#{negative_prompt}, #{style_negative_add}".gsub(/\s+/, " ").strip
   end
+  guidance = Integer(ENV.fetch("FAITH_IMAGE_GUIDANCE_SCALE", "7")) rescue 7
+  guidance = 7 unless (1..30).include?(guidance)
+
+  {
+    prompt: visual[0, 1800],
+    negative_prompt: negative_prompt,
+    resolution: resolution,
+    guidance_scale: guidance,
+    art_style: art_style_key
+  }
 rescue StandardError => error
-  warn "Faith image generation error: #{error.class}: #{error.message}"
-  []
+  warn "Faith image spec error: #{error.class}: #{error.message}"
+  nil
 end
 
 # Optional post-answer factual sourcing.
@@ -2438,8 +2489,8 @@ direct_qwen_chat = lambda do |question, emotion, on_delta = nil|
 end
 
 # Image-generation phrases are NEVER sent to the direct Qwen chat relay.
-# Faith's existing /api/chat generation path handles these so Pollinations
-# and the Painting expression remain intact. Keep this deliberately strict because
+# Faith's existing /api/chat generation path handles these so the Perchance
+# embed generation and the Painting expression remain intact. Keep this deliberately strict because
 # prompts such as "paint a sunset" and "generate a castle" may not contain the word
 # "image" at all.
 special_image_phrase = lambda do |question|
@@ -2988,6 +3039,9 @@ server.mount_proc "/api/imagegen" do |req, res|
     payload = JSON.parse(req.body.to_s)
     question = payload["question"].to_s.strip
     raise "Empty image-generation request." if question.empty?
+    # Shared Art Style dropdown (browser localStorage, sent as "art_style").
+    # Unknown/blank values fall back to "No style" = legacy behavior.
+    art_style_param = normalize_art_style.call(payload["art_style"])
 
     unless generate_image_request.call(question)
       json_response.call(res, 400, {
@@ -2997,44 +3051,39 @@ server.mount_proc "/api/imagegen" do |req, res|
       next
     end
 
-    warn "[Faith Image Relay] IMAGE ONLY :4567 -> image generator question=#{question[0, 120].inspect}"
+    warn "[Faith Image Relay] IMAGE ONLY :4567 -> image spec question=#{question[0, 120].inspect} art_style=#{art_style_param.inspect}"
 
-    selected_image_provider = image_provider_suffix.call(question)
-    images = generate_image.call(question)
-    image_prompt = extract_visual_prompt.call(question)
-    image_prompt = fallback_image_topic.call(question) if image_prompt.to_s.length < 3
-    image_prompt = selected_image_provider[:prompt][0, 1000] if image_prompt.to_s.length < 3
+    spec = build_image_spec.call(question, art_style_param)
 
-    if images.empty?
-      # Pollinations is the sole provider; do not hand failed requests to a
-      # different browser-side generator.
-      image_prompt = nil
+    if spec.nil?
       image_mode = "none"
-      warn "[Faith Image Relay] Pollinations failed; alternate-provider fallback is disabled."
+      warn "[Faith Image Relay] Could not build an image spec."
     else
       image_mode = "generated"
-      warn "[Faith Image Relay] Generated #{images.length} image(s) successfully."
+      warn "[Faith Image Relay] Built image spec successfully."
     end
 
     generation_available = true
 
     res["X-Faith-Server-Version"] = FAITH_SERVER_VERSION
     res["X-Faith-Qwen-Relay"] = "not-used"
-    res["X-Faith-Image-Relay"] = "direct"
+    res["X-Faith-Image-Relay"] = "faith-image-bridge"
     json_response.call(res, 200, {
-      answer: (images.empty? && selected_image_provider[:explicit] ? "Pollinations image generation failed. No API key is needed; check the Faith server log for a Pollinations network, rate-limit, or service error." : ""),
+      answer: "",
       expression: "painting",
       emotion: nil,
       session_mode: "idle",
-      images: images,
-      image_prompt: image_prompt,
-      image_resolution: ENV.fetch("FAITH_IMAGE_RESOLUTION", "832x1216"),
-      image_guidance: ENV.fetch("FAITH_IMAGE_GUIDANCE_SCALE", "7"),
+      images: [],
+      image_prompt: spec ? spec[:prompt] : nil,
+      image_negative: spec ? spec[:negative_prompt] : nil,
+      image_resolution: spec ? spec[:resolution] : ENV.fetch("FAITH_IMAGE_RESOLUTION", "512x768"),
+      image_guidance: spec ? spec[:guidance_scale] : 7,
       image_seed: -1,
       image_mode: image_mode,
       image_generation_available: generation_available,
-      image_provider: selected_image_provider[:provider],
+      image_provider: "perchance",
       image_request: true,
+      art_style: art_style_param,
       source_research_job_id: nil,
       source_research_status: "none"
     })
@@ -3502,7 +3551,7 @@ server.mount_proc "/api/chat" do |req, res|
     session_state = mutex.synchronize { { troubleshooting: troubleshooting_active, coding: coding_active } }
     # Expression selection is based on the CURRENT request. Coding is a one-shot
     # action used only for an explicit code-fix response; it must never overwrite
-    # Painting/Pollinations or ordinary chat on later requests.
+    # Painting or ordinary chat on later requests.
     expression_name = if emotion
                         emotion.to_s
                       elsif defined?(set_coding) && set_coding
@@ -3519,24 +3568,28 @@ server.mount_proc "/api/chat" do |req, res|
                         expression_name
                       end
 
-    # Generation path returns finished /generated/* URLs (server-side download,
-    # reliable). Photo path returns Wikimedia URLs. Generation never falls
-    # through to Wikimedia.
+    # Generation path returns a styled prompt spec; the BROWSER generates the
+    # actual bytes through the Perchance image-generation embed. Photo path
+    # returns Wikimedia URLs. Generation never falls through to Wikimedia.
     images = []
     image_prompt = nil
+    image_negative = nil
+    image_resolution = nil
+    image_guidance = nil
     image_mode = "none"
 
     if generated_request && !troubleshooting_request.call(question)
       warn "Faith routing: GENERATE question=#{question[0, 80].inspect}"
-      selected_image_provider = image_provider_suffix.call(question)
-      images = generate_image.call(question)
-      if images.empty?
-        # Pollinations is the only image-generation provider; do not switch to
-        # another provider when the free service is unavailable or rate-limited.
+      spec = build_image_spec.call(question, payload["art_style"])
+      if spec.nil?
         image_prompt = nil
         image_mode = "none"
-        answer = answer.to_s.rstrip + "\n\nPollinations couldn't return an image this time. No API key is needed; check the Faith server log and try again later."
+        answer = answer.to_s.rstrip + "\n\nI couldn't build an image request this time. Please try again in a moment."
       else
+        image_prompt = spec[:prompt]
+        image_negative = spec[:negative_prompt]
+        image_resolution = spec[:resolution]
+        image_guidance = spec[:guidance_scale]
         image_mode = "generated"
       end
     elsif direct_photo && !troubleshooting_request.call(question)
@@ -3589,12 +3642,13 @@ server.mount_proc "/api/chat" do |req, res|
       fix_code_available: session_state[:troubleshooting] && session_state[:code_available] && session_state[:troubleshooting_ready],
       images: images,
       image_prompt: image_prompt,
-      image_resolution: ENV.fetch("FAITH_IMAGE_RESOLUTION", "832x1216"),
-      image_guidance: ENV.fetch("FAITH_IMAGE_GUIDANCE_SCALE", "7"),
+      image_negative: image_negative,
+      image_resolution: image_resolution || ENV.fetch("FAITH_IMAGE_RESOLUTION", "512x768"),
+      image_guidance: image_guidance || 7,
       image_seed: -1,
       image_mode: image_mode,
       image_generation_available: generation_available,
-      image_provider: image_provider_suffix.call(question)[:provider],
+      image_provider: "perchance",
       image_request: direct_photo || generated_request,
       attachment: attachment && {
         name: attachment[:name],
@@ -4286,7 +4340,7 @@ puts "Faith Web AI".red
 puts "Model: #{MODEL}".red
 puts "Chat backend: local Qwen2 via #{FAITH_LOCAL_AI_URL}".red
 puts "Images: Wikimedia Commons".red
-puts "AI images: Pollinations (no API key required)".red
+puts "AI images: Perchance embed (browser-side, no API key required)".red
 puts
 puts "Open http://localhost:#{PORT}".red
 puts "Press Ctrl+C to stop.".red
