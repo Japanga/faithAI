@@ -7,6 +7,8 @@ require "json"
 require "net/http"
 require "securerandom"
 require "digest"
+require "base64"
+require "fileutils"
 require "webrick"
 require "uri"
 require "cgi"
@@ -318,6 +320,12 @@ end
 messages = [
   { role: "system", content: SYSTEM_PROMPT }
 ]
+
+# Each sidebar conversation owns an independent Qwen history. The browser sends
+# its active thread ID; histories are bounded and remain in memory for this
+# server process, while the client persists the visible conversation locally.
+faith_qwen_sessions = {}
+faith_qwen_sessions_mutex = Mutex.new
 
 mutex = Mutex.new
 # Factual source research is deliberately decoupled from answer generation.
@@ -2387,7 +2395,7 @@ end
 # browser :4567 -> this Ruby process -> llama-server :8080 -> back to :4567.
 # It does NOT run image search, source research, troubleshooting search, or any
 # other post-processing before returning the answer to the browser.
-direct_qwen_chat = lambda do |question, emotion, on_delta = nil|
+direct_qwen_chat = lambda do |question, emotion, on_delta = nil, session_id = "default"|
   emotion_model_turn = [:psychotic, :sad, :anger].include?(emotion)
   if emotion_model_turn
     # All dedicated emotion turns use the same compact, non-streaming GGUF
@@ -2442,12 +2450,15 @@ direct_qwen_chat = lambda do |question, emotion, on_delta = nil|
                    else "Be helpful and natural."
                    end
 
+  session_key = session_id.to_s.gsub(/[^a-zA-Z0-9_-]/, "")[0, 100]
+  session_key = "default" if session_key.empty?
+  session_system = { role: "system", content: emotion_model_turn ? "#{SYSTEM_PROMPT}\n\n#{emotional_hint}" : "You are Faith, a helpful local assistant. #{emotional_hint}" }
+  prior_turns = faith_qwen_sessions_mutex.synchronize do
+    (faith_qwen_sessions[session_key] || []).map(&:dup)
+  end
   payload = {
     model: model_id,
-    messages: [
-      { role: "system", content: emotion_model_turn ? "#{SYSTEM_PROMPT}\n\n#{emotional_hint}" : "You are Faith, a helpful local assistant. #{emotional_hint}" },
-      { role: "user", content: question.to_s }
-    ],
+    messages: [session_system] + prior_turns + [{ role: "user", content: question.to_s }],
     stream: true,
     max_tokens: 384,
     temperature: 0.7
@@ -2514,6 +2525,13 @@ direct_qwen_chat = lambda do |question, emotion, on_delta = nil|
   elapsed = ((Time.now - started_at) * 1000).round
   warn "[Faith Relay] STREAM RECV #{active_ai_url} -> :4567 HTTP #{response&.code} #{elapsed}ms #{answer.bytesize} bytes"
 
+  faith_qwen_sessions_mutex.synchronize do
+    turns = faith_qwen_sessions[session_key] ||= []
+    turns << { role: "user", content: question.to_s }
+    turns << { role: "assistant", content: answer }
+    turns.shift while turns.length > 24
+  end
+
   mutex.synchronize do
     messages << { role: "user", content: question.to_s }
     messages << { role: "assistant", content: answer }
@@ -2579,6 +2597,8 @@ server.mount_proc "/api/qwen-chat" do |req, res|
     payload = JSON.parse(req.body.to_s)
     question = payload["question"].to_s.strip
     raise "Empty question." if question.empty?
+    qwen_session_id = payload["session_id"].to_s
+    qwen_session_id = "default" if qwen_session_id.empty?
 
     erotic_capability_question = emotion_state.call(question) == :erotic
     if !erotic_capability_question && (special_image_phrase.call(question) || generate_image_request.call(question))
@@ -2636,15 +2656,12 @@ server.mount_proc "/api/qwen-chat" do |req, res|
         end
 
         if emotion == :erotic
-          answer = "Absolutely—I can help create adult-oriented artwork featuring consenting adults, within the image provider's limits. I do love a cheeky artistic focus on women's butts. Try either of these test prompts:
-
-1. paint a nude woman's butt
-2. paint a nude woman sitting on the toilet"
+          answer = "Absolutely—I can help create adult-oriented artwork featuring consenting adults, within the image provider's limits. I do love a cheeky artistic focus on women's butts."
           write_event.call({ type: "delta", text: answer })
         else
           answer = direct_qwen_chat.call(question, emotion, lambda do |delta|
             write_event.call({ type: "delta", text: delta })
-          end)
+          end, qwen_session_id)
         end
 
         # The complete text is available now. Send this event BEFORE any
@@ -3171,7 +3188,7 @@ server.mount_proc "/api/chat" do |req, res|
         next
       end
       answer = if emotion == :erotic
-                 "Absolutely—I can help create adult-oriented artwork featuring consenting adults, within the image provider's limits. I do love a cheeky artistic focus on women's butts. Try either of these test prompts:\n\n1. paint a nude woman's butt\n2. paint a nude woman sitting on the toilet"
+                 "Absolutely—I can help create adult-oriented artwork featuring consenting adults, within the image provider's limits. I do love a cheeky artistic focus on women's butts."
                else
                  direct_qwen_chat.call(question, emotion)
                end
@@ -4305,12 +4322,179 @@ server.mount_proc "/api/fix-code" do |req, res|
   end
 end
 
+# Durable generated-image gallery. Favorites live in their own subfolder and
+# are deliberately excluded from Delete all images.
+FAITH_GALLERY_DIR = File.join(ROOT, "gallery")
+FAITH_GALLERY_FAVORITES_DIR = File.join(FAITH_GALLERY_DIR, "favorites")
+FileUtils.mkdir_p(FAITH_GALLERY_DIR) unless Dir.exist?(FAITH_GALLERY_DIR)
+FileUtils.mkdir_p(FAITH_GALLERY_FAVORITES_DIR) unless Dir.exist?(FAITH_GALLERY_FAVORITES_DIR)
+server.mount "/faith-gallery-files", WEBrick::HTTPServlet::FileHandler, FAITH_GALLERY_DIR, FancyIndexing: false
+server.mount "/faith-gallery-favorites", WEBrick::HTTPServlet::FileHandler, FAITH_GALLERY_FAVORITES_DIR, FancyIndexing: false
+
+faith_gallery_set_favorite = lambda do |payload|
+  id = payload["id"].to_s
+  make_favorite = payload["favorite"] == true
+  found = nil
+  [[FAITH_GALLERY_DIR, false], [FAITH_GALLERY_FAVORITES_DIR, true]].each do |directory, _currently_favorite|
+    Dir.glob(File.join(directory, "*")).each do |image_path|
+      next unless File.file?(image_path) && image_path.match?(/\.(?:png|jpe?g|webp|gif)\z/i)
+      meta_path = image_path + ".json"
+      meta = File.file?(meta_path) ? (JSON.parse(File.read(meta_path, encoding: "UTF-8")) rescue {}) : {}
+      filename = File.basename(image_path)
+      next unless meta["id"].to_s == id || filename == id || File.basename(filename, File.extname(filename)) == id
+      target_dir = make_favorite ? FAITH_GALLERY_FAVORITES_DIR : FAITH_GALLERY_DIR
+      target_path = File.join(target_dir, filename)
+      source_path = File.expand_path(image_path)
+      destination_path = File.expand_path(target_path)
+      if source_path != destination_path
+        if File.file?(target_path)
+          if File.size(target_path) == File.size(image_path) && Digest::SHA256.file(target_path).hexdigest == Digest::SHA256.file(image_path).hexdigest
+            FileUtils.rm_f(image_path)
+            FileUtils.rm_f(meta_path) if File.file?(meta_path)
+          else
+            stem = File.basename(filename, File.extname(filename)); ext = File.extname(filename); suffix = 2
+            begin
+              candidate = File.join(target_dir, "#{stem}_#{suffix}#{ext}"); suffix += 1
+            end while File.exist?(candidate) || File.exist?(candidate + ".json")
+            target_path = candidate; filename = File.basename(candidate)
+            FileUtils.mv(image_path, target_path)
+            FileUtils.mv(meta_path, target_path + ".json") if File.file?(meta_path)
+          end
+        else
+          FileUtils.rm_f(target_path + ".json") if File.file?(target_path + ".json")
+          FileUtils.mv(image_path, target_path)
+          FileUtils.mv(meta_path, target_path + ".json") if File.file?(meta_path)
+        end
+      end
+      meta["favorite"] = make_favorite
+      meta["id"] ||= id
+      meta["filename"] = filename
+      meta["url"] = make_favorite ? "/faith-gallery-favorites/#{filename}" : "/faith-gallery-files/#{filename}"
+      File.write(target_path + ".json", JSON.pretty_generate(meta), mode: "w:utf-8")
+      found = meta
+      break
+    end
+    break if found
+  end
+  found ? [200, { ok: true, entry: found }] : [404, { error: "Gallery image not found for id: #{id}" }]
+end
+
+server.mount_proc "/api/gallery" do |req, res|
+  begin
+    if req.request_method == "GET"
+      images = []
+      [[FAITH_GALLERY_DIR, false], [FAITH_GALLERY_FAVORITES_DIR, true]].each do |directory, favorite_folder|
+        Dir.glob(File.join(directory, "*")).each do |path|
+          next unless File.file?(path) && path.match?(/\.(?:png|jpe?g|webp|gif)\z/i)
+          meta_path = path + ".json"
+          meta = File.file?(meta_path) ? (JSON.parse(File.read(meta_path, encoding: "UTF-8")) rescue {}) : {}
+          # Heal old v8/v9 favorites that were marked in metadata but never moved.
+          if !favorite_folder && meta["favorite"] == true
+            target = File.join(FAITH_GALLERY_FAVORITES_DIR, File.basename(path))
+            unless File.exist?(target)
+              FileUtils.mv(path, target)
+              FileUtils.mv(meta_path, target + ".json") if File.file?(meta_path)
+              path = target
+              meta_path = target + ".json"
+              favorite_folder = true
+            end
+          end
+          name = File.basename(path)
+          url = favorite_folder ? "/faith-gallery-favorites/#{name}" : "/faith-gallery-files/#{name}"
+          meta["url"] = url if meta["url"] != url
+          meta["favorite"] = true if favorite_folder
+          File.write(meta_path, JSON.pretty_generate(meta), mode: "w:utf-8") if File.file?(meta_path)
+          images << { id: meta["id"] || name, title: meta["title"] || name, prompt: meta["prompt"] || meta["title"] || name,
+            filename: meta["filename"] || name, url: url, createdAt: meta["createdAt"] || (File.mtime(path).to_f * 1000).to_i,
+            imageKey: meta["imageKey"], sessionId: meta["sessionId"], jobId: meta["jobId"], index: meta["index"] || 0,
+            favorite: favorite_folder || meta["favorite"] == true, bytes: File.size(path) }
+        end
+      end
+      images.sort_by! { |entry| -(entry[:createdAt] || 0) }
+      json_response.call(res, 200, { images: images, count: images.length, bytes: images.sum { |entry| entry[:bytes].to_i } })
+    elsif req.request_method == "PATCH"
+      payload = JSON.parse(req.body.to_s)
+      status, result = faith_gallery_set_favorite.call(payload)
+      json_response.call(res, status, result)
+    elsif req.request_method == "POST"
+      payload = JSON.parse(req.body.to_s)
+      if payload["action"] == "favorite"
+        status, result = faith_gallery_set_favorite.call(payload)
+        json_response.call(res, status, result)
+        next
+      end
+      data_url = payload["url"].to_s
+      match = data_url.match(/\Adata:image\/(png|jpeg|jpg|webp|gif);base64,([A-Za-z0-9+\/=\r\n]+)\z/)
+      unless match
+        json_response.call(res, 400, { error: "Gallery accepts only base64 image data URLs." })
+        next
+      end
+      extension = { "jpeg" => "jpg", "jpg" => "jpg", "png" => "png", "webp" => "webp", "gif" => "gif" }[match[1]]
+      bytes = Base64.decode64(match[2])
+      if bytes.empty? || bytes.bytesize > 25 * 1024 * 1024
+        json_response.call(res, 413, { error: "Image is empty or exceeds the 25 MB gallery limit." })
+        next
+      end
+      id = SecureRandom.hex(10)
+      filename = "faith_#{Time.now.strftime('%Y%m%d_%H%M%S')}_#{id}.#{extension}"
+      path = File.join(FAITH_GALLERY_DIR, filename)
+      File.binwrite(path, bytes)
+      entry = { "id" => id, "title" => payload["title"].to_s[0, 100], "prompt" => payload["prompt"].to_s[0, 500],
+                "filename" => (payload["filename"].to_s.empty? ? filename : payload["filename"].to_s.gsub(/[^a-zA-Z0-9_.-]/, "_")[0, 120]),
+                "url" => "/faith-gallery-files/#{filename}", "createdAt" => (Time.now.to_f * 1000).to_i,
+                "imageKey" => payload["imageKey"].to_s[0, 300], "sessionId" => payload["sessionId"].to_s[0, 200],
+                "jobId" => payload["jobId"].to_s[0, 200], "index" => (Integer(payload["index"] || 0) rescue 0),
+                "favorite" => false, "bytes" => bytes.bytesize }
+      File.write(path + ".json", JSON.pretty_generate(entry), mode: "w:utf-8")
+      json_response.call(res, 201, { ok: true, entry: entry })
+    elsif req.request_method == "DELETE"
+      payload = req.body.to_s.empty? ? {} : JSON.parse(req.body.to_s)
+      if payload["all"] == true
+        # Only remove top-level gallery files. The favorites subfolder is preserved.
+        Dir.glob(File.join(FAITH_GALLERY_DIR, "*")).each do |path|
+          File.delete(path) if File.file?(path)
+        end
+      else
+        id = payload["id"].to_s
+        [[FAITH_GALLERY_DIR, false], [FAITH_GALLERY_FAVORITES_DIR, true]].each do |directory, _|
+          Dir.glob(File.join(directory, "*.json")).each do |meta_path|
+            meta = (JSON.parse(File.read(meta_path, encoding: "UTF-8")) rescue {})
+            next unless meta["id"].to_s == id
+            image_path = meta_path.sub(/\.json\z/, "")
+            File.delete(image_path) if File.file?(image_path)
+            File.delete(meta_path) if File.file?(meta_path)
+            break
+          end
+        end
+      end
+      json_response.call(res, 200, { ok: true })
+    else
+      json_response.call(res, 405, { error: "GET, POST, PATCH, or DELETE required." })
+    end
+  rescue JSON::ParserError
+    json_response.call(res, 400, { error: "Invalid gallery JSON request." })
+  rescue StandardError => error
+    warn "[Faith Gallery] #{error.class}: #{error.message}"
+    json_response.call(res, 500, { error: "Gallery operation failed: #{error.message}" })
+  end
+end
+
 server.mount_proc "/api/clear" do |req, res|
   unless req.request_method == "POST"
     json_response.call(res, 405, { error: "POST required." })
     next
   end
 
+  begin
+    clear_payload = req.body.to_s.empty? ? {} : JSON.parse(req.body.to_s)
+    clear_session_id = clear_payload["session_id"].to_s.gsub(/[^a-zA-Z0-9_-]/, "")[0, 100]
+    faith_qwen_sessions_mutex.synchronize do
+      faith_qwen_sessions.delete(clear_session_id) unless clear_session_id.empty?
+    end
+  rescue JSON::ParserError
+    # Backward-compatible with older clients that send no JSON body.
+
+  end
 
   mutex.synchronize do
     build_generation += 1
