@@ -1,4 +1,4 @@
-const FAITH_CLIENT_VERSION = "95-batchupscale";
+const FAITH_CLIENT_VERSION = "106-mic-organic-cyan-pink-gradient";
 
 // Transport rule (hard-won, 2026-10-22, proven by the v6 tab test): the image
 // backend (image-generation.perchance.org) sends
@@ -929,7 +929,8 @@ const expressionImages = {
   psychotic: "/assets/psychotic.PNG",
   sad: "/assets/sad.PNG",
   anger: "/assets/anger.PNG",
-  erotic: "/assets/erotic.PNG"
+  erotic: "/assets/erotic.PNG",
+  talking: "/assets/Talking.gif"
 };
 
 const expressionNames = {
@@ -947,8 +948,33 @@ const expressionNames = {
   psychotic: "Psychotic",
   sad: "Sad",
   anger: "Anger",
-  erotic: "Erotic"
+  erotic: "Erotic",
+  talking: "Talking..."
 };
+
+// Voice may be controlled by the standalone voice module. Accept its common
+// global/local setting signals without assuming browser TTS availability means
+// the user's Faith voice feature is enabled.
+function isFaithVoiceEnabled() {
+  try {
+    if (window.faithVoiceEnabled === true || window.FAITH_VOICE_ENABLED === true) return true;
+    if (window.faithVoice && window.faithVoice.enabled === true) return true;
+    if (window.localStorage && ["true", "1", "enabled", "on"].includes(String(
+      window.localStorage.getItem("faithVoiceEnabled") ||
+      window.localStorage.getItem("faith-voice-enabled") || ""
+    ).toLowerCase())) return true;
+    const toggle = document.querySelector(
+      '#faith-voice-toggle, #voice-enabled, [name="faithVoiceEnabled"], [data-faith-voice-toggle]'
+    );
+    if (toggle && "checked" in toggle) return !!toggle.checked;
+    if (toggle && toggle.getAttribute("aria-pressed") === "true") return true;
+  } catch (_) {}
+  return false;
+}
+
+function getDefaultReplyExpression(fallback = "explanation") {
+  return isFaithVoiceEnabled() ? "talking" : fallback;
+}
 
 const expressionDetails = {
   ruby: "Ready",
@@ -1228,6 +1254,9 @@ let displayedExpressionName = null;
 let pendingExpressionName = null;
 
 function setExpression(name, customDetail = null) {
+  // While the browser voice engine is actively speaking, keep Faith's animated
+  // Talking.gif expression visible even if a streaming/status event arrives.
+  try { if (window.speechSynthesis && window.speechSynthesis.speaking) name = "talking"; } catch (_) {}
   if (!expressionImages[name]) return;
 
   // Update the caption immediately. Repeated status/token events for the same
@@ -1235,6 +1264,23 @@ function setExpression(name, customDetail = null) {
   // appear to flicker between the old and new expression.
   status.textContent = expressionNames[name];
   detail.textContent = customDetail || expressionDetails[name];
+  // Each thread remembers its own last expression, so switching conversations
+  // restores the correct behavior instead of inheriting the previous chat's face.
+  try {
+    if (typeof faithWorkspace !== "undefined" && faithWorkspace) {
+      const activeThread = faithWorkspace.threads.find(t => t.id === faithWorkspace.activeId);
+      if (activeThread) {
+        activeThread.expression = name;
+        activeThread.detail = customDetail || expressionDetails[name] || "";
+        // Keep the behavior/session mode separate from the face. For example,
+        // Painting is an expression while Coding/Build/Troubleshooting are
+        // persistent session behaviors.
+        activeThread.mode = sessionMode || "idle";
+        activeThread.behaviorState = sessionMode || "idle";
+        faithPersistThreadState(activeThread);
+      }
+    }
+  } catch (_) {}
 
   if (pendingExpressionName === name) return;
   if (displayedExpressionName === name && pendingExpressionName === null) {
@@ -1258,6 +1304,40 @@ function setExpression(name, customDetail = null) {
     expression.classList.remove("swap");
   }, 120);
 }
+
+// Track the actual voice playback call, not merely browser support. This also
+// covers the existing Read Aloud / voice module when it uses speechSynthesis.
+(function installFaithTalkingExpressionHook() {
+  try {
+    const synth = window.speechSynthesis;
+    if (!synth || synth.__faithTalkingHookInstalled || typeof synth.speak !== "function") return;
+    const originalSpeak = synth.speak.bind(synth);
+    synth.speak = function(utterance) {
+      try {
+        setExpression("talking", "Speaking...");
+        if (utterance && !utterance.__faithTalkingHooksAttached) {
+          utterance.__faithTalkingHooksAttached = true;
+          const priorEnd = utterance.onend;
+          const priorError = utterance.onerror;
+          utterance.onend = function(event) {
+            try { if (typeof priorEnd === "function") priorEnd.call(this, event); } finally {
+              if (isFaithVoiceEnabled()) setExpression("talking", "Voice enabled");
+              else setExpression("explanation");
+            }
+          };
+          utterance.onerror = function(event) {
+            try { if (typeof priorError === "function") priorError.call(this, event); } finally {
+              if (isFaithVoiceEnabled()) setExpression("talking", "Voice enabled");
+              else setExpression("explanation");
+            }
+          };
+        }
+      } catch (_) {}
+      return originalSpeak(utterance);
+    };
+    synth.__faithTalkingHookInstalled = true;
+  } catch (_) {}
+})();
 
 function stripImageMarkdown(text) {
   return String(text || "")
@@ -1333,6 +1413,22 @@ function appendImages(item, images, onGeneratedStateChange = null) {
 
     figure.appendChild(link);
     figure.appendChild(caption);
+    if (image.type === "generated") {
+      const activeThreadId = faithWorkspace.activeId || "main";
+      const bridgeJobId = String(image.jobId || image.job_id || image.session_id || "");
+      const stableImageKey = String(image.imageKey || image.image_key || (bridgeJobId ? `${activeThreadId}:${bridgeJobId}:${image.index ?? 0}` : `${activeThreadId}:${Date.now().toString(36)}:${Math.random().toString(36).slice(2, 8)}`));
+      figure.dataset.faithImageKey = stableImageKey;
+      imageNode.dataset.faithImageKey = stableImageKey;
+      link.dataset.faithImageKey = stableImageKey;
+      faithAddGalleryImage({ ...image, imageKey: stableImageKey, sessionId: activeThreadId, jobId: bridgeJobId }, faithLastUserPrompt || image.title, imageNode, link);
+      const download = document.createElement("a");
+      download.href = image.original_url || image.url;
+      download.download = faithSafeFilename(faithLastUserPrompt || image.title);
+      download.textContent = "Download image";
+      download.className = "faith-image-download";
+      download.addEventListener("click", () => { download.download = faithSafeFilename(faithLastUserPrompt || image.title); });
+      figure.appendChild(download);
+    }
     imageGrid.appendChild(figure);
   });
 
@@ -1550,6 +1646,608 @@ function scheduleCodeHighlight(root) {
   faithCodeHighlightTimers.set(root, timer);
 }
 
+
+// Faith sidebar: browser-persistent conversation threads and generated-image gallery.
+const FAITH_WORKSPACE_KEY = "faithWorkspaceV1";
+let faithWorkspace = { activeId: "main", threads: [], gallery: [] };
+let faithGalleryStorageStats = { count: 0, bytes: 0 };
+let faithGalleryFavoritesOnly = false;
+let faithWorkspaceReady = false;
+let faithLastUserPrompt = "";
+function faithLoadWorkspace() {
+  try {
+    const saved = JSON.parse(localStorage.getItem(FAITH_WORKSPACE_KEY) || "null");
+    if (saved && Array.isArray(saved.threads) && Array.isArray(saved.gallery)) faithWorkspace = saved;
+  } catch (_) {}
+  if (!faithWorkspace.threads.length) {
+    faithWorkspace.threads = [{ id: "main", title: "New conversation", html: "", updatedAt: Date.now(), mode: "chat" }];
+    faithWorkspace.activeId = "main";
+  }
+  if (!faithWorkspace.threads.some(t => t.id === faithWorkspace.activeId)) faithWorkspace.activeId = faithWorkspace.threads[0].id;
+  faithWorkspaceReady = true;
+}
+function faithPersistThreadState(thread) {
+  if (!thread || !faithWorkspaceReady) return;
+  try {
+    localStorage.setItem(FAITH_WORKSPACE_KEY, JSON.stringify(faithWorkspace));
+  } catch (_) {
+    // Fall back to the normal size-tolerant workspace save if image data makes
+    // the lightweight state write exceed the browser's storage quota.
+    try { faithSaveWorkspace(); } catch (_) {}
+  }
+}
+function faithSaveWorkspace() {
+  const thread = faithWorkspace.threads.find(t => t.id === faithWorkspace.activeId);
+  if (thread && chat) {
+    thread.html = chat.innerHTML;
+    thread.updatedAt = Date.now();
+    const firstUser = chat.querySelector(".message.you .message-text");
+    const title = firstUser ? firstUser.textContent.trim().replace(/\s+/g, " ") : "";
+    if (title) thread.title = title.slice(0, 42) + (title.length > 42 ? "…" : "");
+    thread.mode = sessionMode || "idle";
+    thread.behaviorState = sessionMode || "idle";
+    if (displayedExpressionName || pendingExpressionName) thread.expression = pendingExpressionName || displayedExpressionName;
+    if (!thread.detail && detail) thread.detail = detail.textContent || "";
+  }
+  try { localStorage.setItem(FAITH_WORKSPACE_KEY, JSON.stringify(faithWorkspace)); } catch (e) {
+    // Large image data URLs can exceed localStorage. Keep conversation text and
+    // gallery metadata instead of allowing storage limits to break the chat.
+    try {
+      const safe = JSON.parse(JSON.stringify(faithWorkspace));
+      safe.gallery = safe.gallery.slice(0, 30).map(g => ({...g, url: g.url && g.url.length > 180000 ? "" : g.url}));
+      safe.threads = safe.threads.map(t => ({...t, html: String(t.html || "").replace(/(src|href)="data:image[^"]+"/gi, '$1=""')}));
+      localStorage.setItem(FAITH_WORKSPACE_KEY, JSON.stringify(safe));
+    } catch (_) {}
+  }
+  faithRenderSidebar();
+}
+function faithSafeFilename(prompt, ext = "png") {
+  const slug = String(prompt || "faith-artwork").toLowerCase()
+    .replace(/\b(?:please|faith|generate|create|draw|paint|make|an image|a picture|an illustration)\b/g, " ")
+    .replace(/[^a-z0-9]+/g, "-").replace(/^-+|-+$/g, "").slice(0, 54) || "faith-artwork";
+  const stamp = new Date().toISOString().replace(/[:.]/g, "-").replace("T", "_").slice(0, 19);
+  return `faith_${slug}_${stamp}.${ext}`;
+}
+async function faithAddGalleryImage(image, prompt, imageNode = null, linkNode = null) {
+  if (!image || !image.url || image.type !== "generated") return;
+  const imageKey = String(image.imageKey || image.image_key || "");
+  const sessionId = String(image.sessionId || faithWorkspace.activeId || "main");
+  const jobId = String(image.jobId || image.job_id || image.session_id || "");
+  const existing = faithWorkspace.gallery.find(g => (imageKey && g.imageKey === imageKey) || (jobId && g.jobId === jobId && g.sessionId === sessionId && g.index === (image.index ?? 0)) || g.url === (image.original_url || image.url));
+  if (existing) {
+    if (existing.url && !String(existing.url).startsWith("data:image/")) {
+      if (imageNode) imageNode.src = existing.url;
+      if (linkNode) linkNode.href = existing.url;
+    }
+    return existing;
+  }
+  const url = image.original_url || image.url;
+  const entry = {
+    id: "img-" + Date.now().toString(36) + "-" + Math.random().toString(36).slice(2, 7),
+    imageKey, sessionId, jobId, index: Number.isFinite(Number(image.index)) ? Number(image.index) : 0,
+    title: String(image.title || prompt || "Faith artwork").slice(0, 100),
+    prompt: String(prompt || image.title || "Faith artwork").slice(0, 500),
+    url, filename: faithSafeFilename(prompt || image.title), createdAt: Date.now()
+  };
+  // Save the bytes to the Ruby gallery and immediately replace the chat's
+  // transient data URL with the durable gallery URL. This makes the original
+  // message reloadable even when localStorage has to drop large image data.
+  try {
+    if (String(url).startsWith("data:image/")) {
+      const response = await fetch("/api/gallery", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(entry) });
+      const saved = await response.json();
+      if (response.ok && saved && saved.entry) Object.assign(entry, saved.entry, { imageKey, sessionId, jobId, index: entry.index });
+    }
+  } catch (error) { console.warn("Faith Gallery server save failed; retaining browser copy if possible.", error); }
+  if (imageNode && entry.url && !String(entry.url).startsWith("data:image/")) imageNode.src = entry.url;
+  if (linkNode && entry.url && !String(entry.url).startsWith("data:image/")) linkNode.href = entry.url;
+  const duplicate = faithWorkspace.gallery.find(g => (imageKey && g.imageKey === imageKey) || (g.jobId && jobId && g.jobId === jobId && g.sessionId === sessionId && g.index === entry.index) || (g.url && g.url === entry.url));
+  if (duplicate) Object.assign(duplicate, entry); else faithWorkspace.gallery.unshift(entry);
+  faithWorkspace.gallery = faithWorkspace.gallery.slice(0, 200);
+  faithGalleryStorageStats.count = faithWorkspace.gallery.length;
+  faithGalleryStorageStats.bytes = faithWorkspace.gallery.reduce((sum, g) => sum + (Number(g.bytes) || 0), 0);
+  faithRenderSidebar();
+  faithSaveWorkspace();
+  faithLoadServerGallery();
+  return entry;
+}
+
+function faithRestoreThreadImages(thread) {
+  if (!thread || !chat || !Array.isArray(faithWorkspace.gallery)) return;
+  const byKey = new Map();
+  faithWorkspace.gallery.forEach(entry => {
+    if (entry.imageKey) byKey.set(entry.imageKey, entry);
+    if (entry.jobId && entry.sessionId) byKey.set(`${entry.sessionId}:${entry.jobId}:${entry.index || 0}`, entry);
+  });
+  chat.querySelectorAll("img[data-faith-image-key]").forEach(img => {
+    const key = img.dataset.faithImageKey;
+    const entry = byKey.get(key);
+    if (!entry || !entry.url) return;
+    img.src = entry.url;
+    const link = img.closest("a");
+    if (link) link.href = entry.url;
+  });
+  // Older v5 markup may not have an image key. If it still has a transient
+  // data URL, match by this conversation's session ID and stable gallery order.
+  const legacy = faithWorkspace.gallery.filter(g => (!g.sessionId || g.sessionId === thread.id) && g.url && !String(g.url).startsWith("data:image/"));
+  const used = new Set();
+  chat.querySelectorAll('.message-images img[src=""], .message-images img[src^="data:image/"], .message-images img:not([src])').forEach(img => {
+    if (img.dataset.faithImageKey) return;
+    const figure = img.closest("figure");
+    const caption = figure && figure.querySelector("figcaption");
+    const captionText = (caption && caption.textContent || "").trim();
+    // Older versions did not persist job/session IDs in the gallery. Match
+    // their saved caption/title first; only then use conversation-scoped order.
+    let entry = legacy.find(g => !used.has(g.id) && captionText && (
+      captionText === String(g.title || "").trim() ||
+      captionText.startsWith(String(g.title || "").trim()) ||
+      String(g.title || "").trim().startsWith(captionText)
+    ));
+    if (!entry) entry = legacy.find(g => !used.has(g.id) && g.sessionId === thread.id);
+    if (!entry) return;
+    used.add(entry.id);
+    img.src = entry.url;
+    img.dataset.faithImageKey = entry.imageKey || "";
+    const link = img.closest("a"); if (link) link.href = entry.url;
+  });
+}
+
+async function faithLoadServerGallery() {
+  try {
+    const response = await fetch("/api/gallery", { cache: "no-store" });
+    if (!response.ok) return;
+    const payload = await response.json();
+    if (!Array.isArray(payload.images)) return;
+    const merged = new Map();
+    faithGalleryStorageStats = { count: Number(payload.count) || payload.images.length, bytes: Number(payload.bytes) || 0 };
+    payload.images.forEach(entry => merged.set(entry.id, entry));
+    // Migrate any previously browser-only data URLs into the durable gallery folder.
+    for (const oldEntry of faithWorkspace.gallery.slice()) {
+      if (oldEntry.url && String(oldEntry.url).startsWith("data:image/")) {
+        try {
+          const response = await fetch("/api/gallery", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(oldEntry) });
+          const saved = await response.json();
+          if (response.ok && saved && saved.entry) { merged.set(saved.entry.id, saved.entry); continue; }
+        } catch (_) {}
+      }
+      if (!merged.has(oldEntry.id)) merged.set(oldEntry.id, oldEntry);
+    }
+    faithWorkspace.gallery = Array.from(merged.values()).sort((a,b) => (b.createdAt || 0) - (a.createdAt || 0)).slice(0, 200);
+    const activeThread = faithWorkspace.threads.find(t => t.id === faithWorkspace.activeId);
+    faithRestoreThreadImages(activeThread);
+    faithRenderSidebar(); faithSaveWorkspace();
+  } catch (_) {}
+}
+
+function faithArchiveThread(thread) {
+  if (!thread) return;
+  const holder = document.createElement("div");
+  holder.innerHTML = String(thread.html || "");
+  const messages = Array.from(holder.querySelectorAll(".message"));
+  const lines = [];
+  lines.push(`Faith Chat Archive: ${thread.title || "New conversation"}`);
+  lines.push(`Archived: ${new Date().toLocaleString()}`);
+  lines.push("");
+  messages.forEach((message) => {
+    const isUser = message.classList.contains("you") || message.classList.contains("user");
+    const speaker = isUser ? "User" : "Faith";
+    const textNode = message.querySelector(".message-text");
+    let body = (textNode ? (textNode.innerText || textNode.textContent) : "").replace(/\u00a0/g, " ").trim();
+    const attachmentNames = Array.from(message.querySelectorAll(".message-attachment-name")).map(n => n.textContent.trim()).filter(Boolean);
+    if (attachmentNames.length) body += (body ? "\n" : "") + "Attachments: " + attachmentNames.join(", ");
+    const imageCount = message.querySelectorAll(".message-image img, img[data-faith-image-key], .message-images img").length;
+    if (imageCount) body += (body ? "\n" : "") + `[${imageCount} image${imageCount === 1 ? "" : "s"} attached]`;
+    if (body) {
+      // Keep archives compact and readable, matching the requested transcript format.
+      lines.push(`[${speaker}]: ${body}`);
+      lines.push("");
+    }
+  });
+  const content = lines.join("\n").trimEnd() + "\n";
+  const blob = new Blob([content], { type: "text/plain;charset=utf-8" });
+  const url = URL.createObjectURL(blob);
+  const link = document.createElement("a");
+  const safeTitle = String(thread.title || "faith-chat").replace(/[\\/:*?"<>|]+/g, "-").replace(/\s+/g, "-").slice(0, 60) || "faith-chat";
+  link.href = url; link.download = `${safeTitle}-archive.txt`; link.style.display = "none";
+  document.body.appendChild(link); link.click(); link.remove();
+  setTimeout(() => URL.revokeObjectURL(url), 1000);
+}
+
+function faithShowContextMenu(x, y, items) {
+  document.querySelectorAll(".faith-context-menu").forEach(node => node.remove());
+  const menu = document.createElement("div"); menu.className = "faith-context-menu"; menu.setAttribute("role", "menu");
+  menu.style.left = `${Math.max(6, Math.min(x, window.innerWidth - 190))}px`;
+  menu.style.top = `${Math.max(6, Math.min(y, window.innerHeight - 100))}px`;
+  items.forEach(item => {
+    const button = document.createElement("button"); button.type = "button"; button.textContent = item.label;
+    button.className = item.danger ? "danger" : ""; button.setAttribute("role", "menuitem");
+    button.addEventListener("click", () => { menu.remove(); item.action(); }); menu.appendChild(button);
+  });
+  document.body.appendChild(menu);
+  const close = (event) => { if (!menu.contains(event.target)) { menu.remove(); document.removeEventListener("pointerdown", close, true); document.removeEventListener("keydown", keyClose, true); } };
+  const keyClose = (event) => { if (event.key === "Escape") { menu.remove(); document.removeEventListener("pointerdown", close, true); document.removeEventListener("keydown", keyClose, true); } };
+  setTimeout(() => { document.addEventListener("pointerdown", close, true); document.addEventListener("keydown", keyClose, true); }, 0);
+}
+
+function faithRenderSidebar() {
+  const list = document.getElementById("faith-thread-list");
+  const gallery = document.getElementById("faith-gallery-list");
+  if (list) {
+    list.innerHTML = "";
+    faithWorkspace.threads.slice().sort((a,b) => b.updatedAt-a.updatedAt).forEach(thread => {
+      const b = document.createElement("button");
+      b.type = "button"; b.className = "faith-thread" + (thread.id === faithWorkspace.activeId ? " active" : "");
+      b.textContent = thread.title || "New conversation"; b.title = b.textContent;
+      b.addEventListener("click", () => faithSwitchThread(thread.id));
+      b.addEventListener("contextmenu", (event) => {
+        event.preventDefault();
+        faithShowContextMenu(event.clientX, event.clientY, [
+          { label: "Archive chat (.txt)", action: () => faithArchiveThread(thread) },
+          { label: "Delete chat", danger: true, action: () => {
+            if (confirm(`Delete the conversation “${thread.title || "New conversation"}”? This cannot be undone.`)) faithDeleteThread(thread.id);
+          } }
+        ]);
+      });
+      b.title = `${b.textContent} — right-click for options`;
+      list.appendChild(b);
+    });
+  }
+  if (gallery) {
+    gallery.innerHTML = "";
+    const storage = document.getElementById("faith-gallery-storage");
+    if (storage) storage.textContent = `${faithGalleryStorageStats.count || faithWorkspace.gallery.length} images · ${faithFormatBytes(faithGalleryStorageStats.bytes)} used in gallery folder`;
+    const visibleGallery = faithGalleryFavoritesOnly ? faithWorkspace.gallery.filter(entry => entry.favorite) : faithWorkspace.gallery;
+    faithWorkspace.gallery.forEach(entry => {
+      if (faithGalleryFavoritesOnly && !entry.favorite) return;
+      const card = document.createElement("div"); card.className = "faith-gallery-card";
+      if (entry.url) {
+        const img = document.createElement("img"); img.src = entry.url; img.alt = entry.title || "Faith artwork"; img.loading = "lazy";
+        card.appendChild(img);
+        const star = document.createElement("button"); star.type = "button"; star.className = "faith-gallery-star" + (entry.favorite ? " favorited" : "");
+        star.textContent = entry.favorite ? "★" : "☆"; star.title = entry.favorite ? "Remove favorite" : "Favorite image"; star.setAttribute("aria-label", star.title);
+        star.addEventListener("click", (event) => {
+          event.preventDefault(); event.stopPropagation();
+          const nextFavorite = !entry.favorite;
+          star.disabled = true;
+          star.classList.toggle("favorited", nextFavorite);
+          star.textContent = nextFavorite ? "★" : "☆";
+          star.title = nextFavorite ? "Remove favorite" : "Favorite image";
+          faithSetGalleryFavorite(entry.id, nextFavorite).finally(() => { star.disabled = false; });
+        });
+        card.appendChild(star);
+        card.addEventListener("contextmenu", (event) => {
+          event.preventDefault();
+          faithShowContextMenu(event.clientX, event.clientY, [
+            { label: "View image", action: () => { const win = window.open(entry.url, "_blank", "noopener,noreferrer"); if (win) win.opener = null; } },
+            { label: "Download image", action: () => { const a = document.createElement("a"); a.href = entry.url; a.download = entry.filename || faithSafeFilename(entry.title); a.click(); } },
+            { label: entry.favorite ? "Remove favorite" : "Favorite image ★", action: () => faithSetGalleryFavorite(entry.id, !entry.favorite) },
+            { label: "Delete image", danger: true, action: () => { if (confirm(`Permanently delete “${entry.title || "this image"}” from gallery storage and remove its chat message?`)) faithDeleteGalleryImage(entry.id); } }
+          ]);
+        });
+        card.title = "Right-click for image options; tap the star to favorite";
+      } else {
+        const missing = document.createElement("div"); missing.className = "faith-gallery-missing"; missing.textContent = "Image preview unavailable after storage limit"; card.appendChild(missing);
+        card.addEventListener("contextmenu", (event) => { event.preventDefault(); faithShowContextMenu(event.clientX, event.clientY, [
+          { label: entry.favorite ? "Remove favorite" : "Favorite image ★", action: () => faithSetGalleryFavorite(entry.id, !entry.favorite) },
+          { label: "Delete image record", danger: true, action: () => { if (confirm(`Permanently delete “${entry.title || "this image"}”?`)) faithDeleteGalleryImage(entry.id); } }
+        ]); });
+      }
+      const label = document.createElement("div"); label.className = "faith-gallery-title"; label.textContent = entry.title || "Faith artwork"; card.appendChild(label);
+      gallery.appendChild(card);
+    });
+  }
+}
+function faithSwitchThread(id) {
+  if (id === faithWorkspace.activeId) return;
+  faithSaveWorkspace();
+  const next = faithWorkspace.threads.find(t => t.id === id);
+  if (!next) return;
+  faithWorkspace.activeId = id;
+  chat.innerHTML = next.html || "";
+  faithBindReplayButtons(chat);
+  faithRestoreThreadImages(next);
+  sessionMode = (next.behaviorState || next.mode) && (next.behaviorState || next.mode) !== "chat" ? (next.behaviorState || next.mode) : "idle";
+  const expressionName = next.expression || (sessionMode === "troubleshooting" ? "troubleshooting" : sessionMode === "coding" ? "coding" : sessionMode === "build" ? "build" : "ruby");
+  setExpression(expressionName, next.detail || (sessionMode === "idle" ? "Conversation restored" : `Restored ${sessionMode} session`));
+  faithSaveWorkspace();
+}
+function faithDeleteThread(id) {
+  const wasActive = id === faithWorkspace.activeId;
+  faithWorkspace.threads = faithWorkspace.threads.filter(t => t.id !== id);
+  if (!faithWorkspace.threads.length) faithWorkspace.threads.push({ id: "thread-" + Date.now().toString(36), title: "New conversation", html: "", updatedAt: Date.now(), mode: "chat", expression: "ruby" });
+  if (wasActive) {
+    faithWorkspace.activeId = faithWorkspace.threads[0].id;
+    const active = faithWorkspace.threads[0];
+    chat.innerHTML = active.html || "";
+    faithBindReplayButtons(chat);
+    faithRestoreThreadImages(active);
+    sessionMode = (active.behaviorState || active.mode) && (active.behaviorState || active.mode) !== "chat" ? (active.behaviorState || active.mode) : "idle";
+    setExpression(active.expression || "ruby", "Conversation restored");
+    fetch("/api/clear", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ session_id: id }) }).catch(() => {});
+  }
+  faithSaveWorkspace();
+}
+function faithDeleteAllThreads() {
+  if (!confirm("Delete ALL saved conversations? This cannot be undone.")) return;
+  const oldIds = faithWorkspace.threads.map(t => t.id);
+  faithWorkspace.threads = [{ id: "thread-" + Date.now().toString(36), title: "New conversation", html: "", updatedAt: Date.now(), mode: "chat", expression: "ruby" }];
+  faithWorkspace.activeId = faithWorkspace.threads[0].id;
+  chat.innerHTML = ""; sessionMode = "idle";
+  oldIds.forEach(id => fetch("/api/clear", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ session_id: id }) }).catch(() => {}));
+  setExpression("ruby", "All conversations deleted"); faithSaveWorkspace();
+}
+function faithFormatBytes(value) {
+  const bytes = Math.max(0, Number(value) || 0);
+  if (bytes < 1024) return `${bytes} B`;
+  if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(1)} KB`;
+  if (bytes < 1024 * 1024 * 1024) return `${(bytes / (1024 * 1024)).toFixed(2)} MB`;
+  return `${(bytes / (1024 * 1024 * 1024)).toFixed(2)} GB`;
+}
+async function faithSetGalleryFavorite(id, favorite) {
+  const entry = faithWorkspace.gallery.find(g => g.id === id);
+  const oldUrl = entry && entry.url ? String(entry.url) : "";
+  const response = await fetch("/api/gallery", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ action: "favorite", id, favorite: !!favorite }) }).catch(error => ({ __networkError: error && error.message ? error.message : String(error) }));
+  if (!response || response.__networkError || !response.ok) {
+    let reason = response && response.__networkError ? `Network request failed: ${response.__networkError}` : "The gallery server could not move the image.";
+    try { if (response && response.json) { const body = await response.json(); if (body && body.error) reason = body.error; } } catch (_) {}
+    alert(`Could not ${favorite ? "add this image to" : "remove this image from"} favorites: ${reason}`);
+    faithRenderSidebar();
+    return;
+  }
+  const payload = await response.json().catch(() => ({}));
+  if (entry) {
+    entry.favorite = !!favorite;
+    if (payload.entry && payload.entry.url) entry.url = payload.entry.url;
+  }
+  const newUrl = entry && entry.url ? String(entry.url) : "";
+  if (oldUrl && newUrl && oldUrl !== newUrl) {
+    // Keep saved conversations and the currently visible chat pointed at the
+    // image after its file moves between gallery/ and gallery/favorites/.
+    for (const thread of faithWorkspace.threads) {
+      if (typeof thread.html === "string") thread.html = thread.html.split(oldUrl).join(newUrl);
+    }
+    chat.querySelectorAll("img, a[href]").forEach(node => {
+      if (node.matches("img") && node.getAttribute("src") === oldUrl) node.setAttribute("src", newUrl);
+      if (node.matches("a[href]") && node.getAttribute("href") === oldUrl) node.setAttribute("href", newUrl);
+    });
+  }
+  faithSaveWorkspace(); faithRenderSidebar();
+}
+function faithRemoveImageMessageFromHtml(html, entry) {
+  const holder = document.createElement("div"); holder.innerHTML = html || "";
+  const key = String(entry.imageKey || "");
+  const url = String(entry.url || "");
+  const affected = new Set();
+  holder.querySelectorAll(".message-image, .message-images img, figure").forEach(node => {
+    const image = node.matches("img") ? node : node.querySelector("img");
+    if (!image) return;
+    const parentFigure = image.closest("figure") || node.closest("figure");
+    const matchesKey = key && (image.dataset.faithImageKey === key || (parentFigure && parentFigure.dataset.faithImageKey === key));
+    const src = image.getAttribute("src") || "";
+    const matchesUrl = url && (src === url || src.endsWith(url) || (image.closest("a") && ((image.closest("a").getAttribute("href") || "") === url)));
+    if (matchesKey || matchesUrl) {
+      const message = image.closest(".message");
+      if (message) affected.add(message); else if (parentFigure) parentFigure.remove();
+    }
+  });
+  affected.forEach(message => message.remove());
+  return holder.innerHTML;
+}
+function faithRemoveDeletedImageFromChats(entry) {
+  faithWorkspace.threads.forEach(thread => { thread.html = faithRemoveImageMessageFromHtml(thread.html, entry); });
+  if (chat) {
+    const active = faithWorkspace.threads.find(t => t.id === faithWorkspace.activeId);
+    if (active) chat.innerHTML = active.html || "";
+    faithBindReplayButtons(chat);
+  }
+}
+async function faithDeleteGalleryImage(id) {
+  const entry = faithWorkspace.gallery.find(item => item.id === id);
+  if (!entry) return;
+  const response = await fetch("/api/gallery", { method: "DELETE", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ id }) }).catch(() => null);
+  if (!response || !response.ok) { alert("The image could not be removed from gallery storage, so it has not been removed from the chat."); return; }
+  faithRemoveDeletedImageFromChats(entry);
+  faithWorkspace.gallery = faithWorkspace.gallery.filter(item => item.id !== id);
+  faithLoadServerGallery(); faithSaveWorkspace();
+}
+async function faithDeleteAllGalleryImages() {
+  if (!confirm("Permanently delete ALL image files from Faith's gallery folder and remove their chat messages? This cannot be undone.")) return;
+  const response = await fetch("/api/gallery", { method: "DELETE", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ all: true }) }).catch(() => null);
+  if (!response || !response.ok) { alert("Gallery files could not be deleted. No chat messages were removed."); return; }
+  // Remove every generated-image message, including entries older than the UI's
+  // display cap, after the server confirms that the files were hard-deleted.
+  faithWorkspace.threads.forEach(thread => {
+    const holder = document.createElement("div"); holder.innerHTML = thread.html || "";
+    holder.querySelectorAll(".message").forEach(message => {
+      const refs = Array.from(message.querySelectorAll("img[data-faith-image-key], img[src*='/faith-gallery-files/'], a[href*='/faith-gallery-files/']"));
+      const belongsToDeletedGallery = refs.some(node => {
+        const ref = String(node.getAttribute("src") || node.getAttribute("href") || "");
+        return ref.includes("/faith-gallery-files/") || (node.hasAttribute("data-faith-image-key") && !ref.includes("/faith-gallery-favorites/"));
+      });
+      if (belongsToDeletedGallery) message.remove();
+    });
+    thread.html = holder.innerHTML;
+  });
+  const active = faithWorkspace.threads.find(t => t.id === faithWorkspace.activeId);
+  if (active && chat) { chat.innerHTML = active.html || ""; faithBindReplayButtons(chat); }
+  // Keep favorites in the local cache too; otherwise the gallery loader's
+  // offline-migration fallback could resurrect deleted non-favorite images.
+  faithWorkspace.gallery = faithWorkspace.gallery.filter(item => item.favorite);
+  faithSaveWorkspace(); faithRenderSidebar(); faithLoadServerGallery();
+}
+function faithNewThread() {
+  faithSaveWorkspace();
+  const thread = { id: "thread-" + Date.now().toString(36), title: "New conversation", html: "", updatedAt: Date.now(), mode: "idle", behaviorState: "idle", expression: "ruby", detail: "Ready" };
+  faithWorkspace.threads.unshift(thread);
+  faithWorkspace.activeId = thread.id;
+  chat.innerHTML = "";
+  sessionMode = "idle";
+  setExpression("ruby", "Ready");
+  faithSaveWorkspace();
+}
+function faithInitSidebar() {
+  faithLoadWorkspace();
+  const active = faithWorkspace.threads.find(t => t.id === faithWorkspace.activeId);
+  if (active) {
+    if (active.html) chat.innerHTML = active.html;
+    faithBindReplayButtons(chat);
+    faithRestoreThreadImages(active);
+    // Restore both the saved behavior/session and the exact final expression.
+    // The expression is not inferred from the most recent prompt because a
+    // chat may have ended in Painting, Sad, Explanation, or another behavior.
+    sessionMode = active.behaviorState || active.mode || "idle";
+    if (sessionMode === "chat") sessionMode = "idle";
+    const fallbackExpression = sessionMode === "troubleshooting" ? "troubleshooting"
+      : sessionMode === "coding" ? "coding"
+      : sessionMode === "build" ? "build" : "ruby";
+    const savedExpression = active.expression || fallbackExpression;
+    setExpression(savedExpression, active.detail || (sessionMode === "idle" ? "Ready" : `Restored ${sessionMode} session`));
+  }
+  faithLoadServerGallery();
+  faithRenderSidebar();
+  const newButton = document.getElementById("faith-new-chat");
+  if (newButton) newButton.addEventListener("click", faithNewThread);
+  const deleteChatsButton = document.getElementById("faith-delete-all-chats");
+  if (deleteChatsButton) deleteChatsButton.addEventListener("click", faithDeleteAllThreads);
+  const deleteGalleryButton = document.getElementById("faith-delete-all-gallery");
+  if (deleteGalleryButton) deleteGalleryButton.addEventListener("click", faithDeleteAllGalleryImages);
+  // Voice-button styling is attached to Faith's existing mic control below.
+  // Do not call the removed standalone push-to-talk initializer here.
+  const favoritesFilter = document.getElementById("faith-gallery-favorites-filter");
+  if (favoritesFilter) favoritesFilter.addEventListener("click", () => {
+    faithGalleryFavoritesOnly = !faithGalleryFavoritesOnly;
+    favoritesFilter.setAttribute("aria-pressed", faithGalleryFavoritesOnly ? "true" : "false");
+    favoritesFilter.textContent = faithGalleryFavoritesOnly ? "★ Showing favorites · Show all" : "☆ Favorites only";
+    faithRenderSidebar();
+  });
+  const tabChat = document.getElementById("faith-sidebar-chats");
+  const tabGallery = document.getElementById("faith-sidebar-gallery");
+  const chatsPanel = document.getElementById("faith-chats-panel");
+  const galleryPanel = document.getElementById("faith-gallery-panel");
+  if (tabChat && tabGallery && chatsPanel && galleryPanel) {
+    tabChat.addEventListener("click", () => { chatsPanel.hidden = false; galleryPanel.hidden = true; tabChat.classList.add("active"); tabGallery.classList.remove("active"); });
+    tabGallery.addEventListener("click", () => { chatsPanel.hidden = true; galleryPanel.hidden = false; tabGallery.classList.add("active"); tabChat.classList.remove("active"); });
+  }
+}
+function faithDecorateExistingMicButton() {
+  // Decorate Faith's existing voice/microphone button beside Clear. Never create
+  // a replacement button or change the voice module's click/listening behavior.
+  const clear = document.getElementById("clear");
+  const composerRow = clear && clear.parentElement;
+  const selectors = [
+    '#mic', '#mic-button', '#voice-button', '#voice-input', '#record-button',
+    '#talk-to-faith', '#talkToFaith', '#faith-mic', '#faith-voice-button',
+    '[data-action="microphone"]', '[data-action="mic"]', '[data-action*="voice" i]',
+    '[aria-label*="microphone" i]', '[title*="microphone" i]',
+    '[aria-label*="voice input" i]', '[title*="voice input" i]',
+    '[aria-label*="talk to faith" i]', '[title*="talk to faith" i]'
+  ];
+  let button = null;
+  // First look specifically beside Clear so another voice-related control elsewhere
+  // in the page can never be decorated by mistake.
+  for (const selector of selectors) {
+    let matches = [];
+    try { matches = Array.from((composerRow || document).querySelectorAll(selector)); } catch (_) {}
+    button = matches.find(node => node instanceof HTMLButtonElement && !node.disabled && node.id !== "send" && node.id !== "clear" && node.id !== "upload");
+    if (button) break;
+  }
+  // If the voice module places its control elsewhere, fall back to semantic matching.
+  if (!button) for (const selector of selectors) {
+    let matches = [];
+    try { matches = Array.from(document.querySelectorAll(selector)); } catch (_) {}
+    button = matches.find(node => node instanceof HTMLButtonElement && !node.disabled && node.id !== "send" && node.id !== "clear" && node.id !== "upload");
+    if (button) break;
+  }
+  // Some older voice modules inject an icon-only button with no accessible label.
+  // In that case, select the closest button to Clear in the same row whose text,
+  // title, class, or id indicates voice/microphone behavior.
+  if (!button && composerRow && clear) {
+    const rowButtons = Array.from(composerRow.querySelectorAll("button"));
+    const clearIndex = rowButtons.indexOf(clear);
+    const candidates = rowButtons.filter(node => node !== clear && node.id !== "send" && node.id !== "upload" && !node.disabled);
+    candidates.sort((a, b) => Math.abs(rowButtons.indexOf(a) - clearIndex) - Math.abs(rowButtons.indexOf(b) - clearIndex));
+    button = candidates.find(node => {
+      const label = `${node.id} ${node.className} ${node.getAttribute("aria-label") || ""} ${node.title || ""} ${node.textContent || ""}`.toLowerCase();
+      return /mic|voice|speech|talk|record|listen/.test(label);
+    }) || null;
+  }
+  if (!button || button.dataset.faithMicDecorated === "true") return;
+  button.dataset.faithMicDecorated = "true";
+  button.classList.add("faith-mic-glow");
+  button.setAttribute("data-faith-voice-control", "true");
+  ["t1", "t2", "t3", "t4", "t5", "t6", "t7", "t8", "t9", "t10", "t11", "t12"].forEach(cls => {
+    const tendril = document.createElement("span");
+    tendril.className = `faith-mic-tendril ${cls}`;
+    tendril.setAttribute("aria-hidden", "true");
+    button.appendChild(tendril);
+  });
+  const syncListening = () => {
+    const active = button.getAttribute("aria-pressed") === "true" ||
+      button.classList.contains("listening") || button.classList.contains("recording") ||
+      button.dataset.listening === "true" || button.getAttribute("data-state") === "listening";
+    button.classList.toggle("faith-mic-listening", active);
+  };
+  new MutationObserver(syncListening).observe(button, { attributes: true, attributeFilter: ["aria-pressed", "class", "data-listening", "data-state"] });
+  syncListening();
+}
+
+document.addEventListener("DOMContentLoaded", () => {
+  faithInitSidebar();
+  faithDecorateExistingMicButton();
+  [250, 750, 1500, 3000].forEach(delay => setTimeout(faithDecorateExistingMicButton, delay));
+  if (document.body && !window.faithMicDecorationObserver) {
+    window.faithMicDecorationObserver = new MutationObserver(faithDecorateExistingMicButton);
+    window.faithMicDecorationObserver.observe(document.body, { childList: true, subtree: true });
+  }
+});
+
+function faithEnsureReadAloudButton(item) {
+  if (!item) return;
+  const textNode = item.querySelector(".message-text");
+  if (!textNode) return;
+  let speak = item.querySelector(".faith-speak-button");
+  if (!speak) {
+    speak = document.createElement("button");
+    speak.type = "button";
+    speak.className = "faith-speak-button";
+    item.appendChild(speak);
+  }
+  // innerHTML/localStorage restores markup but not addEventListener handlers.
+  // Rebind every restored button instead of treating its presence as complete.
+  speak.type = "button";
+  speak.textContent = "↻ Replay voice";
+  speak.setAttribute("aria-label", "Replay this Faith reply aloud");
+  speak.title = "Replay this reply on demand; it does not start automatic reading.";
+  if (speak.dataset.faithReplayHooked === "true") return;
+  speak.dataset.faithReplayHooked = "true";
+  speak.addEventListener("click", () => {
+    const spokenText = (textNode.innerText || textNode.textContent || "").trim();
+    if (!spokenText) return;
+    // Prefer the installed Faith voice module if it exposes a replay/speak
+    // hook. Otherwise use browser speech synthesis as a dependable fallback.
+    const voice = window.faithVoice;
+    const customReplay = window.faithReplayReply || window.replayFaithReply || (voice && (voice.replay || voice.speak || voice.speakText));
+    if (typeof customReplay === "function") {
+      try {
+        const result = customReplay.call(voice || window, spokenText, item);
+        if (result !== false) { speak.textContent = "↻ Replaying…"; setTimeout(() => { speak.textContent = "↻ Replay voice"; }, 1800); return; }
+      } catch (error) { console.warn("Faith voice replay hook failed; using browser voice.", error); }
+    }
+    if (!("speechSynthesis" in window) || !("SpeechSynthesisUtterance" in window)) { alert("Replay voice is not supported by this browser."); return; }
+    window.speechSynthesis.cancel();
+    const utterance = new SpeechSynthesisUtterance(spokenText);
+    utterance.lang = navigator.language || "en-US"; utterance.rate = 1; utterance.pitch = 1; utterance.volume = 1;
+    speak.textContent = "⏸ Replaying…";
+    utterance.onend = utterance.onerror = () => { speak.textContent = "↻ Replay voice"; };
+    window.speechSynthesis.speak(utterance);
+  });
+}
+
+function faithBindReplayButtons(root = chat) {
+  if (!root) return;
+  root.querySelectorAll(".message.ai").forEach(faithEnsureReadAloudButton);
+}
+
 function appendMessage(speaker, text, type, images = [], options = {}) {
   const item = document.createElement("div");
   item.className = `message ${type}`;
@@ -1565,11 +2263,13 @@ function appendMessage(speaker, text, type, images = [], options = {}) {
   textNode.innerHTML = formatFaithMessage(text);
   scheduleCodeHighlight(textNode);
   item.appendChild(textNode);
+  if (type === "ai") faithEnsureReadAloudButton(item);
 
   appendImages(item, images, options.onGeneratedStateChange);
 
   chat.appendChild(item);
   chat.scrollTop = chat.scrollHeight;
+  try { faithSaveWorkspace(); } catch (_) {}
   return item;
 }
 
@@ -1852,6 +2552,7 @@ async function consumeQwenStream(response, qwenRelayLoading) {
 
   const updateStreamingText = () => {
     if (!faithItem) return;
+    faithEnsureReadAloudButton(faithItem);
     const textNode = faithItem.querySelector(".message-text");
     if (!textNode) return;
     // During the live stream, keep the raw text visible so Markdown cannot
@@ -1901,15 +2602,16 @@ async function consumeQwenStream(response, qwenRelayLoading) {
       answer = typeof event.answer === "string" ? event.answer : answer;
       ensureFaithItem();
       updateStreamingText();
+      faithEnsureReadAloudButton(faithItem);
 
       // Qwen is finished at this exact point. Do not wait for Wikimedia or
       // source research before returning Faith to her normal Explanation mode.
       // Those are post-message enrichments and must never control her expression.
-      const completedExpression = [
+      const completedExpression = isFaithVoiceEnabled() ? "talking" : ([
         "robotic", "psychotic", "sad", "anger", "erotic",
         "greeting", "thinking", "explanation", "confusion",
         "troubleshooting", "observing", "coding", "build"
-      ].includes(event.expression) ? event.expression : "explanation";
+      ].includes(event.expression) ? event.expression : getDefaultReplyExpression());
       if (event.session_mode === "build") sessionMode = "build";
       else if (event.session_mode === "coding") sessionMode = "coding";
       else if (event.session_mode === "troubleshooting") sessionMode = "troubleshooting";
@@ -1989,6 +2691,7 @@ async function consumeQwenStream(response, qwenRelayLoading) {
     qwenRelayLoading.stop();
   }
 
+  if (faithItem) faithEnsureReadAloudButton(faithItem);
   return { data: finalData, faithItem };
 }
 
@@ -2847,6 +3550,7 @@ async function submitQuestion() {
 
   const question = input.value.trim();
   if (!question) return;
+  faithLastUserPrompt = question;
   const turnId = ++turnSequence;
 
   input.value = "";
@@ -3038,7 +3742,7 @@ async function submitQuestion() {
         "Accept": "application/json"
       },
       signal: chatController.signal,
-      body: JSON.stringify({ question, art_style: getFaithArtStyle() })
+      body: JSON.stringify({ question, art_style: getFaithArtStyle(), session_id: faithWorkspace.activeId || "main" })
     });
 
     // If a stale server/proxy does not know /api/qwen-chat, immediately retry
@@ -3052,7 +3756,7 @@ async function submitQuestion() {
           "Accept": "application/json"
         },
         signal: chatController.signal,
-        body: JSON.stringify({ question, art_style: getFaithArtStyle() })
+        body: JSON.stringify({ question, art_style: getFaithArtStyle(), session_id: faithWorkspace.activeId || "main" })
       });
     }
 
@@ -3194,9 +3898,9 @@ async function submitQuestion() {
             ? "troubleshooting"
             : (isTroubleshootingPrompt
               ? "troubleshooting"
-              : (["greeting", "thinking", "explanation", "confusion", "troubleshooting", "observing"].includes(data.expression)
+              : (["greeting", "thinking", "confusion", "troubleshooting", "observing"].includes(data.expression)
                 ? data.expression
-                : "explanation")))));
+                : getDefaultReplyExpression("explanation"))))));
       setExpression(normalExpression);
     }
 
@@ -3281,7 +3985,10 @@ async function submitQuestion() {
               url: img.dataUrl,
               title: paintTitle + (paintTotal > 1 ? ` (${paintedOk}/${paintTotal})` : "") + (dims ? ` — ${dims}` : ""),
               source: `Faith / ${img.provider || "Perchance"} (${paintStyleName})${img.upscaled ? " • upscaled" : ""}`,
-              type: "generated"
+              type: "generated",
+              jobId: img.jobId || img.job_id || "",
+              sessionId: faithWorkspace.activeId || "main",
+              index: idx
             }]);
             chat.scrollTop = chat.scrollHeight;
             if (paintedOk + paintedFailed < paintTotal) {
@@ -3305,7 +4012,10 @@ async function submitQuestion() {
             url: summary.url,
             title: `${paintTitle} — ${dims}`,
             source: `Faith / ${summary.provider || "Perchance"} (${paintStyleName})`,
-            type: "generated"
+            type: "generated",
+            jobId: summary.jobId || summary.job_id || "",
+            sessionId: faithWorkspace.activeId || "main",
+            index: 0
           }]);
           chat.scrollTop = chat.scrollHeight;
         }
@@ -3426,6 +4136,9 @@ clear.addEventListener("click", async () => {
   }
   setBusy(true);
   chat.innerHTML = "";
+  const currentThread = faithWorkspace.threads.find(t => t.id === faithWorkspace.activeId);
+  if (currentThread) { currentThread.html = ""; currentThread.title = "New conversation"; currentThread.updatedAt = Date.now(); }
+  faithSaveWorkspace();
   sessionMode = "idle";
   troubleshootingDiagnosisReady = false;
   pendingCodeFile = null;
@@ -3436,7 +4149,8 @@ clear.addEventListener("click", async () => {
     const response = await fetch("/api/clear", {
       method: "POST",
       cache: "no-store",
-      headers: { "Cache-Control": "no-cache" }
+      headers: { "Content-Type": "application/json", "Cache-Control": "no-cache" },
+      body: JSON.stringify({ session_id: faithWorkspace.activeId || "main" })
     });
     if (!response.ok) throw new Error(`HTTP ${response.status}`);
     setExpression("ruby", "Ready — conversation and Build context cleared");
@@ -3449,6 +4163,18 @@ clear.addEventListener("click", async () => {
   }
 });
 
-setExpression("ruby", "Ready");
 input.focus();
 console.info("[Faith] frontend " + FAITH_CLIENT_VERSION + " ready; bridge: " + getFaithImageBridgeUrl());
+
+window.addEventListener("beforeunload", () => {
+  try {
+    const active = faithWorkspace.threads.find(t => t.id === faithWorkspace.activeId);
+    if (active) {
+      active.expression = pendingExpressionName || displayedExpressionName || active.expression || "ruby";
+      active.detail = detail ? (detail.textContent || active.detail || "") : (active.detail || "");
+      active.mode = sessionMode || "idle";
+      active.behaviorState = sessionMode || "idle";
+    }
+    faithSaveWorkspace();
+  } catch (_) {}
+});

@@ -8,6 +8,122 @@
   <style>
     /* Faith layout: keep the character/expression area fixed on screen.
        Only the conversation message pane is allowed to scroll. */
+    /* GPT/Qwen-style navigation rail: threads + generated-art gallery. */
+    body { display: flex; align-items: stretch; background: #080b12; }
+    .faith-sidebar {
+      width: 252px; min-width: 252px; min-height: 100vh; box-sizing: border-box;
+      padding: 16px 12px; background: #090d15; border-right: 1px solid rgba(255,255,255,.09);
+      color: #eef3ff; display: flex; flex-direction: column; gap: 12px;
+    }
+    .faith-sidebar-brand { font-size: 1.05rem; letter-spacing: .14em; font-weight: 800; padding: 4px 8px; }
+    .faith-sidebar-tabs { display: flex; gap: 6px; }
+    .faith-sidebar button { font: inherit; cursor: pointer; color: #dbe5f7; background: transparent; border: 1px solid transparent; border-radius: 9px; padding: 9px 10px; text-align: left; }
+    .faith-sidebar button:hover { background: rgba(255,255,255,.06); }
+    .faith-sidebar button.active { background: rgba(98,132,210,.18); border-color: rgba(119,157,255,.24); }
+    #faith-new-chat { width: 100%; border-color: rgba(255,255,255,.13); background: rgba(255,255,255,.035); }
+    .faith-sidebar-heading { color: #91a0b9; font-size: .75rem; text-transform: uppercase; letter-spacing: .09em; padding: 8px 8px 3px; }
+    #faith-thread-list { display: flex; flex-direction: column; gap: 3px; overflow-y: auto; max-height: 42vh; }
+    .faith-thread { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-size: .85rem !important; }
+    #faith-gallery-list { display: grid; grid-template-columns: 1fr 1fr; gap: 8px; overflow-y: auto; max-height: 72vh; }
+    .faith-gallery-card { min-width: 0; padding: 6px; border: 1px solid rgba(255,255,255,.09); border-radius: 10px; background: rgba(255,255,255,.025); }
+    .faith-gallery-card img { width: 100%; aspect-ratio: 1; object-fit: cover; display: block; border-radius: 6px; }
+    .faith-gallery-title { font-size: .72rem; line-height: 1.25; margin-top: 5px; overflow-wrap: anywhere; color: #dce5f6; }
+    .faith-gallery-favorite { position: absolute; top: 9px; right: 9px; color: #ffd66b; font-size: 1.1rem; text-shadow: 0 0 10px rgba(255,214,107,.65); pointer-events: none; }
+    .faith-gallery-card { position: relative; }
+    .faith-gallery-star { position: absolute !important; top: 7px; right: 7px; z-index: 2; padding: 1px 5px !important; min-width: 28px; border: 1px solid rgba(255,255,255,.24) !important; background: rgba(5,9,18,.82) !important; border-radius: 99px !important; color: #d8e4f8 !important; font-size: 1.2rem !important; line-height: 1.25 !important; text-align: center !important; }
+    .faith-gallery-star.favorited { color: #ffd66b !important; border-color: rgba(255,214,107,.48) !important; text-shadow: 0 0 9px rgba(255,214,107,.6); }
+    .faith-gallery-storage { color: #aebbd2; font-size: .74rem; line-height: 1.4; padding: 4px 8px 8px; overflow-wrap: anywhere; }
+    /* Neon styling lives on the existing microphone control; the moving aura is behind it. */
+    .faith-mic-glow {
+      position: relative !important; isolation: isolate !important; overflow: visible !important;
+      z-index: 1 !important; border: 1px solid rgba(0,235,255,.78) !important;
+      background: rgba(7,14,24,.92) !important;
+      box-shadow: 0 0 7px rgba(0,235,255,.58), 0 0 15px rgba(0,235,255,.24) !important;
+      animation: faith-mic-edge 2.8s ease-in-out infinite !important;
+    }
+    .faith-mic-glow::before {
+      content: ""; position: absolute; z-index: -1; pointer-events: none;
+      inset: -9px; border-radius: inherit;
+      background: linear-gradient(110deg, #00eaff 0%, #00eaff 24%, #ee65d8 76%, #ee65d8 100%);
+      background-size: 220% 100%; filter: blur(11px); opacity: .76;
+      animation: faith-mic-aura 3.6s ease-in-out infinite alternate;
+    }
+    .faith-mic-tendril {
+      position: absolute !important; display: block !important; z-index: 20 !important;
+      width: 25px !important; height: 27px !important; border: 0 !important;
+      border-radius: 0 !important; padding: 0 !important; margin: 0 !important;
+      pointer-events: none !important; background: transparent !important;
+      box-shadow: none !important; opacity: .92; overflow: visible !important;
+      will-change: transform, opacity;
+    }
+    .faith-mic-tendril::before {
+      content: ""; position: absolute; inset: 1px 9px 1px 9px;
+      border-left: 2px solid #00eaff; border-radius: 48% 52% 62% 38%;
+      box-shadow: -1px 0 5px rgba(0,234,255,.7), 1px 0 5px rgba(238,101,216,.4);
+      transform-origin: 50% 90%;
+      animation: faith-tendril-writhe 2.25s ease-in-out infinite;
+    }
+    .faith-mic-tendril::after {
+      content: ""; position: absolute; inset: 3px 5px 0 6px;
+      border-right: 2px solid #ee65d8; border-radius: 35% 65% 44% 56%;
+      filter: drop-shadow(0 0 4px rgba(238,101,216,.8));
+      transform-origin: 50% 85%; animation: faith-tendril-writhe-alt 2.9s ease-in-out infinite;
+    }
+    /* Shorter, denser tendrils: four above and four below, spread across both sides. */
+    .faith-mic-tendril.t1 { left: 8% !important; top: -24px !important; transform-origin: 50% 100%; animation: faith-tendril-drift-1 3.1s ease-in-out infinite; }
+    .faith-mic-tendril.t2 { left: 31% !important; top: -24px !important; transform-origin: 50% 100%; animation: faith-tendril-drift-2 3.7s ease-in-out infinite; }
+    .faith-mic-tendril.t3 { right: 31% !important; top: -24px !important; transform-origin: 50% 100%; animation: faith-tendril-drift-3 2.8s ease-in-out infinite; }
+    .faith-mic-tendril.t4 { right: 8% !important; top: -24px !important; transform-origin: 50% 100%; animation: faith-tendril-drift-4 3.5s ease-in-out infinite; }
+    .faith-mic-tendril.t5 { left: 8% !important; bottom: -24px !important; transform-origin: 50% 0%; animation: faith-tendril-drift-3 3.3s ease-in-out infinite; }
+    .faith-mic-tendril.t6 { left: 31% !important; bottom: -24px !important; transform-origin: 50% 0%; animation: faith-tendril-drift-4 3.9s ease-in-out infinite; }
+    .faith-mic-tendril.t7 { right: 31% !important; bottom: -24px !important; transform-origin: 50% 0%; animation: faith-tendril-drift-1 3.0s ease-in-out infinite; }
+    .faith-mic-tendril.t8 { right: 8% !important; bottom: -24px !important; transform-origin: 50% 0%; animation: faith-tendril-drift-2 3.6s ease-in-out infinite; }
+    /* Small side tendrils emerge horizontally; the left pair stay tucked close so they don't cover Clear. */
+    .faith-mic-tendril.t9, .faith-mic-tendril.t10, .faith-mic-tendril.t11, .faith-mic-tendril.t12 {
+      width: 23px !important; height: 20px !important;
+    }
+    /* Side tendrils use the same paired, glowing strands as the top/bottom ones,
+       but their travel is deliberately bounded so they cannot reach Clear or the next field. */
+    .faith-mic-tendril.t9 { left: -7px !important; top: 0 !important; transform-origin: 100% 50%; animation: faith-tendril-side-left 3.1s ease-in-out infinite; }
+    .faith-mic-tendril.t10 { left: -7px !important; bottom: 0 !important; transform-origin: 100% 50%; animation: faith-tendril-side-left 3.7s ease-in-out infinite reverse; }
+    .faith-mic-tendril.t11 { right: -11px !important; top: 0 !important; transform-origin: 0% 50%; animation: faith-tendril-side-right 3.4s ease-in-out infinite; }
+    .faith-mic-tendril.t12 { right: -11px !important; bottom: 0 !important; transform-origin: 0% 50%; animation: faith-tendril-side-right 2.8s ease-in-out infinite reverse; }
+    .faith-mic-tendril.t9::before, .faith-mic-tendril.t10::before, .faith-mic-tendril.t11::before, .faith-mic-tendril.t12::before { inset: 1px 8px 1px 8px; }
+    .faith-mic-tendril.t9::after, .faith-mic-tendril.t10::after, .faith-mic-tendril.t11::after, .faith-mic-tendril.t12::after { inset: 3px 5px 0 6px; }
+    .faith-mic-tendril.t2::before, .faith-mic-tendril.t6::before { animation-delay: -.8s; border-left-color: #ee65d8; border-right-color: #00eaff; }
+    .faith-mic-tendril.t3::before, .faith-mic-tendril.t7::before { animation-delay: -1.2s; }
+    .faith-mic-tendril.t4::after, .faith-mic-tendril.t8::after { animation-delay: -1.6s; }
+    @keyframes faith-mic-aura { from { background-position: 0% 50%; } to { background-position: 100% 50%; } }
+    @keyframes faith-mic-edge { 0%,100% { box-shadow: 0 0 7px rgba(0,235,255,.55), 0 0 15px rgba(0,235,255,.22); } 50% { box-shadow: 0 0 9px rgba(238,101,216,.55), 0 0 18px rgba(238,101,216,.25); } }
+    @keyframes faith-tendril-writhe { 0%,100% { transform: rotate(-24deg) skewX(-16deg) scaleY(.8); border-radius: 70% 30% 62% 38%; } 28% { transform: rotate(18deg) skewX(22deg) scaleY(1.12); border-radius: 25% 75% 38% 62%; } 61% { transform: rotate(-42deg) skewX(8deg) scaleY(.92); border-radius: 42% 58% 72% 28%; } 82% { transform: rotate(34deg) skewX(-24deg) scaleY(1.18); border-radius: 68% 32% 28% 72%; } }
+    @keyframes faith-tendril-writhe-alt { 0%,100% { transform: rotate(22deg) skewX(12deg) scaleY(.88); } 36% { transform: rotate(-32deg) skewX(-22deg) scaleY(1.15); } 68% { transform: rotate(38deg) skewX(18deg) scaleY(.72); } }
+    @keyframes faith-tendril-side-left { 0%,100% { transform: rotate(-12deg) skewY(-15deg) scaleX(.82) scaleY(.88); } 28% { transform: rotate(18deg) skewY(18deg) scaleX(1.08) scaleY(1.05); } 56% { transform: rotate(-24deg) skewY(9deg) scaleX(.92) scaleY(.82); } 80% { transform: rotate(9deg) skewY(-12deg) scaleX(1.02) scaleY(1.12); } }
+    @keyframes faith-tendril-side-right { 0%,100% { transform: rotate(13deg) skewY(12deg) scaleX(.84) scaleY(.9); } 27% { transform: rotate(-17deg) skewY(-17deg) scaleX(1.1) scaleY(1.08); } 55% { transform: rotate(25deg) skewY(8deg) scaleX(.91) scaleY(.82); } 79% { transform: rotate(-8deg) skewY(14deg) scaleX(1.03) scaleY(1.12); } }
+    @keyframes faith-tendril-drift-1 { 0%,100% { transform: rotate(-13deg) skewX(-8deg) scaleY(.88); } 23% { transform: rotate(17deg) skewX(17deg) scaleY(1.05); } 51% { transform: rotate(-26deg) skewX(-19deg) scaleY(.94); } 77% { transform: rotate(9deg) skewX(12deg) scaleY(1.14); } }
+    @keyframes faith-tendril-drift-2 { 0%,100% { transform: rotate(16deg) skewX(11deg) scaleY(.91); } 29% { transform: rotate(-19deg) skewX(-14deg) scaleY(1.13); } 54% { transform: rotate(28deg) skewX(18deg) scaleY(.82); } 81% { transform: rotate(-7deg) skewX(-6deg) scaleY(1.06); } }
+    @keyframes faith-tendril-drift-3 { 0%,100% { transform: rotate(12deg) skewX(9deg) scaleY(.9); } 21% { transform: rotate(-23deg) skewX(-16deg) scaleY(1.12); } 48% { transform: rotate(8deg) skewX(20deg) scaleY(.83); } 73% { transform: rotate(-15deg) skewX(-8deg) scaleY(1.16); } }
+    @keyframes faith-tendril-drift-4 { 0%,100% { transform: rotate(-17deg) skewX(-10deg) scaleY(.86); } 26% { transform: rotate(24deg) skewX(16deg) scaleY(1.12); } 57% { transform: rotate(-9deg) skewX(-20deg) scaleY(.93); } 79% { transform: rotate(19deg) skewX(7deg) scaleY(1.08); } }
+    .faith-mic-glow.faith-mic-listening { border-color: #ee65d8 !important; box-shadow: 0 0 12px rgba(238,101,216,.72), 0 0 20px rgba(0,234,255,.4) !important; }
+    .faith-gallery-download, .faith-image-download { display: inline-block; margin-top: 6px; font-size: .76rem; color: #9dbbff; text-decoration: none; }
+    .faith-gallery-missing { font-size: .7rem; color: #9ba7bd; padding: 12px 3px; }
+    .faith-danger-button { width: 100%; color: #ffb5b5 !important; border-color: rgba(255,95,95,.25) !important; font-size: .78rem !important; }
+    .faith-context-hint { text-transform: none; letter-spacing: 0; opacity: .65; }
+    .faith-context-menu { position: fixed; z-index: 99999; min-width: 170px; padding: 5px; border: 1px solid rgba(255,255,255,.16); border-radius: 9px; background: #151b28; box-shadow: 0 10px 30px rgba(0,0,0,.45); }
+    .faith-context-menu button { display: block; width: 100%; padding: 8px 10px !important; border: 0 !important; border-radius: 6px !important; font-size: .82rem !important; }
+    .faith-context-menu button.danger { color: #ffaaaa !important; }
+    .faith-context-menu button:hover { background: rgba(255,255,255,.1) !important; }
+    .faith-gallery-delete { display: inline-block; margin: 6px 0 0 8px; padding: 4px 7px !important; font-size: .72rem !important; color: #ffb5b5 !important; border: 1px solid rgba(255,95,95,.25) !important; }
+    .faith-speak-button { display: inline-block; margin: 8px 0; padding: 5px 9px; border: 1px solid rgba(0,229,255,.28); border-radius: 7px; background: rgba(0,229,255,.07); color: #8ff4ff; font-size: .78rem; cursor: pointer; }
+    .faith-speak-button:hover { background: rgba(0,229,255,.15); }
+    .app-shell { flex: 1 1 auto; min-width: 0; width: auto; max-width: none; }
+    @media (max-width: 760px) {
+      body { display: block; }
+      .faith-sidebar { width: 100%; min-width: 0; min-height: 0; padding: 8px; border-right: 0; border-bottom: 1px solid rgba(255,255,255,.09); }
+      .faith-sidebar-brand { display: none; }
+      #faith-thread-list { max-height: 150px; }
+      #faith-gallery-list { grid-template-columns: repeat(4, minmax(0,1fr)); max-height: 220px; }
+      .app-shell { width: 100%; }
+    }
     html, body {
       min-height: 100%;
       height: auto;
@@ -361,6 +477,26 @@
   <script src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.11.1/highlight.min.js"></script>
 </head>
 <body>
+  <aside class="faith-sidebar" aria-label="Faith conversations and gallery">
+    <div class="faith-sidebar-brand">FAITH</div>
+    <div class="faith-sidebar-tabs">
+      <button id="faith-sidebar-chats" class="active" type="button">Chats</button>
+      <button id="faith-sidebar-gallery" type="button">Gallery</button>
+    </div>
+    <div id="faith-chats-panel">
+      <button id="faith-new-chat" type="button">＋ New chat</button>
+      <button id="faith-delete-all-chats" class="faith-danger-button" type="button">Delete all chats</button>
+      <div class="faith-sidebar-heading">Recent conversations <span class="faith-context-hint">(right-click to delete)</span></div>
+      <nav id="faith-thread-list" aria-label="Recent conversations"></nav>
+    </div>
+    <div id="faith-gallery-panel" hidden>
+      <div class="faith-sidebar-heading">Generated images</div>
+      <button id="faith-delete-all-gallery" class="faith-danger-button" type="button">Delete all images</button>
+      <div id="faith-gallery-storage" class="faith-gallery-storage" aria-live="polite">Checking gallery storage…</div>
+      <button id="faith-gallery-favorites-filter" type="button" aria-pressed="false">☆ Favorites only</button>
+      <div id="faith-gallery-list"></div>
+    </div>
+  </aside>
   <main class="app-shell">
     <section class="topbar">
       <div>
@@ -415,7 +551,7 @@
     <div class="hint">Press Enter to send, Shift+Enter for a new line</div>
   </main>
 
-  <script src="/app.js?v=95-batchupscale"></script>
+  <script src="/app.js?v=110-organic-side-tendrils"></script>
   <script>
   (() => {
   "use strict";
