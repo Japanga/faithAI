@@ -1098,7 +1098,8 @@ const expressionImages = {
   sad: "/assets/sad.PNG",
   anger: "/assets/anger.PNG",
   erotic: "/assets/erotic.PNG",
-  talking: "/assets/Talking.gif"
+  talking: "/assets/Talking.gif",
+  hazard: "/assets/hazard.PNG"
 };
 
 const expressionNames = {
@@ -1118,7 +1119,8 @@ const expressionNames = {
   sad: "Sad",
   anger: "Anger",
   erotic: "Erotic",
-  talking: "Talking..."
+  talking: "Talking...",
+  hazard: "Hazard"
 };
 
 // Voice may be controlled by the standalone voice module. Accept its common
@@ -1468,6 +1470,15 @@ function setExpression(name, customDetail = null) {
   expressionSwapTimer = window.setTimeout(() => {
     expression.src = expressionImages[name];
     expression.alt = `${expressionNames[name]} expression`;
+    if (name === "hazard") {
+      expression.onerror = function() {
+        expression.onerror = null;
+        expression.src = expressionImages.troubleshooting;
+        expression.alt = "Hazard warning expression";
+      };
+    } else {
+      expression.onerror = null;
+    }
     displayedExpressionName = name;
     pendingExpressionName = null;
     expressionSwapTimer = null;
@@ -1507,6 +1518,32 @@ function setExpression(name, customDetail = null) {
     };
     synth.__faithTalkingHookInstalled = true;
   } catch (_) {}
+})();
+
+// Some voice modules play audio directly instead of calling speechSynthesis.speak.
+// Watch actual playback and keep the Talking.gif expression active while audio is running.
+(function installFaithPlaybackWatcher() {
+  if (window.__faithPlaybackWatcher) return;
+  window.__faithPlaybackWatcher = true;
+  window.setInterval(() => {
+    // Actual playback is the source of truth. Some voice modules do not expose
+    // a reliable enabled flag, so never gate the Talking expression on that flag.
+    let speaking = false;
+    try { speaking = !!(window.speechSynthesis && window.speechSynthesis.speaking); } catch (_) {}
+    if (!speaking) {
+      const audios = Array.from(document.querySelectorAll("audio, video"));
+      speaking = audios.some(media => !media.paused && !media.ended && !media.muted && media.currentTime > 0);
+    }
+    if (speaking) {
+      if (displayedExpressionName !== "talking" && pendingExpressionName !== "talking") setExpression("talking", "Speaking...");
+    } else if (displayedExpressionName === "talking" && !pendingExpressionName) {
+      // Restore the chat's expression after speech ends rather than leaving Talking stuck.
+      const active = (typeof faithWorkspace !== "undefined" && faithWorkspace.threads)
+        ? faithWorkspace.threads.find(thread => thread.id === faithWorkspace.activeId) : null;
+      const restore = active && active.expression ? active.expression : "explanation";
+      if (restore !== "talking") setExpression(restore, active && active.detail ? active.detail : "");
+    }
+  }, 200);
 })();
 
 function stripImageMarkdown(text) {
@@ -1962,6 +1999,73 @@ function faithRestoreThreadImages(thread) {
   });
 }
 
+let faithHazardPromptShown = false;
+function faithOpenStorageLimitConversation(bytes) {
+  const title = "Storage limit";
+  let thread = faithWorkspace.threads.find(item => item.storageLimitConversation === true || item.title === title);
+  const used = faithFormatBytes(bytes);
+  const reply = `⚠️ **Gallery storage limit reached**\n\nFaith's generated-image folder is using **${used}**, which has reached the **100 MB warning threshold**.\n\nHere are your options:\n- **Clear gallery images now:** removes non-favorite generated images and preserves favorites.\n- **Keep everything for now:** leaves the gallery unchanged, and this warning will appear again the next time the page is refreshed while storage remains at or above 100 MB.\n- **Protect important images:** mark images as favorites before clearing; favorites are preserved.\n\nYou can manage images from the Gallery panel. I'll keep this notice in the dedicated **Storage limit** conversation so it doesn't interrupt your other chats.`;
+  if (!thread) {
+    thread = { id: "storage-limit", title, html: "", updatedAt: Date.now(), mode: "idle", behaviorState: "idle", expression: "hazard", detail: "Gallery storage limit reached", storageLimitConversation: true };
+    faithWorkspace.threads.unshift(thread);
+  }
+  thread.title = title;
+  thread.storageLimitConversation = true;
+  thread.expression = "hazard";
+  thread.detail = `Gallery storage warning · ${used}`;
+  // Refresh the single notice instead of adding duplicate first posts every reload.
+  const holder = document.createElement("div");
+  holder.innerHTML = thread.html || "";
+  let post = holder.querySelector(".message.ai.storage-limit-notice");
+  if (!post) {
+    post = document.createElement("div");
+    post.className = "message ai storage-limit-notice";
+    const speaker = document.createElement("span"); speaker.className = "speaker"; speaker.textContent = "Faith";
+    const body = document.createElement("div"); body.className = "message-text";
+    post.append(speaker, body); holder.appendChild(post);
+  }
+  const body = post.querySelector(".message-text");
+  if (body) body.innerHTML = formatFaithMessage(reply);
+  thread.html = holder.innerHTML;
+  thread.updatedAt = Date.now();
+  faithWorkspace.activeId = thread.id;
+  if (typeof chat !== "undefined" && chat) {
+    chat.innerHTML = thread.html;
+    faithBindReplayButtons(chat);
+    sessionMode = "idle";
+    setExpression("hazard", thread.detail);
+  }
+  faithSaveWorkspace();
+  faithRenderSidebar();
+}
+function faithCheckGalleryHazard(bytes) {
+  const threshold = 100 * 1024 * 1024;
+  if (Number(bytes) < threshold || faithHazardPromptShown) return;
+  faithHazardPromptShown = true;
+  faithOpenStorageLimitConversation(bytes);
+  setExpression("hazard", "Gallery storage warning");
+  const used = faithFormatBytes(bytes);
+  const clearNow = confirm(`HAZARD: Faith's generated-image folder has reached ${used} (100 MB warning threshold).\n\nPress OK to clear non-favorite gallery images now. Favorite images will be preserved. Press Cancel to keep the gallery unchanged. The Storage limit conversation contains the options.`);
+  if (clearNow) {
+    fetch("/api/gallery", { method: "DELETE", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ all: true }) })
+      .then(async response => {
+        if (!response.ok) { let body = {}; try { body = await response.json(); } catch (_) {} throw new Error(body.error || "Gallery cleanup failed."); }
+        faithWorkspace.gallery = faithWorkspace.gallery.filter(item => item.favorite);
+        faithWorkspace.threads.forEach(thread => {
+          const holder = document.createElement("div"); holder.innerHTML = thread.html || "";
+          holder.querySelectorAll(".message").forEach(message => {
+            if (Array.from(message.querySelectorAll("img, a[href]")).some(node => String(node.getAttribute("src") || node.getAttribute("href") || "").includes("/faith-gallery-files/"))) message.remove();
+          });
+          thread.html = holder.innerHTML;
+        });
+        faithSaveWorkspace(); faithRenderSidebar(); faithLoadServerGallery();
+        setExpression("hazard", "Gallery cleanup complete; favorites preserved");
+      }).catch(error => alert(`Faith could not clear the gallery: ${error.message}`));
+  } else {
+    setExpression("hazard", "Storage limit warning remains in its conversation");
+  }
+}
+
 async function faithLoadServerGallery() {
   try {
     const response = await fetch("/api/gallery", { cache: "no-store" });
@@ -1970,6 +2074,7 @@ async function faithLoadServerGallery() {
     if (!Array.isArray(payload.images)) return;
     const merged = new Map();
     faithGalleryStorageStats = { count: Number(payload.count) || payload.images.length, bytes: Number(payload.bytes) || 0 };
+    faithCheckGalleryHazard(faithGalleryStorageStats.bytes);
     payload.images.forEach(entry => merged.set(entry.id, entry));
     // Migrate any previously browser-only data URLs into the durable gallery folder.
     for (const oldEntry of faithWorkspace.gallery.slice()) {
@@ -2212,17 +2317,22 @@ function faithRemoveDeletedImageFromChats(entry) {
   }
 }
 async function faithDeleteGalleryImage(id) {
-  const entry = faithWorkspace.gallery.find(item => item.id === id);
-  if (!entry) return;
-  const response = await fetch("/api/gallery", { method: "DELETE", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ id }) }).catch(() => null);
-  if (!response || !response.ok) { alert("The image could not be removed from gallery storage, so it has not been removed from the chat."); return; }
+  const entry = faithWorkspace.gallery.find(item => String(item.id) === String(id) || String(item.filename || "") === String(id) || String(item.url || "").split(/[?#]/, 1)[0].split("/").pop() === String(id));
+  if (!entry) { alert("This gallery item is stale. Refresh the gallery and try deleting it again."); await faithLoadServerGallery(); return; }
+  const deleteId = entry.id || entry.filename || String(entry.url || "").split(/[?#]/, 1)[0].split("/").pop();
+  const response = await fetch("/api/gallery", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ action: "delete", id: deleteId, filename: entry.filename, url: entry.url }) }).catch(() => null);
+  if (!response || !response.ok) {
+    let reason = "The image could not be removed from gallery storage, so it has not been removed from the chat.";
+    try { const body = await response.json(); if (body && body.error) reason = body.error; } catch (_) {}
+    alert(reason); return;
+  }
   faithRemoveDeletedImageFromChats(entry);
   faithWorkspace.gallery = faithWorkspace.gallery.filter(item => item.id !== id);
   faithLoadServerGallery(); faithSaveWorkspace();
 }
 async function faithDeleteAllGalleryImages() {
   if (!confirm("Permanently delete ALL image files from Faith's gallery folder and remove their chat messages? This cannot be undone.")) return;
-  const response = await fetch("/api/gallery", { method: "DELETE", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ all: true }) }).catch(() => null);
+  const response = await fetch("/api/gallery", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ action: "delete", all: true }) }).catch(() => null);
   if (!response || !response.ok) { alert("Gallery files could not be deleted. No chat messages were removed."); return; }
   // Remove every generated-image message, including entries older than the UI's
   // display cap, after the server confirms that the files were hard-deleted.
@@ -2256,6 +2366,7 @@ function faithNewThread() {
   faithSaveWorkspace();
 }
 function faithInitSidebar() {
+  faithRenameExistingAutoReadLabel();
   faithLoadWorkspace();
   const active = faithWorkspace.threads.find(t => t.id === faithWorkspace.activeId);
   if (active) {
@@ -2297,6 +2408,21 @@ function faithInitSidebar() {
   if (tabChat && tabGallery && chatsPanel && galleryPanel) {
     tabChat.addEventListener("click", () => { chatsPanel.hidden = false; galleryPanel.hidden = true; tabChat.classList.add("active"); tabGallery.classList.remove("active"); });
     tabGallery.addEventListener("click", () => { chatsPanel.hidden = true; galleryPanel.hidden = false; tabGallery.classList.add("active"); tabChat.classList.remove("active"); });
+  }
+}
+// Rename the existing cyan voice toggle label only if the voice module has
+// already created it. This does not create, replace, or wire any checkbox.
+function faithRenameExistingAutoReadLabel() {
+  const rename = () => {
+    const label = document.querySelector('label[for="faith-cyan-voice-toggle"]');
+    const span = label && label.querySelector("span");
+    if (span && span.textContent.trim() !== "Auto-read?") span.textContent = "Auto-read?";
+  };
+  rename();
+  if (document.body && !window.__faithAutoReadLabelObserver) {
+    const observer = new MutationObserver(rename);
+    observer.observe(document.body, { childList: true, subtree: true });
+    window.__faithAutoReadLabelObserver = observer;
   }
 }
 function faithDecorateExistingMicButton() {
