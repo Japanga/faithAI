@@ -1,4 +1,4 @@
-const FAITH_CLIENT_VERSION = "106-mic-organic-cyan-pink-gradient";
+const FAITH_CLIENT_VERSION = "107-mic-organic-cyan-pink-gradient-editing";
 
 // Transport rule (hard-won, 2026-10-22, proven by the v6 tab test): the image
 // backend (image-generation.perchance.org) sends
@@ -914,6 +914,173 @@ function generateFaithImageViaBridge(job, opts) {
 function generateFaithImage(job, opts) {
   return generateFaithImageViaBridge(job, opts);
 }
+
+// ---- Faith image-Editing transport (recreate tab) ----
+// Uploaded images skip the local GGUF vision pipeline entirely: the image is
+// posted as a faith-recreate-job to the faith-img-2-img generator, which
+// auto-analyzes it and posts the description back. "Recreate in style" reuses
+// the same tab with generate:true + the CURRENT frontend Art Style value.
+// Tab-only (no hidden frame): like painting, generation needs top-level
+// *.perchance.org ancestry for the image backend's framing policy, and the
+// tab is opened in the Upload click gesture so popups can't block it.
+const FAITH_RECREATE_URL_DEFAULT = "https://null.perchance.org/faith-img-2-img";
+const FAITH_RECREATE_URL_KEY = "faithRecreateUrl";
+
+function getFaithRecreateUrl() {
+  try {
+    const saved = (localStorage.getItem(FAITH_RECREATE_URL_KEY) || "").trim();
+    if (saved && /^https:\/\/[^/]+\.perchance\.org\//.test(saved)) return saved;
+  } catch (_) {}
+  return FAITH_RECREATE_URL_DEFAULT;
+}
+
+let faithRecreatePopup = null;
+let faithRecreateReady = false;
+const faithRecreatePending = {};
+const faithRecreateReadyWaiters = [];
+let faithRecreateListening = false;
+let recreateOpenedThisTurn = false;
+
+function installFaithRecreateListener() {
+  if (faithRecreateListening) return;
+  faithRecreateListening = true;
+  window.addEventListener("message", (event) => {
+    if (typeof event.origin !== "string" || !/\.perchance\.org$/.test(event.origin)) return;
+    const msg = event.data;
+    if (!msg || typeof msg !== "object") return;
+    if (msg.type === "faith-recreate-ready") {
+      // The recreate page runs nested in its wrapper tab, so the READY source
+      // is the inner frame, never the tab window — accept it whenever our tab
+      // is open (same rule as the painter tab).
+      try {
+        if (!faithRecreatePopup || faithRecreatePopup.closed) return;
+      } catch (_) { return; }
+      faithRecreateReady = true;
+      const waiters = faithRecreateReadyWaiters.splice(0, faithRecreateReadyWaiters.length);
+      waiters.forEach((fn) => { try { fn(); } catch (_) {} });
+      return;
+    }
+    if (typeof msg.jobId !== "string" || !msg.jobId) return;
+    const entry = faithRecreatePending[msg.jobId];
+    if (!entry) return;
+    if (msg.type === "faith-recreate-analyzed") {
+      // A generate:true job also emits analyzed on its way to finished; only
+      // the analysis leg settles on it.
+      if (entry.mode === "generate") return;
+      delete faithRecreatePending[msg.jobId];
+      if (!msg.description) entry.reject(new Error("The editor returned an empty description."));
+      else entry.resolve({ description: String(msg.description), style: String(msg.style || "") });
+    } else if (msg.type === "faith-recreate-finished") {
+      delete faithRecreatePending[msg.jobId];
+      if (!msg.dataUrl) entry.reject(new Error("The editor returned an empty result."));
+      else entry.resolve({ url: msg.dataUrl, description: String(msg.description || ""), style: String(msg.style || "") });
+    } else if (msg.type === "faith-recreate-error") {
+      delete faithRecreatePending[msg.jobId];
+      entry.reject(new Error(String(msg.message || "The editor reported a failure.")));
+    }
+  });
+}
+
+// Must run inside a user gesture (Upload click, Recreate-button click) or the
+// browser blocks the tab as a popup. Reuses one named tab across turns.
+function openFaithRecreatePopup() {
+  try {
+    if (faithRecreatePopup && !faithRecreatePopup.closed) return faithRecreatePopup;
+  } catch (_) {}
+  faithRecreateReady = false;
+  let popup = null;
+  try { popup = window.open(getFaithRecreateUrl(), "faith-recreate"); } catch (_) { popup = null; }
+  if (popup) {
+    faithRecreatePopup = popup;
+    installFaithRecreateListener();
+    return popup;
+  }
+  return null;
+}
+// ---- (recreate transport part 2) ----
+// The recreate page runs in a frame inside the wrapper tab, so jobs and pings
+// are broadcast to the tab window AND every frame in it (same pattern as the
+// painter tab).
+function postToRecreateTab(obj) {
+  let popup = null;
+  try { popup = (faithRecreatePopup && !faithRecreatePopup.closed) ? faithRecreatePopup : null; } catch (_) { popup = null; }
+  if (!popup) return "no open tab";
+  let n = 0;
+  const problems = [];
+  try { popup.postMessage(obj, "*"); n++; } catch (err) { problems.push("tab: " + (err && err.message)); }
+  let len = 0, lenOk = false;
+  try { len = popup.frames.length; lenOk = true; } catch (err) { problems.push("frames.length blocked"); }
+  if (lenOk) {
+    for (let i = 0; i < len; i++) {
+      try { popup.frames[i].postMessage(obj, "*"); n++; }
+      catch (err) { problems.push("frame" + i + " blocked"); }
+    }
+  }
+  return "posted to " + n + " window(s)" + (problems.length ? " [" + problems.join("; ") + "]" : "");
+}
+
+// Resolves once the recreate tab announces itself. Always re-verified so a tab
+// the user navigated elsewhere cannot swallow a job.
+function ensureRecreateReady(timeoutMs) {
+  try {
+    if (faithRecreatePopup && !faithRecreatePopup.closed && faithRecreateReady) return Promise.resolve();
+    if (faithRecreatePopup && !faithRecreatePopup.closed) faithRecreateReady = false;
+    else throw new Error("recreate tab is not open");
+  } catch (err) {
+    return Promise.reject(new Error("Faith's editor tab is not open. Allow popups for this page, then upload again."));
+  }
+  return new Promise((resolve, reject) => {
+    const timer = setTimeout(() => {
+      const i = faithRecreateReadyWaiters.indexOf(done);
+      if (i !== -1) faithRecreateReadyWaiters.splice(i, 1);
+      reject(new Error("Faith's editor tab did not answer. Open " + getFaithRecreateUrl() + " in a tab — it should show the editor page. If an editor tab opened but shows the wrong page, close it and upload again."));
+    }, timeoutMs);
+    function done() { clearTimeout(timer); resolve(); }
+    faithRecreateReadyWaiters.push(done);
+    try {
+      if (faithRecreatePopup && !faithRecreatePopup.closed) postToRecreateTab({ type: "faith-recreate-ping" });
+    } catch (_) {}
+  });
+}
+
+// One recreate job: { imageDataUrl, artStyle, description?, generate? }.
+// Analysis-leg jobs (no generate) settle on faith-recreate-analyzed;
+// generate:true jobs settle on faith-recreate-finished.
+function runRecreateJob(spec, jobTimeoutMs) {
+  const imageDataUrl = (spec && typeof spec.imageDataUrl === "string") ? spec.imageDataUrl : "";
+  const artStyle = (spec && spec.artStyle) ? String(spec.artStyle) : getFaithArtStyle();
+  const generate = !!(spec && spec.generate);
+  const description = (spec && typeof spec.description === "string" && spec.description.trim()) ? spec.description.trim().slice(0, 2000) : "";
+  if (!imageDataUrl && !description) return Promise.reject(new Error("Faith has no image to edit."));
+  return new Promise((resolve, reject) => {
+    let settled = false;
+    const jobId = "recreate" + Date.now().toString(36) + Math.random().toString(36).slice(2);
+    const timer = setTimeout(() => {
+      if (settled) return;
+      settled = true;
+      try { delete faithRecreatePending[jobId]; } catch (_) {}
+      reject(new Error("The image editor timed out. The Perchance queue can be slow — try again, or open the editor tab to check it."));
+    }, jobTimeoutMs);
+    faithRecreatePending[jobId] = {
+      mode: generate ? "generate" : "analyze",
+      resolve: (value) => { if (settled) return; settled = true; clearTimeout(timer); resolve(value); },
+      reject: (err) => { if (settled) return; settled = true; clearTimeout(timer); reject(err); }
+    };
+    ensureRecreateReady(60000).then(() => {
+      if (settled) return;
+      console.info("[Faith Editing] Recreate job " + jobId + " -> " + postToRecreateTab({
+        type: "faith-recreate-job", jobId: jobId, imageDataUrl: imageDataUrl,
+        artStyle: artStyle, generate: generate, description: description
+      }));
+    }).catch((err) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      try { delete faithRecreatePending[jobId]; } catch (_) {}
+      reject(err);
+    });
+  });
+}
 const expressionImages = {
   ruby: "/assets/ruby_wrench.png",
   thinking: "/assets/thinking.PNG",
@@ -922,6 +1089,7 @@ const expressionImages = {
   greeting: "/assets/greeting.PNG",
   painting: "/assets/painting.PNG",
   observing: "/assets/observing.PNG",
+  editing: "/assets/editing.PNG",
   troubleshooting: "/assets/troubleshooting.PNG",
   coding: "/assets/coding.PNG",
   build: "/assets/build.png",
@@ -941,6 +1109,7 @@ const expressionNames = {
   greeting: "Greeting",
   painting: "Painting",
   observing: "Observing",
+  editing: "Editing",
   troubleshooting: "Troubleshooting",
   coding: "Coding",
   build: "Build",
@@ -984,6 +1153,7 @@ const expressionDetails = {
   greeting: "Hello!",
   painting: "Creating your image...",
   observing: "Examining your upload...",
+  editing: "Editing your image...",
   troubleshooting: "Troubleshooting...",
   coding: "Coding...",
   build: "Building from the ground up...",
@@ -2919,6 +3089,94 @@ async function runCoderDiagnosis(question) {
   if (!completed || !answer.trim()) throw new Error("The coding GGUF ended before returning a complete diagnosis.");
 }
 
+// ---- Editing behavior mode: image upload -> recreate editor ----
+async function runImageEditingUpload(file, userQuestion) {
+  // The recreate tab should already be open (opened in the Upload click
+  // gesture). If something else triggered this, try now (may be blocked —
+  // the job below will surface a clear popup error in that case).
+  try {
+    if (!faithRecreatePopup || faithRecreatePopup.closed) openFaithRecreatePopup();
+  } catch (_) {}
+  setExpression("editing", "Sending your image to the editor…");
+  setUploadStatus(`Sending: ${file.name}`);
+  const dataUrl = await readFileAsDataUrl(file);
+  setExpression("editing", "Analyzing your image…");
+  setUploadStatus(`Analyzing: ${file.name}`);
+  const analyzed = await runRecreateJob({ imageDataUrl: dataUrl, artStyle: getFaithArtStyle() }, 150000);
+  const description = String(analyzed.description || "").trim();
+  if (!description) throw new Error("The editor returned an empty description.");
+  setUploadStatus(`Sent: ${file.name}`, true);
+  setExpression("editing", "Image described — ready to recreate");
+  const faithItem = appendMessage(
+    "Faith",
+    `Here's what I see in **${file.name}**:\n\n${description}\n\nPick a style with the 🎨 dropdown above, then hit **Recreate in style**.`,
+    "ai"
+  );
+  attachRecreateButton(faithItem, { name: file.name, dataUrl: dataUrl, description: description });
+}
+
+function attachRecreateButton(faithItem, source) {
+  const row = document.createElement("div");
+  row.style.marginTop = "10px";
+  row.style.display = "flex";
+  row.style.alignItems = "center";
+  row.style.flexWrap = "wrap";
+  row.style.gap = "8px";
+  const btn = document.createElement("button");
+  btn.type = "button";
+  btn.dataset.faithRecreate = "true";
+  btn.textContent = `✨ Recreate in style (${getFaithArtStyle()})`;
+  // Keep every Recreate button's label in sync with the frontend style
+  // dropdown, so it always shows the style it will recreate in.
+  try {
+    const styleSelect = document.getElementById("art-style-select");
+    if (styleSelect && !styleSelect.dataset.faithRecreateHooked) {
+      styleSelect.dataset.faithRecreateHooked = "true";
+      styleSelect.addEventListener("change", () => {
+        try {
+          document.querySelectorAll("button[data-faith-recreate]").forEach((b) => {
+            if (!b.disabled) b.textContent = `✨ Recreate in style (${getFaithArtStyle()})`;
+          });
+        } catch (_) {}
+      });
+    }
+  } catch (_) {}
+  btn.addEventListener("click", async () => {
+    if (busy) return;
+    // Read the dropdown AT CLICK TIME: the recreation uses whatever style is
+    // currently selected in the frontend, and the description the editor
+    // already produced (no re-analysis — straight to painting).
+    const style = getFaithArtStyle();
+    btn.disabled = true;
+    setBusy(true);
+    setExpression("editing", `Recreating in ${style}…`);
+    let loading = null;
+    try {
+      try { if (!faithRecreatePopup || faithRecreatePopup.closed) openFaithRecreatePopup(); } catch (_) {}
+      loading = appendLoadingMessage(`Recreating in ${style}…`);
+      const result = await runRecreateJob({
+        imageDataUrl: source.dataUrl, artStyle: style,
+        description: source.description, generate: true
+      }, 180000);
+      appendImages(faithItem, [{
+        url: result.url, original_url: result.url,
+        type: "generated", title: `Recreation of ${source.name} (${style})`
+      }]);
+      setExpression("editing", "Recreation ready");
+    } catch (error) {
+      setExpression("editing", "Recreation failed");
+      appendMessage("Error", `Recreation failed: ${error.message}`, "error");
+      btn.disabled = false;
+    } finally {
+      if (loading) removeLoadingMessage(loading);
+      setBusy(false);
+      input.focus();
+    }
+  });
+  row.appendChild(btn);
+  faithItem.appendChild(row);
+}
+
 async function uploadFileToFaith(file, suppliedQuestion = null) {
   if (busy || !file) return;
 
@@ -2950,8 +3208,8 @@ async function uploadFileToFaith(file, suppliedQuestion = null) {
   setUploadStatus(`Selected: ${file.name}`);
   setBusy(true);
   setExpression(
-    isImageUpload ? "observing" : (sessionMode === "troubleshooting" ? "troubleshooting" : "thinking"),
-    isImageUpload ? "Checking vision files..." : (sessionMode === "troubleshooting" ? "Sending your file and change request to Faith…" : "Reading file...")
+    isImageUpload ? "editing" : (sessionMode === "troubleshooting" ? "troubleshooting" : "thinking"),
+    isImageUpload ? "Sending your image to the editor…" : (sessionMode === "troubleshooting" ? "Sending your file and change request to Faith…" : "Reading file...")
   );
 
   // Render the user's comment and attachment card together as one user message.
@@ -2963,59 +3221,35 @@ async function uploadFileToFaith(file, suppliedQuestion = null) {
     size: file.size
   });
 
+  // NEW Editing behavior mode: image uploads skip the local GGUF vision
+  // pipeline entirely. The image is sent to the faith-img-2-img editor as a
+  // faith-recreate-job; the editor auto-analyzes it and posts the description
+  // back, which Faith renders with a "Recreate in style" button.
+  if (isImageUpload) {
+    try {
+      await runImageEditingUpload(file, question);
+    } catch (error) {
+      setUploadStatus(`Not sent: ${file.name}`);
+      setExpression("editing", "Editor handoff failed");
+      appendMessage("Error", `Could not send “${file.name}” to the image editor: ${error.message}`, "error");
+    } finally {
+      recreateOpenedThisTurn = false;
+      setBusy(false);
+      input.focus();
+    }
+    return;
+  }
+
   let visionDownloads = [];
   try {
-    // IMPORTANT: ONLY image uploads use the optional local vision preflight.
-    // Text/source files (.py, .java, .js, etc.) use Faith's independent local
-    // file-observer pipeline and must never be blocked by missing GGUF files.
-    if (isImageUpload) {
-      const visionAbort = new AbortController();
-      const visionTimeout = setTimeout(() => visionAbort.abort(), 5000);
-      let visionResponse;
-      try {
-        visionResponse = await fetch(`/api/vision-status?ts=${Date.now()}`, {
-          method: "GET",
-          cache: "no-store",
-          headers: { "Cache-Control": "no-cache" },
-          signal: visionAbort.signal
-        });
-      } finally {
-        clearTimeout(visionTimeout);
-      }
-
-      let visionStatus;
-      try {
-        visionStatus = await visionResponse.json();
-      } catch (_) {
-        throw new Error("Faith returned an invalid vision-status response. Please restart Faith with the latest version.");
-      }
-
-      visionDownloads = Array.isArray(visionStatus.download_urls) ? visionStatus.download_urls : [];
-      if (!visionDownloads.length) {
-        visionDownloads = [
-          { filename: visionStatus.model_filename || FAITH_VISION_DOWNLOADS[0].filename, url: visionStatus.download_url || FAITH_VISION_DOWNLOADS[0].url },
-          { filename: visionStatus.mmproj_filename || FAITH_VISION_DOWNLOADS[1].filename, url: visionStatus.mmproj_download_url || FAITH_VISION_DOWNLOADS[1].url }
-        ];
-      }
-
-      if (!visionStatus.model_installed || !visionStatus.mmproj_installed) {
-        const missingParts = [];
-        if (!visionStatus.model_installed) missingParts.push(visionStatus.model_filename || "gemma-3-4b-it-Q4_K_M.gguf");
-        if (!visionStatus.mmproj_installed) missingParts.push(visionStatus.mmproj_filename || "mmproj-model-f16.gguf");
-        const error = new Error(`Faith cannot describe images yet. Missing required vision file${missingParts.length === 1 ? "" : "s"}: ${missingParts.join(", ")}.`);
-        error.visionDownloads = visionDownloads;
-        throw error;
-      }
-
-      setExpression("observing", "Reading your upload...");
-    }
-
+    // NOTE: image uploads return earlier via the Editing flow above, so only
+    // text/code files reach this pipeline now. The old GGUF vision preflight
+    // was removed with the image branch.
     setUploadStatus(`Sending: ${file.name}`);
-    // Images still use the existing data-URL transport for the vision pipeline.
-    // Source/code files are deliberately sent as plain UTF-8 text instead: the
+    // Source/code files are deliberately sent as plain UTF-8 text: the
     // coding pipeline has no reason to receive a Base64 representation at all.
-    const dataUrl = isImageUpload ? await readFileAsDataUrl(file) : null;
-    const sourceText = isImageUpload ? null : await readFileAsText(file);
+    const dataUrl = null;
+    const sourceText = await readFileAsText(file);
 
     // Images go through /api/chat so the local vision observer can produce the
     // visual description. Text/source files deliberately go through /api/upload
@@ -4088,13 +4322,34 @@ async function submitQuestion() {
 }
 
 upload.addEventListener("click", () => {
-  if (!busy) fileInput.click();
+  if (busy) return;
+  // Open the recreate tab NOW, inside this click gesture, so the browser
+  // cannot block it as a popup — same speculative pattern as the painter tab
+  // on Send. Closed again below if no image is actually chosen.
+  try {
+    let hadOpen = false;
+    try { hadOpen = !!(faithRecreatePopup && !faithRecreatePopup.closed); } catch (_) {}
+    recreateOpenedThisTurn = !hadOpen && !!openFaithRecreatePopup();
+  } catch (_) { recreateOpenedThisTurn = false; }
+  fileInput.click();
 });
 
 fileInput.addEventListener("change", async () => {
   const file = fileInput.files && fileInput.files[0];
   fileInput.value = "";
-  if (file) await uploadFileToFaith(file);
+  const isImage = file && String(file.type || "").toLowerCase().startsWith("image/");
+  if (!file || !isImage) {
+    // Cancelled, or a non-image (the recreate tab isn't needed for those):
+    // close the speculative tab so tabs don't pile up — but only if this
+    // click opened it (a warm tab from an earlier turn stays for reuse).
+    if (recreateOpenedThisTurn) {
+      try { if (faithRecreatePopup && !faithRecreatePopup.closed) faithRecreatePopup.close(); } catch (_) {}
+      try { faithRecreateReady = false; } catch (_) {}
+      recreateOpenedThisTurn = false;
+    }
+    if (!file) return;
+  }
+  await uploadFileToFaith(file);
 });
 
 form.addEventListener("submit", (event) => {
@@ -4126,6 +4381,15 @@ clear.addEventListener("click", async () => {
     });
   } catch (_) {}
   try { faithPainterReady = false; } catch (_) {}
+  // Same for the recreate tab: drop pending analysis/recreation jobs.
+  try {
+    Object.keys(faithRecreatePending).forEach((id) => {
+      try { faithRecreatePending[id].reject(new Error("Cleared.")); } catch (_) {}
+      delete faithRecreatePending[id];
+    });
+  } catch (_) {}
+  try { faithRecreateReady = false; } catch (_) {}
+  try { recreateOpenedThisTurn = false; } catch (_) {}
   if (activeChatController) {
     try { activeChatController.abort(); } catch (_) {}
     activeChatController = null;
