@@ -2541,11 +2541,46 @@ function faithInitSidebar() {
   });
   const tabChat = document.getElementById("faith-sidebar-chats");
   const tabGallery = document.getElementById("faith-sidebar-gallery");
+  const tabStudio = document.getElementById("faith-sidebar-studio");
   const chatsPanel = document.getElementById("faith-chats-panel");
   const galleryPanel = document.getElementById("faith-gallery-panel");
-  if (tabChat && tabGallery && chatsPanel && galleryPanel) {
-    tabChat.addEventListener("click", () => { chatsPanel.hidden = false; galleryPanel.hidden = true; tabChat.classList.add("active"); tabGallery.classList.remove("active"); });
-    tabGallery.addEventListener("click", () => { chatsPanel.hidden = true; galleryPanel.hidden = false; tabGallery.classList.add("active"); tabChat.classList.remove("active"); });
+  const studioPanel = document.getElementById("faith-studio-panel");
+  const showSidebarTab = (which) => {
+    if (!tabChat || !tabGallery || !tabStudio || !chatsPanel || !galleryPanel || !studioPanel) return;
+    chatsPanel.hidden = which !== "chats";
+    galleryPanel.hidden = which !== "gallery";
+    studioPanel.hidden = which !== "studio";
+    // Studio is its own blank workspace, not a view layered over the current
+    // conversation. The chat and composer return when another sidebar tab opens.
+    document.body.classList.toggle("faith-studio-mode", which === "studio");
+    tabChat.classList.toggle("active", which === "chats");
+    tabGallery.classList.toggle("active", which === "gallery");
+    tabStudio.classList.toggle("active", which === "studio");
+    if (which !== "studio") {
+      // Restore the active conversation's saved expression after leaving Studio.
+      const activeThread = typeof faithWorkspace !== "undefined" && faithWorkspace.threads
+        ? faithWorkspace.threads.find(t => t.id === faithWorkspace.activeId) : null;
+      const name = activeThread && expressionImages[activeThread.expression] ? activeThread.expression : "explanation";
+      setExpression(name, activeThread && activeThread.detail ? activeThread.detail : null);
+    }
+  };
+  if (tabChat && tabGallery && tabStudio && chatsPanel && galleryPanel && studioPanel) {
+    tabChat.addEventListener("click", () => showSidebarTab("chats"));
+    tabGallery.addEventListener("click", () => showSidebarTab("gallery"));
+    tabStudio.addEventListener("click", () => {
+      showSidebarTab("studio");
+      // Studio's expression is a view state, not a change to the conversation's saved behavior.
+      const img = document.getElementById("expression");
+      if (img) {
+        img.onerror = null;
+        img.src = "/assets/videostudio.png";
+        img.alt = "Faith video studio expression";
+      }
+      const status = document.getElementById("status");
+      const detail = document.getElementById("state-detail");
+      if (status) status.textContent = "Studio";
+      if (detail) detail.textContent = "Video studio";
+    });
   }
 }
 // Rename the existing cyan voice toggle label only if the voice module has

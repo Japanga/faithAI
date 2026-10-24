@@ -1,0 +1,235 @@
+<!-- Faith Video Studio — paste this section inside Faith's <main class="app-shell"> (e.g. after the chat-panel section).
+     Companion files: faith-video-studio.css (Faith stylesheet or <style>), faith-video-studio.js (script tag after Faith's app.js). -->
+<div id="fvsRootEl">
+  <h1>✂️ Cutout Animator</h1>
+  <p class="subEl">Describe a character, painted in Faith's current <b>Art Style</b>, and get a little animation of that <b>exact same picture</b> wiggling over a background.</p>
+
+  <section>
+    <h2>1 · Your character</h2>
+    <div class="fieldEl grow2">
+      <label for="fvs-charInput">What does your character look like?</label>
+      <textarea id="fvs-charInput" rows="2">cute orange fox warrior girl, fluffy tail, green cloak</textarea>
+    </div>
+    <div class="fieldEl grow2">
+      <label for="fvs-basePoseInput">Base pose — how are they standing/sitting? (anchors every frame)</label>
+      <input id="fvs-basePoseInput" type="text" value="standing, facing forward">
+    </div>
+    <div class="rowEl" style="margin-top:8px">
+      <div class="fieldEl grow2">
+        <label>Art style</label>
+        <div class="hintEl" style="margin-top:6px">Uses Faith's Art Style picker (top bar) — same styles as her image painting.</div>
+      </div>
+    </div>
+    <div class="rowEl" style="margin-top:8px">
+      <button id="fvs-genCutBtn" type="button" class="primaryBtn">✨ Make my character</button>
+      <button id="fvs-newCharBtn" type="button" title="Paint a fresh take on the same description">🎲 new look</button>
+      <button id="fvs-retryCutBtn" type="button" title="Paint again">↻ retry</button>
+    </div>
+    <div class="rowEl" style="margin-top:8px">
+      <div class="fieldEl" style="flex:0 1 auto">
+        <label>&nbsp;</label>
+        <button id="fvs-flipPrevBtn" type="button" title="Mirror left-right — fixes a character facing the wrong way">⇋ Flip</button>
+      </div>
+      <div class="fieldEl">
+        <label for="fvs-prevRotInput">Rotation <span id="fvs-prevRotValEl">0°</span></label>
+        <input id="fvs-prevRotInput" type="range" min="-180" max="180" value="0">
+      </div>
+    </div>
+    <div class="hintEl" style="margin-top:10px">Scene cast — add characters, then arrange everyone on the stage in step 4. Click a card to select it.</div>
+    <div id="fvs-castEl" style="display:flex; gap:8px; flex-wrap:wrap; margin-top:6px"></div>
+    <div class="rowEl" style="margin-top:8px">
+      <button id="fvs-castAddBtn" type="button">＋ Add current character to scene</button>
+    </div>
+    <div class="hintEl" id="fvs-castCapEl"></div>
+    <div id="fvs-cutLoadEl" class="fvs-loadingEl" hidden><span class="fvs-dotsEl">painting your character</span></div>
+    <img id="fvs-cutPrevImgEl" class="fvs-checkerEl" hidden alt="your character cutout">
+    <div class="hintEl" id="fvs-cutCapEl"></div>
+  </section>
+
+  <section>
+    <h2>2 · Animation style</h2>
+    <div class="fieldEl grow2">
+      <label for="fvs-modeSelect">How should it move?</label>
+      <select id="fvs-modeSelect">
+        <option value="moves" selected>Slight moves — the same picture wiggles (always identical)</option>
+        <option value="poses">New poses — one sheet, same design in every frame</option>
+      </select>
+    </div>
+    <div id="fvs-movesBox">
+    <p class="hintEl" style="margin:8px 0">Every frame below is the <b>exact same picture</b> — just bobbed a little. Each character's own movement is set on its card or in step 4.</p>
+    <div id="fvs-stripEl"></div>
+    </div>
+    <div id="fvs-posesBox" hidden>
+      <p class="hintEl" style="margin:8px 0">One picture holds <b>all</b> your poses side by side — so the design is identical in every frame, guaranteed. It gets sliced into frames automatically.</p>
+      <div id="fvs-poseRowsEl" style="display:flex; flex-direction:column; gap:6px; margin-bottom:8px"></div>
+      <div class="rowEl">
+        <button id="fvs-addPoseBtn" type="button">+ add pose</button>
+        <button id="fvs-genPosesBtn" type="button" class="primaryBtn">🎭 Generate poses</button>
+        <button id="fvs-sheetDiceBtn" type="button" title="New random sheet" hidden>🎲 new sheet look</button>
+      </div>
+      <img id="fvs-sheetPrevImgEl" hidden alt="pose sheet preview">
+      <div class="hintEl" id="fvs-sheetCapEl"></div>
+      <div id="fvs-poseGridEl" style="display:grid; grid-template-columns:repeat(auto-fill,minmax(150px,1fr)); gap:10px; margin-top:10px"></div>
+    </div>
+  </section>
+
+  <section>
+    <h2>3 · Background</h2>
+    <div class="rowEl">
+      <div class="fieldEl grow2">
+        <label for="fvs-bgPromptInput">Where is your character?</label>
+        <input id="fvs-bgPromptInput" type="text" value="sunny meadow with soft hills and a dirt path, empty, no characters">
+      </div>
+      <div class="fieldEl" style="max-width:200px">
+        <label>&nbsp;</label>
+        <button id="fvs-genBgBtn" type="button">🖼️ Make background</button>
+      </div>
+    </div>
+    <div id="fvs-bgLoadEl" class="fvs-loadingEl" hidden><span class="fvs-dotsEl">painting background</span></div>
+    <div class="rowEl" style="margin-top:8px; align-items:flex-end">
+      <div class="fieldEl" style="flex:0 1 auto">
+        <label>&nbsp;</label>
+        <label style="font-size:0.9rem; font-weight:400"><input id="fvs-bgAnimCheck" type="checkbox"> Animate background <span class="hintEl">(optional — shifting variants, e.g. drifting clouds, glowing lights)</span></label>
+        <label style="font-size:0.9rem; font-weight:400"><input id="fvs-bgStrictCheck" type="checkbox" checked> Strict sameness</label>
+      </div>
+      <div class="fieldEl" style="max-width:100px; flex:0 1 auto">
+        <label for="fvs-bgCountSelect">Variants</label>
+        <select id="fvs-bgCountSelect">
+          <option value="2" selected>2</option>
+          <option value="3">3</option>
+          <option value="4">4</option>
+        </select>
+      </div>
+    </div>
+    <div id="fvs-bgStripEl" style="display:flex; gap:6px; flex-wrap:wrap; margin-top:8px"></div>
+    <img id="fvs-bgPrevImgEl" hidden alt="background preview">
+  </section>
+
+  <section>
+    <h2>4 · Play + save</h2>
+    <div id="fvs-stageWrapEl">
+      <canvas id="fvs-stageCanvasEl" width="768" height="768"></canvas>
+      <div id="fvs-stageSideEl">
+        <div style="display:flex; gap:6px; align-items:center">
+          <button id="fvs-playBtn" type="button"><svg viewBox="0 0 24 24" width="12" height="12" aria-hidden="true"><path d="M7 4l13 8-13 8z" fill="currentColor"/></svg><span>play</span></button>
+          <label for="fvs-fpsInput">Speed</label>
+          <input id="fvs-fpsInput" type="range" min="1" max="12" value="5" style="flex:1">
+          <b id="fvs-fpsValEl">5</b>
+        </div>
+        <label for="fvs-scaleInput">Character size <span id="fvs-scaleValEl">0.85</span></label>
+        <input id="fvs-scaleInput" type="range" min="0.3" max="1.2" step="0.05" value="0.85">
+        <div class="hintEl" id="fvs-selCapEl">No character selected — click one on the stage or in the scene list.</div>
+        <div style="display:flex; gap:6px; flex-wrap:wrap">
+          <button id="fvs-setABtn" type="button">Set A ●</button>
+          <button id="fvs-setBBtn" type="button">Set B ●</button>
+          <button id="fvs-clearPathBtn" type="button">Clear path</button>
+        </div>
+        <div class="hintEl">Drag characters right on the stage. The green line is the movement path (A → B, loops back and forth).</div>
+        <div class="rowEl">
+          <div class="fieldEl">
+            <label for="fvs-castPresetSelect">Selected moves like…</label>
+            <select id="fvs-castPresetSelect">
+              <option value="none">Stands still</option>
+              <option value="bob">Gentle bob</option>
+              <option value="hop">Happy hop</option>
+              <option value="sway">Sway side to side</option>
+              <option value="float">Floating</option>
+              <option value="nod">Nodding</option>
+              <option value="march">Marching</option>
+            </select>
+          </div>
+          <div class="fieldEl">
+            <label for="fvs-castStrengthInput">Move size <span id="fvs-castStrengthValEl">45</span></label>
+            <input id="fvs-castStrengthInput" type="range" min="0" max="100" value="45">
+          </div>
+          <div class="fieldEl">
+            <label for="fvs-castOffsetInput">Timing offset <span id="fvs-castOffsetValEl">0%</span></label>
+            <input id="fvs-castOffsetInput" type="range" min="0" max="100" value="0" title="Stagger the timing so characters don't move in lockstep">
+          </div>
+          <div class="fieldEl">
+            <label for="fvs-castRotInput">Rotation <span id="fvs-castRotValEl">0°</span></label>
+            <input id="fvs-castRotInput" type="range" min="-180" max="180" value="0">
+          </div>
+          <div class="fieldEl" style="max-width:90px">
+            <label>&nbsp;</label>
+            <button id="fvs-castFlipBtn" type="button" title="Mirror left-right">⇋ Flip</button>
+          </div>
+        </div>
+        <div style="display:flex; gap:6px; align-items:center; margin-top:8px">
+          <label for="fvs-loopFramesInput" style="font-size:0.85rem">Frames per loop</label>
+          <input id="fvs-loopFramesInput" type="number" min="2" max="8" value="4" style="width:60px">
+        </div>
+        <div class="hintEl" id="fvs-stageCapEl">Make your character first, then press play.</div>
+        <div id="fvs-exportRowEl">
+          <button id="fvs-mp4Btn" type="button">⬇ video (.mp4)</button>
+          <button id="fvs-zipBtn" type="button">⬇ all pictures</button>
+        </div>
+        <video id="fvs-mp4PrevEl" hidden loop autoplay muted playsinline controls></video>
+      </div>
+    </div>
+  </section>
+
+  <section>
+    <h2>5 · Post-processing — blend it together</h2>
+    <p class="hintEl" style="margin:0 0 8px">Bloom, light-matching and colour grade. Applies live to the stage above and to everything you save.</p>
+    <div class="rowEl">
+      <div class="fieldEl">
+        <label for="fvs-bloomInput">Bloom <span id="fvs-bloomValEl">30</span></label>
+        <input id="fvs-bloomInput" type="range" min="0" max="100" value="30">
+      </div>
+      <div class="fieldEl">
+        <label for="fvs-ambientInput">Match background light <span id="fvs-ambientValEl">35</span></label>
+        <input id="fvs-ambientInput" type="range" min="0" max="100" value="35">
+      </div>
+      <div class="fieldEl">
+        <label for="fvs-tintStrengthInput">Character tint <span id="fvs-tintValEl">0</span></label>
+        <input id="fvs-tintStrengthInput" type="range" min="0" max="100" value="0">
+      </div>
+      <div class="fieldEl" style="max-width:110px">
+        <label for="fvs-tintColorInput">Tint colour</label>
+        <input id="fvs-tintColorInput" type="color" value="#ffb46b">
+      </div>
+      <div class="fieldEl">
+        <label for="fvs-warmthInput">Warm ↔ cool <span id="fvs-warmthValEl">0</span></label>
+        <input id="fvs-warmthInput" type="range" min="-100" max="100" value="0">
+      </div>
+      <div class="fieldEl">
+        <label for="fvs-vignetteInput">Vignette <span id="fvs-vignetteValEl">20</span></label>
+        <input id="fvs-vignetteInput" type="range" min="0" max="100" value="20">
+      </div>
+      <div class="fieldEl">
+        <label for="fvs-satInput">Saturation <span id="fvs-satValEl">100</span></label>
+        <input id="fvs-satInput" type="range" min="0" max="200" value="100">
+      </div>
+      <div class="fieldEl">
+        <label for="fvs-conInput">Contrast <span id="fvs-conValEl">100</span></label>
+        <input id="fvs-conInput" type="range" min="0" max="200" value="100">
+      </div>
+      <div class="fieldEl">
+        <label for="fvs-grainInput">Film grain <span id="fvs-grainValEl">0</span></label>
+        <input id="fvs-grainInput" type="range" min="0" max="100" value="0">
+      </div>
+    </div>
+    <div class="rowEl" style="margin-top:8px">
+      <button id="fvs-fxResetBtn" type="button">reset effects</button>
+    </div>
+  </section>
+
+  <section>
+    <h2>6 · Timeline — splice clips into one video</h2>
+    <p class="hintEl" style="margin:0 0 8px">Bank moments as clips, then join them into a single video. <b>＋ Add current stage</b> freezes this exact scene (which characters are visible, poses, paths, background) as a clip — handy with alternates: keep two similar characters on cast cards, hide one with its eye button, add the stage, then flip visibility and add it again for the next shot. <b>⬆ Upload</b> adds your exported .mp4s. Reorder with ◀ ▶, then export.</p>
+    <div class="rowEl">
+      <button id="fvs-tlAddStageBtn" type="button">＋ Add current stage as clip</button>
+      <button id="fvs-tlUploadBtn" type="button">⬆ Upload .mp4 clip(s)</button>
+      <button id="fvs-tlExportBtn" type="button" class="primaryBtn">⬇ Export timeline (.mp4)</button>
+      <button id="fvs-tlClearBtn" type="button">Clear</button>
+    </div>
+    <input id="fvs-tlFileInput" type="file" accept="video/mp4,video/*" multiple hidden>
+    <div class="hintEl" id="fvs-tlCapEl" style="margin-top:8px">No clips yet — add the current stage or upload .mp4s.</div>
+    <div id="fvs-tlEl"></div>
+    <video id="fvs-tlPrevEl" hidden loop autoplay muted playsinline controls></video>
+  </section>
+
+  <div id="fvs-statusEl"></div>
+</div>
+
