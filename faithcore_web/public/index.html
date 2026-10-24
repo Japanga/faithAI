@@ -206,6 +206,41 @@
       font-weight: 600;
     }
 
+    .upload-menu-wrap { position: relative; display: inline-flex; }
+    .upload-menu {
+      position: absolute;
+      left: 0;
+      bottom: calc(100% + 8px);
+      z-index: 1000;
+      min-width: 190px;
+      padding: 6px;
+      border: 1px solid rgba(255,255,255,.14);
+      border-radius: 12px;
+      background: #111722;
+      box-shadow: 0 12px 32px rgba(0,0,0,.45);
+    }
+    .upload-menu[hidden] { display: none !important; }
+    .upload-menu-option {
+      display: flex;
+      align-items: center;
+      gap: 10px;
+      width: 100%;
+      padding: 10px 12px;
+      border: 0;
+      border-radius: 8px;
+      background: transparent;
+      color: #f4f6fb;
+      text-align: left;
+      cursor: pointer;
+      font: inherit;
+    }
+    .upload-menu-option:hover, .upload-menu-option:focus-visible { background: #252f40; outline: none; }
+    .upload-menu-icon { width: 24px; height: 24px; flex: 0 0 24px; display: inline-flex; align-items: center; justify-content: center; color: #b8c8e6; }
+    .upload-menu-icon svg { display: block; width: 22px; height: 22px; stroke: currentColor; fill: none; stroke-width: 1.8; stroke-linecap: round; stroke-linejoin: round; }
+    #upload-image-choice .upload-menu-icon { color: #86c8ff; }
+    .upload-menu-copy { display: flex; flex-direction: column; gap: 2px; }
+    .upload-menu-copy small { color: #9ba7bd; font-size: .75rem; }
+
     .upload-status {
       flex: 0 1 210px;
       width: 210px;
@@ -549,7 +584,19 @@
                 autocomplete="off"
                 placeholder="Ask Faith something..."></textarea>
       <div class="composer-row">
-        <button id="upload" type="button" class="secondary">Upload</button>
+        <div class="upload-menu-wrap">
+          <button id="upload" type="button" class="secondary" aria-haspopup="menu" aria-expanded="false">Upload ▾</button>
+          <div id="upload-menu" class="upload-menu" role="menu" aria-label="Choose upload type" hidden>
+            <button id="upload-file-choice" class="upload-menu-option" type="button" role="menuitem">
+              <span class="upload-menu-icon" aria-hidden="true"><svg viewBox="0 0 24 24"><path d="M10 13.5 8.6 14.9a3.5 3.5 0 0 1-5-5l4-4a3.5 3.5 0 0 1 5 0"/><path d="m14 10.5 1.4-1.4a3.5 3.5 0 0 1 5 5l-4 4a3.5 3.5 0 0 1-5 0"/><path d="m8.5 15.5 7-7"/></svg></span>
+              <span class="upload-menu-copy"><strong>File</strong><small>Code, documents, project files</small></span>
+            </button>
+            <button id="upload-image-choice" class="upload-menu-option" type="button" role="menuitem">
+              <span class="upload-menu-icon" aria-hidden="true"><svg viewBox="0 0 24 24"><rect x="3" y="3.5" width="18" height="17" rx="2.2"/><circle cx="8.5" cy="8.5" r="1.5"/><path d="m4.5 17 5-5 3.2 3.2 2.2-2.2 4.6 4.5"/></svg></span>
+              <span class="upload-menu-copy"><strong>Image</strong><small>Image-to-image editing</small></span>
+            </button>
+          </div>
+        </div>
         <span id="upload-status" class="upload-status" aria-live="polite">No file selected</span>
         <label for="art-style-select" class="art-style-label" title="Art Style is applied to Faith's generated images (paint/draw/generate requests) and to image recreations from uploads (Editing mode). Chat, vision, troubleshooting and build modes are unaffected.">🎨</label>
         <select id="art-style-select" class="art-style-select" aria-label="Art Style for generated and recreated images" title="Art Style is applied to Faith's generated images (paint/draw/generate requests) and to image recreations from uploads (Editing mode). Chat, vision, troubleshooting and build modes are unaffected."></select>

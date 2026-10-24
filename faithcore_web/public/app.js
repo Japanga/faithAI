@@ -3459,7 +3459,7 @@ function attachRecreateButton(faithItem, source) {
   faithItem.appendChild(row);
 }
 
-async function uploadFileToFaith(file, suppliedQuestion = null) {
+async function uploadFileToFaith(file, suppliedQuestion = null, uploadKind = null) {
   if (busy || !file) return;
 
   const maxBytes = 12 * 1024 * 1024;
@@ -3472,7 +3472,9 @@ async function uploadFileToFaith(file, suppliedQuestion = null) {
 
   const question = suppliedQuestion === null ? input.value.trim() : String(suppliedQuestion || "").trim();
   input.value = "";
-  const isImageUpload = String(file.type || "").toLowerCase().startsWith("image/");
+  // The menu choice is authoritative: an image selected through File remains
+  // a normal attachment; only the Image choice enters the img2img pipeline.
+  const isImageUpload = uploadKind ? uploadKind === "image" : String(file.type || "").toLowerCase().startsWith("image/");
 
   // Source code is staged like a chat attachment: selecting it alone must not
   // send it or start analysis. The next user message sends file + comment.
@@ -4644,27 +4646,61 @@ async function submitQuestion() {
   }
 }
 
-upload.addEventListener("click", () => {
+const uploadMenu = document.getElementById("upload-menu");
+const uploadFileChoice = document.getElementById("upload-file-choice");
+const uploadImageChoice = document.getElementById("upload-image-choice");
+let selectedUploadKind = "file";
+
+function closeUploadMenu() {
+  if (uploadMenu) uploadMenu.hidden = true;
+  if (upload) upload.setAttribute("aria-expanded", "false");
+}
+
+upload.addEventListener("click", (event) => {
   if (busy) return;
-  // Open the recreate tab NOW, inside this click gesture, so the browser
-  // cannot block it as a popup — same speculative pattern as the painter tab
-  // on Send. Closed again below if no image is actually chosen.
-  try {
-    let hadOpen = false;
-    try { hadOpen = !!(faithRecreatePopup && !faithRecreatePopup.closed); } catch (_) {}
-    recreateOpenedThisTurn = !hadOpen && !!openFaithRecreatePopup();
-  } catch (_) { recreateOpenedThisTurn = false; }
-  fileInput.click();
+  event.stopPropagation();
+  const willOpen = uploadMenu && uploadMenu.hidden;
+  if (uploadMenu) uploadMenu.hidden = !willOpen;
+  upload.setAttribute("aria-expanded", willOpen ? "true" : "false");
 });
+
+document.addEventListener("click", (event) => {
+  if (uploadMenu && !uploadMenu.hidden && !event.target.closest(".upload-menu-wrap")) closeUploadMenu();
+});
+document.addEventListener("keydown", (event) => {
+  if (event.key === "Escape") closeUploadMenu();
+});
+
+function chooseUpload(kind) {
+  if (busy) return;
+  selectedUploadKind = kind;
+  closeUploadMenu();
+  if (kind === "image") {
+    // Open the recreate tab during this user gesture so popup blockers allow it.
+    try {
+      let hadOpen = false;
+      try { hadOpen = !!(faithRecreatePopup && !faithRecreatePopup.closed); } catch (_) {}
+      recreateOpenedThisTurn = !hadOpen && !!openFaithRecreatePopup();
+    } catch (_) { recreateOpenedThisTurn = false; }
+    fileInput.accept = "image/*";
+    fileInput.setAttribute("aria-label", "Choose an image for image-to-image editing");
+  } else {
+    fileInput.removeAttribute("accept");
+    fileInput.setAttribute("aria-label", "Choose a file to send to Faith for coding, troubleshooting, or building");
+  }
+  fileInput.click();
+}
+
+uploadFileChoice.addEventListener("click", () => chooseUpload("file"));
+uploadImageChoice.addEventListener("click", () => chooseUpload("image"));
 
 fileInput.addEventListener("change", async () => {
   const file = fileInput.files && fileInput.files[0];
   fileInput.value = "";
-  const isImage = file && String(file.type || "").toLowerCase().startsWith("image/");
-  if (!file || !isImage) {
-    // Cancelled, or a non-image (the recreate tab isn't needed for those):
-    // close the speculative tab so tabs don't pile up — but only if this
-    // click opened it (a warm tab from an earlier turn stays for reuse).
+  const kind = selectedUploadKind;
+  if (!file || kind !== "image") {
+    // If the Image menu opened a speculative editor tab but no image was
+    // selected, close only that newly opened tab.
     if (recreateOpenedThisTurn) {
       try { if (faithRecreatePopup && !faithRecreatePopup.closed) faithRecreatePopup.close(); } catch (_) {}
       try { faithRecreateReady = false; } catch (_) {}
@@ -4672,7 +4708,7 @@ fileInput.addEventListener("change", async () => {
     }
     if (!file) return;
   }
-  await uploadFileToFaith(file);
+  await uploadFileToFaith(file, null, kind);
 });
 
 form.addEventListener("submit", (event) => {
