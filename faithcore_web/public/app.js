@@ -1099,6 +1099,8 @@ const expressionImages = {
   anger: "/assets/anger.PNG",
   erotic: "/assets/erotic.PNG",
   talking: "/assets/Talking.gif",
+  voiceMode: "/assets/voicemode.png",
+  voiceModeTalking: "/assets/robot_talking.gif",
   hazard: "/assets/hazard.PNG"
 };
 
@@ -1120,6 +1122,8 @@ const expressionNames = {
   anger: "Anger",
   erotic: "Erotic",
   talking: "Talking...",
+  voiceMode: "Voice Mode",
+  voiceModeTalking: "Voice Mode — Speaking",
   hazard: "Hazard"
 };
 
@@ -1428,7 +1432,7 @@ let pendingExpressionName = null;
 function setExpression(name, customDetail = null) {
   // While the browser voice engine is actively speaking, keep Faith's animated
   // Talking.gif expression visible even if a streaming/status event arrives.
-  try { if (window.speechSynthesis && window.speechSynthesis.speaking) name = "talking"; } catch (_) {}
+  try { if (window.speechSynthesis && window.speechSynthesis.speaking && window.__faithVoicePlaybackSource !== "user") name = "talking"; } catch (_) {}
   if (!expressionImages[name]) return;
 
   // Update the caption immediately. Repeated status/token events for the same
@@ -1545,6 +1549,27 @@ function setExpression(name, customDetail = null) {
     }
   }, 200);
 })();
+
+// Dedicated expression handling for manual replay and the experimental
+// user-message Voice Mode. The voice module emits these events around playback.
+window.addEventListener("faith-voice-playback", (event) => {
+  const detail = event && event.detail ? event.detail : {};
+  if (detail.active) {
+    window.__faithVoicePlaybackSource = detail.source || "faith";
+    if (detail.source === "user") setExpression("voiceModeTalking", "Reading your message aloud...");
+    else setExpression("talking", "Speaking...");
+    return;
+  }
+  window.__faithVoicePlaybackSource = null;
+  if (detail.source === "user" && window.faithVoiceModeActive) {
+    setExpression("voiceMode", "Voice Mode is active");
+  } else {
+    const active = (typeof faithWorkspace !== "undefined" && faithWorkspace.threads)
+      ? faithWorkspace.threads.find(thread => thread.id === faithWorkspace.activeId) : null;
+    const restore = active && active.expression && active.expression !== "talking" ? active.expression : "explanation";
+    setExpression(restore, active && active.detail ? active.detail : "");
+  }
+});
 
 function stripImageMarkdown(text) {
   return String(text || "")
@@ -1875,6 +1900,8 @@ function faithLoadWorkspace() {
 }
 function faithPersistThreadState(thread) {
   if (!thread || !faithWorkspaceReady) return;
+  thread.voiceModeActive = !!window.faithVoiceModeActive && thread.id === faithWorkspace.activeId
+    ? true : !!thread.voiceModeActive;
   try {
     localStorage.setItem(FAITH_WORKSPACE_KEY, JSON.stringify(faithWorkspace));
   } catch (_) {
@@ -1883,6 +1910,15 @@ function faithPersistThreadState(thread) {
     try { faithSaveWorkspace(); } catch (_) {}
   }
 }
+window.addEventListener("pagehide", () => {
+  const activeVoiceThread = faithWorkspace && Array.isArray(faithWorkspace.threads)
+    ? faithWorkspace.threads.find(t => t.id === faithWorkspace.activeId) : null;
+  if (activeVoiceThread) {
+    activeVoiceThread.voiceModeActive = !!window.faithVoiceModeActive;
+    try { localStorage.setItem(FAITH_WORKSPACE_KEY, JSON.stringify(faithWorkspace)); }
+    catch (_) { /* Existing workspace save handles storage limits during normal use. */ }
+  }
+});
 function faithSaveWorkspace() {
   const thread = faithWorkspace.threads.find(t => t.id === faithWorkspace.activeId);
   if (thread && chat) {
@@ -1891,6 +1927,7 @@ function faithSaveWorkspace() {
     const firstUser = chat.querySelector(".message.you .message-text");
     const title = firstUser ? firstUser.textContent.trim().replace(/\s+/g, " ") : "";
     if (title) thread.title = title.slice(0, 42) + (title.length > 42 ? "…" : "");
+    thread.voiceModeActive = !!window.faithVoiceModeActive;
     thread.mode = sessionMode || "idle";
     thread.behaviorState = sessionMode || "idle";
     if (displayedExpressionName || pendingExpressionName) thread.expression = pendingExpressionName || displayedExpressionName;
@@ -2025,19 +2062,130 @@ function faithOpenStorageLimitConversation(bytes) {
     post.append(speaker, body); holder.appendChild(post);
   }
   const body = post.querySelector(".message-text");
-  if (body) body.innerHTML = formatFaithMessage(reply);
+  if (body) {
+    body.innerHTML = formatFaithMessage(reply);
+    // Restore the actionable control in the dedicated storage-limit notice.
+    // It is part of the saved conversation HTML, so it survives reloads.
+    let clearButton = body.querySelector(".faith-storage-clear-gallery");
+    if (!clearButton) {
+      clearButton = document.createElement("button");
+      clearButton.type = "button";
+      clearButton.className = "faith-storage-clear-gallery";
+      clearButton.textContent = "Clear gallery images now (keep favorites)";
+      body.appendChild(clearButton);
+    }
+    faithStyleStorageLimitClearButton(clearButton);
+  }
   thread.html = holder.innerHTML;
   thread.updatedAt = Date.now();
   faithWorkspace.activeId = thread.id;
+  window.faithVoiceModeActive = !!thread.voiceModeActive;
   if (typeof chat !== "undefined" && chat) {
     chat.innerHTML = thread.html;
     faithBindReplayButtons(chat);
+    faithBindStorageLimitClearButton(chat);
     sessionMode = "idle";
     setExpression("hazard", thread.detail);
   }
   faithSaveWorkspace();
   faithRenderSidebar();
 }
+function faithStyleStorageLimitClearButton(button) {
+  if (!button) return;
+  button.textContent = "Clear gallery images";
+  button.style.cssText = "display:block!important;visibility:visible!important;opacity:1!important;position:relative!important;z-index:2!important;margin:14px 0 4px!important;padding:10px 15px!important;border:1px solid #7f1d1d!important;border-radius:8px!important;background:#450a0a!important;color:#ffffff!important;font-weight:700!important;font-size:14px!important;line-height:1.35!important;cursor:pointer!important;box-shadow:0 2px 7px rgba(0,0,0,.28)!important;";
+}
+function faithBindStorageLimitClearButton(root) {
+  if (!root || !root.querySelectorAll) return;
+  root.querySelectorAll(".faith-storage-clear-gallery").forEach(button => {
+    faithStyleStorageLimitClearButton(button);
+    if (button.dataset.bound === "true") return;
+    button.dataset.bound = "true";
+    button.addEventListener("click", faithClearStorageGalleryFromNotice);
+  });
+}
+// Upgrade saved Storage limit conversations created by older versions.
+// This runs on every startup, even when gallery storage is now below the
+// warning threshold, so users never have to wait for the limit to recur.
+function faithRetrofitStorageLimitButtons() {
+  if (!faithWorkspace || !Array.isArray(faithWorkspace.threads)) return;
+  let changed = false;
+  for (const thread of faithWorkspace.threads) {
+    const isStorageThread = thread.storageLimitConversation === true ||
+      String(thread.title || "").trim().toLowerCase() === "storage limit" ||
+      String(thread.html || "").toLowerCase().includes("gallery storage limit reached");
+    if (!isStorageThread) continue;
+    thread.storageLimitConversation = true;
+    const holder = document.createElement("div");
+    holder.innerHTML = thread.html || "";
+    let post = holder.querySelector(".message.ai.storage-limit-notice");
+    if (!post) {
+      post = Array.from(holder.querySelectorAll(".message.ai")).find(message =>
+        /gallery storage limit reached|100\s*mb warning threshold/i.test(message.textContent || ""));
+      if (post) post.classList.add("storage-limit-notice");
+    }
+    if (!post) post = Array.from(holder.querySelectorAll(".message.ai")).slice(-1)[0];
+    if (!post) continue;
+    post.classList.add("storage-limit-notice");
+    let body = post.querySelector(".message-text");
+    if (!body) {
+      body = document.createElement("div");
+      body.className = "message-text";
+      post.appendChild(body);
+    }
+    let button = body.querySelector(".faith-storage-clear-gallery");
+    if (!button) {
+      button = document.createElement("button");
+      button.type = "button";
+      button.className = "faith-storage-clear-gallery";
+      button.textContent = "Clear gallery images now (keep favorites)";
+      body.appendChild(button);
+      changed = true;
+    }
+    faithStyleStorageLimitClearButton(button);
+    if (thread.html !== holder.innerHTML) { thread.html = holder.innerHTML; changed = true; }
+  }
+  if (changed) {
+    try { localStorage.setItem(FAITH_WORKSPACE_KEY, JSON.stringify(faithWorkspace)); }
+    catch (_) { try { faithSaveWorkspace(); } catch (_) {} }
+  }
+}
+
+async function faithClearStorageGalleryFromNotice() {
+  if (!confirm("Clear non-favorite generated images from Faith's gallery? Favorite images will be preserved, and their chat messages will remain.")) return;
+  const response = await fetch("/api/gallery", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ action: "delete", all: true })
+  }).catch(() => null);
+  if (!response || !response.ok) {
+    alert("Faith could not clear the gallery. Your chat messages have not been removed.");
+    return;
+  }
+  faithWorkspace.gallery = faithWorkspace.gallery.filter(item => item.favorite);
+  faithWorkspace.threads.forEach(thread => {
+    const holder = document.createElement("div");
+    holder.innerHTML = thread.html || "";
+    holder.querySelectorAll(".message").forEach(message => {
+      const refs = Array.from(message.querySelectorAll("img[data-faith-image-key], img[src*='/faith-gallery-files/'], a[href*='/faith-gallery-files/']"));
+      if (refs.some(node => {
+        const ref = String(node.getAttribute("src") || node.getAttribute("href") || "");
+        return ref.includes("/faith-gallery-files/") || (node.hasAttribute("data-faith-image-key") && !ref.includes("/faith-gallery-favorites/"));
+      })) message.remove();
+    });
+    thread.html = holder.innerHTML;
+  });
+  const active = faithWorkspace.threads.find(item => item.id === faithWorkspace.activeId);
+  if (active && chat) {
+    chat.innerHTML = active.html || "";
+    faithBindReplayButtons(chat);
+  }
+  faithSaveWorkspace();
+  faithRenderSidebar();
+  await faithLoadServerGallery();
+  setExpression("hazard", "Gallery cleared; favorites preserved");
+}
+
 function faithCheckGalleryHazard(bytes) {
   const threshold = 100 * 1024 * 1024;
   if (Number(bytes) < threshold || faithHazardPromptShown) return;
@@ -2218,8 +2366,10 @@ function faithSwitchThread(id) {
   const next = faithWorkspace.threads.find(t => t.id === id);
   if (!next) return;
   faithWorkspace.activeId = id;
+  window.faithVoiceModeActive = !!next.voiceModeActive;
   chat.innerHTML = next.html || "";
   faithBindReplayButtons(chat);
+  faithBindStorageLimitClearButton(chat);
   faithRestoreThreadImages(next);
   sessionMode = (next.behaviorState || next.mode) && (next.behaviorState || next.mode) !== "chat" ? (next.behaviorState || next.mode) : "idle";
   const expressionName = next.expression || (sessionMode === "troubleshooting" ? "troubleshooting" : sessionMode === "coding" ? "coding" : sessionMode === "build" ? "build" : "ruby");
@@ -2235,6 +2385,7 @@ function faithDeleteThread(id) {
     const active = faithWorkspace.threads[0];
     chat.innerHTML = active.html || "";
     faithBindReplayButtons(chat);
+    faithBindStorageLimitClearButton(chat);
     faithRestoreThreadImages(active);
     sessionMode = (active.behaviorState || active.mode) && (active.behaviorState || active.mode) !== "chat" ? (active.behaviorState || active.mode) : "idle";
     setExpression(active.expression || "ruby", "Conversation restored");
@@ -2349,7 +2500,7 @@ async function faithDeleteAllGalleryImages() {
     thread.html = holder.innerHTML;
   });
   const active = faithWorkspace.threads.find(t => t.id === faithWorkspace.activeId);
-  if (active && chat) { chat.innerHTML = active.html || ""; faithBindReplayButtons(chat); }
+  if (active && chat) { chat.innerHTML = active.html || ""; faithBindReplayButtons(chat); faithBindStorageLimitClearButton(chat); }
   // Keep favorites in the local cache too; otherwise the gallery loader's
   // offline-migration fallback could resurrect deleted non-favorite images.
   faithWorkspace.gallery = faithWorkspace.gallery.filter(item => item.favorite);
@@ -2360,6 +2511,7 @@ function faithNewThread() {
   const thread = { id: "thread-" + Date.now().toString(36), title: "New conversation", html: "", updatedAt: Date.now(), mode: "idle", behaviorState: "idle", expression: "ruby", detail: "Ready" };
   faithWorkspace.threads.unshift(thread);
   faithWorkspace.activeId = thread.id;
+  window.faithVoiceModeActive = false;
   chat.innerHTML = "";
   sessionMode = "idle";
   setExpression("ruby", "Ready");
@@ -2368,10 +2520,13 @@ function faithNewThread() {
 function faithInitSidebar() {
   faithRenameExistingAutoReadLabel();
   faithLoadWorkspace();
+  faithRetrofitStorageLimitButtons();
   const active = faithWorkspace.threads.find(t => t.id === faithWorkspace.activeId);
   if (active) {
+    window.faithVoiceModeActive = !!active.voiceModeActive;
     if (active.html) chat.innerHTML = active.html;
     faithBindReplayButtons(chat);
+    faithBindStorageLimitClearButton(chat);
     faithRestoreThreadImages(active);
     // Restore both the saved behavior/session and the exact final expression.
     // The expression is not inferred from the most recent prompt because a
@@ -2511,9 +2666,11 @@ function faithEnsureReadAloudButton(item) {
   // innerHTML/localStorage restores markup but not addEventListener handlers.
   // Rebind every restored button instead of treating its presence as complete.
   speak.type = "button";
-  speak.textContent = "↻ Replay voice";
-  speak.setAttribute("aria-label", "Replay this Faith reply aloud");
-  speak.title = "Replay this reply on demand; it does not start automatic reading.";
+  const isVoiceModeUserMessage = item.classList.contains("cyan-voice-message");
+  const idleLabel = isVoiceModeUserMessage ? "🔊 Read aloud" : "↻ Replay voice";
+  speak.textContent = idleLabel;
+  speak.setAttribute("aria-label", isVoiceModeUserMessage ? "Read your message aloud" : "Replay this Faith reply aloud");
+  speak.title = isVoiceModeUserMessage ? "Read this cyan Voice Mode message aloud on demand." : "Replay this reply on demand; it does not start automatic reading.";
   if (speak.dataset.faithReplayHooked === "true") return;
   speak.dataset.faithReplayHooked = "true";
   speak.addEventListener("click", () => {
@@ -2522,31 +2679,42 @@ function faithEnsureReadAloudButton(item) {
     // Prefer the installed Faith voice module if it exposes a replay/speak
     // hook. Otherwise use browser speech synthesis as a dependable fallback.
     const voice = window.faithVoice;
-    const customReplay = window.faithReplayReply || window.replayFaithReply || (voice && (voice.replay || voice.speak || voice.speakText));
+    const cyanVoice = window.FaithCyanVoice;
+    // Explicit Replay is a user action and must work even when Auto-read? is off.
+    const isVoiceModeUserMessage = item.classList.contains("cyan-voice-message");
+    const customReplay = isVoiceModeUserMessage && cyanVoice && typeof cyanVoice.speakUserMessage === "function"
+      ? cyanVoice.speakUserMessage
+      : ((cyanVoice && typeof cyanVoice.replay === "function")
+        ? cyanVoice.replay
+        : (window.faithReplayReply || window.replayFaithReply || (voice && (voice.replay || voice.speak || voice.speakText))));
     if (typeof customReplay === "function") {
       try {
-        const result = customReplay.call(voice || window, spokenText, item);
-        if (result !== false) { speak.textContent = "↻ Replaying…"; setTimeout(() => { speak.textContent = "↻ Replay voice"; }, 1800); return; }
+        const result = customReplay.call(cyanVoice || voice || window, spokenText, item);
+        if (result !== false) { speak.textContent = isVoiceModeUserMessage ? "🔊 Reading…" : "↻ Replaying…"; setTimeout(() => { speak.textContent = idleLabel; }, 1800); return; }
       } catch (error) { console.warn("Faith voice replay hook failed; using browser voice.", error); }
     }
     if (!("speechSynthesis" in window) || !("SpeechSynthesisUtterance" in window)) { alert("Replay voice is not supported by this browser."); return; }
     window.speechSynthesis.cancel();
     const utterance = new SpeechSynthesisUtterance(spokenText);
     utterance.lang = navigator.language || "en-US"; utterance.rate = 1; utterance.pitch = 1; utterance.volume = 1;
-    speak.textContent = "⏸ Replaying…";
-    utterance.onend = utterance.onerror = () => { speak.textContent = "↻ Replay voice"; };
+    speak.textContent = isVoiceModeUserMessage ? "🔊 Reading…" : "⏸ Replaying…";
+    utterance.onend = utterance.onerror = () => { speak.textContent = idleLabel; };
     window.speechSynthesis.speak(utterance);
   });
 }
 
 function faithBindReplayButtons(root = chat) {
   if (!root) return;
-  root.querySelectorAll(".message.ai").forEach(faithEnsureReadAloudButton);
+  root.querySelectorAll(".message.ai, .message.you.cyan-voice-message").forEach(faithEnsureReadAloudButton);
 }
 
 function appendMessage(speaker, text, type, images = [], options = {}) {
   const item = document.createElement("div");
   item.className = `message ${type}`;
+  // Voice Mode user turns are displayed as cyan BBCode-style messages and
+  // receive the same on-demand read-aloud control as Faith's replies.
+  const isVoiceModeUserMessage = type === "you" && !!window.faithVoiceModeActive;
+  if (isVoiceModeUserMessage) item.classList.add("cyan-voice-message");
 
   const speakerNode = document.createElement("span");
   speakerNode.className = "speaker";
@@ -2557,13 +2725,18 @@ function appendMessage(speaker, text, type, images = [], options = {}) {
   const textNode = document.createElement("div");
   textNode.className = "message-text";
   textNode.innerHTML = formatFaithMessage(text);
+  if (isVoiceModeUserMessage) {
+    textNode.style.color = "#00dfff";
+    textNode.style.textShadow = "0 0 5px rgba(0, 223, 255, 0.18)";
+  }
   scheduleCodeHighlight(textNode);
   item.appendChild(textNode);
-  if (type === "ai") faithEnsureReadAloudButton(item);
+  if (type === "ai" || isVoiceModeUserMessage) faithEnsureReadAloudButton(item);
 
   appendImages(item, images, options.onGeneratedStateChange);
 
   chat.appendChild(item);
+  if (isVoiceModeUserMessage) faithEnsureReadAloudButton(item);
   chat.scrollTop = chat.scrollHeight;
   try { faithSaveWorkspace(); } catch (_) {}
   return item;
@@ -3908,12 +4081,53 @@ async function runCoderBuild(question) {
 async function submitQuestion() {
   if (busy) return;
 
-  const question = input.value.trim();
+  let question = input.value.trim();
   if (!question) return;
   faithLastUserPrompt = question;
   const turnId = ++turnSequence;
 
   input.value = "";
+
+  // Experimental Voice Mode: [cyan]text[/cyan] activates voice-only mode and
+  // speaks the enclosed text. While active, plain user messages are spoken
+  // instead of being sent to the AI. Use [cyan]exit[/cyan] to leave Voice Mode.
+  const cyanMatch = question.match(/^\s*\[cyan\]([\s\S]*?)\[\/cyan\]\s*$/i);
+  if (cyanMatch) {
+    const cyanPayload = cyanMatch[1].trim();
+    if (/^(?:exit|off|stop|disable)\s*$/i.test(cyanPayload)) {
+      window.faithVoiceModeActive = false;
+      const voiceThread = faithWorkspace.threads.find(t => t.id === faithWorkspace.activeId);
+      if (voiceThread) voiceThread.voiceModeActive = false;
+      if (voiceThread) faithPersistThreadState(voiceThread);
+      appendMessage("You", "[cyan]exit[/cyan]", "you");
+      setExpression("ruby", "Voice Mode disabled");
+      return;
+    }
+    window.faithVoiceModeActive = true;
+    const voiceThread = faithWorkspace.threads.find(t => t.id === faithWorkspace.activeId);
+    if (voiceThread) faithPersistThreadState(voiceThread);
+    question = cyanPayload;
+  }
+
+  if (window.faithVoiceModeActive) {
+    if (!question.trim()) return;
+    appendMessage("You", question, "you");
+    setExpression("voiceMode", "Reading your message aloud...");
+    const voice = window.FaithCyanVoice;
+    if (voice && typeof voice.speakUserMessage === "function") {
+      voice.speakUserMessage(question);
+    } else if ("speechSynthesis" in window && "SpeechSynthesisUtterance" in window) {
+      try {
+        window.speechSynthesis.cancel();
+        const utterance = new SpeechSynthesisUtterance(question);
+        utterance.onend = utterance.onerror = () => {
+          if (window.faithVoiceModeActive) setExpression("voiceMode", "Voice Mode is active");
+        };
+        window.speechSynthesis.speak(utterance);
+      } catch (_) {}
+    }
+    return;
+  }
   // If a file is staged, defer rendering the user turn until uploadFileToFaith
   // can put the instruction and attachment card together in one message.
   if (!pendingCodeFile) appendMessage("You", question, "you");

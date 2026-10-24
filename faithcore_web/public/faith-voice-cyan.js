@@ -17,7 +17,7 @@
 (function () {
 "use strict";
 
-var FAITH_CYAN_VOICE_VERSION = "1";
+var FAITH_CYAN_VOICE_VERSION = "2";
 var TTS_ENDPOINT = "/api/tts";
 var STORE_KEY = "faithCyanVoice";
 var SETTLE_MS = 3000;
@@ -281,13 +281,31 @@ function speakBrowserFallback(text) {
   });
 }
 
-function speakText(text) {
+function announcePlayback(active, source) {
+  try {
+    window.dispatchEvent(new CustomEvent("faith-voice-playback", {
+      detail: { active: !!active, source: source || "faith" }
+    }));
+  } catch (_) {}
+}
+
+function speakText(text, source) {
+  text = String(text || "").trim();
+  if (!text) return Promise.resolve();
   var token = ++voiceToken;
-  console.info("[Faith Voice] Reading cyan message aloud (" + text.length + " chars).");
+  source = source || "faith";
+  announcePlayback(true, source);
+  console.info("[Faith Voice] Reading message aloud (" + text.length + " chars; source=" + source + ").");
   return speakAuRobot(text, token).catch(function (e) {
     console.warn("[Faith Voice] Robot voice unavailable, browser fallback:", e && e.message ? e.message : e);
     if (token !== voiceToken) return;
     return speakBrowserFallback(text);
+  }).then(function (result) {
+    if (token === voiceToken) announcePlayback(false, source);
+    return result;
+  }, function (error) {
+    if (token === voiceToken) announcePlayback(false, source);
+    throw error;
   });
 }
 
@@ -303,7 +321,7 @@ function stop() {
 
 function checkAndSpeak() {
   settleTimer = null;
-  if (!isEnabled()) return;
+  if (!isEnabled() || window.faithVoiceModeActive) return;
   try {
     var item = lastAiItem();
     if (!item) return;
@@ -343,7 +361,7 @@ function installWatcher() {
         }
         if (m.removedNodes && m.removedNodes.length) interrupt = true; // Clear wiped the chat
       }
-      if (interrupt) { stop(); lastSpokenText = ""; }
+      if (interrupt && !window.faithVoiceModeActive) { stop(); lastSpokenText = ""; }
       scheduleCheck();
     });
     observer.observe(chatEl, { childList: true, characterData: true, subtree: true });
@@ -396,7 +414,12 @@ var FaithCyanVoice = {
   version: FAITH_CYAN_VOICE_VERSION,
   stop: stop,
   isEnabled: isEnabled,
-  setEnabled: setEnabled
+  setEnabled: setEnabled,
+  // Explicit Read Aloud is independent of the Auto-read? checkbox.
+  replay: function (text) { return speakText(text, "replay"); },
+  // Voice Mode reads the user's own message using the dedicated user-message
+  // source, independent of automatic reading being enabled or disabled.
+  speakUserMessage: function (text) { return speakText(text, "user"); }
 };
 if (typeof window !== "undefined") window.FaithCyanVoice = FaithCyanVoice;
 })();

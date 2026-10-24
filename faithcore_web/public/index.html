@@ -22,8 +22,29 @@
     .faith-sidebar button.active { background: rgba(98,132,210,.18); border-color: rgba(119,157,255,.24); }
     #faith-new-chat { width: 100%; border-color: rgba(255,255,255,.13); background: rgba(255,255,255,.035); }
     .faith-sidebar-heading { color: #91a0b9; font-size: .75rem; text-transform: uppercase; letter-spacing: .09em; padding: 8px 8px 3px; }
-    #faith-thread-list { display: flex; flex-direction: column; gap: 3px; overflow-y: auto; max-height: 42vh; }
-    .faith-thread { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-size: .85rem !important; }
+    #faith-thread-list {
+      scrollbar-width: none;
+      -ms-overflow-style: none;
+      display: flex; flex-direction: column; align-items: stretch; gap: 4px;
+      width: 100%; min-width: 0; box-sizing: border-box;
+      overflow-x: hidden; overflow-y: auto; max-height: 42vh;
+    }
+    #faith-thread-list::-webkit-scrollbar, .chat::-webkit-scrollbar { width: 0 !important; height: 0 !important; display: none !important; }
+    .chat { scrollbar-width: none; -ms-overflow-style: none; }
+    /* Keep every conversation on its own stable row; don't let global button
+       styles stretch, overlap, or force long titles to widen the sidebar. */
+    .faith-sidebar #faith-thread-list > .faith-thread {
+      display: block !important; flex: 0 0 auto !important; position: relative !important;
+      width: 100% !important; min-width: 0 !important; max-width: 100% !important;
+      height: auto !important; min-height: 36px !important; max-height: 42px !important;
+      box-sizing: border-box !important; margin: 0 !important;
+      padding: 8px 10px !important; border-radius: 8px !important;
+      font-size: .85rem !important; line-height: 1.25 !important;
+      font-weight: 500 !important; letter-spacing: normal !important;
+      text-align: left !important; white-space: nowrap !important;
+      overflow: hidden !important; text-overflow: ellipsis !important;
+      transform: none !important; writing-mode: horizontal-tb !important;
+    }
     #faith-gallery-list { display: grid; grid-template-columns: 1fr 1fr; gap: 8px; overflow-y: auto; max-height: 72vh; }
     .faith-gallery-card { min-width: 0; padding: 6px; border: 1px solid rgba(255,255,255,.09); border-radius: 10px; background: rgba(255,255,255,.025); }
     .faith-gallery-card img { width: 100%; aspect-ratio: 1; object-fit: cover; display: block; border-radius: 6px; }
@@ -689,7 +710,7 @@
 })();
 </script>
 
-  <script src="/faith-voice-cyan.js?v=1" defer></script>
+  <script src="/faith-voice-cyan.js?v=2" defer></script>
   <script src="/faith-ptt.js" defer></script>
 
 </body>
