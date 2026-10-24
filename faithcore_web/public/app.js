@@ -2099,9 +2099,12 @@ function faithBindStorageLimitClearButton(root) {
   if (!root || !root.querySelectorAll) return;
   root.querySelectorAll(".faith-storage-clear-gallery").forEach(button => {
     faithStyleStorageLimitClearButton(button);
-    if (button.dataset.bound === "true") return;
-    button.dataset.bound = "true";
-    button.addEventListener("click", faithClearStorageGalleryFromNotice);
+    button.type = "button";
+    // Bind directly to the current DOM node. Saved conversation HTML does not
+    // retain event listeners or dataset flags, so never trust a stale bound flag.
+    if (button._faithClearGalleryHandler) button.removeEventListener("click", button._faithClearGalleryHandler);
+    button._faithClearGalleryHandler = faithClearStorageGalleryFromNotice;
+    button.addEventListener("click", button._faithClearGalleryHandler);
   });
 }
 // Upgrade saved Storage limit conversations created by older versions.
@@ -2151,39 +2154,19 @@ function faithRetrofitStorageLimitButtons() {
   }
 }
 
-async function faithClearStorageGalleryFromNotice() {
-  if (!confirm("Clear non-favorite generated images from Faith's gallery? Favorite images will be preserved, and their chat messages will remain.")) return;
-  const response = await fetch("/api/gallery", {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ action: "delete", all: true })
-  }).catch(() => null);
-  if (!response || !response.ok) {
-    alert("Faith could not clear the gallery. Your chat messages have not been removed.");
+async function faithClearStorageGalleryFromNotice(event) {
+  if (event) { event.preventDefault(); event.stopPropagation(); }
+  if (window.faithStorageClearInProgress) return;
+  window.faithStorageClearInProgress = true;
+  // Use the exact same established action as the working Gallery panel button.
+  // Keeping a second implementation here caused the Storage limit control to
+  // drift from the real gallery deletion flow.
+  if (typeof faithDeleteAllGalleryImages === "function") {
+    Promise.resolve(faithDeleteAllGalleryImages()).finally(() => { window.faithStorageClearInProgress = false; });
     return;
   }
-  faithWorkspace.gallery = faithWorkspace.gallery.filter(item => item.favorite);
-  faithWorkspace.threads.forEach(thread => {
-    const holder = document.createElement("div");
-    holder.innerHTML = thread.html || "";
-    holder.querySelectorAll(".message").forEach(message => {
-      const refs = Array.from(message.querySelectorAll("img[data-faith-image-key], img[src*='/faith-gallery-files/'], a[href*='/faith-gallery-files/']"));
-      if (refs.some(node => {
-        const ref = String(node.getAttribute("src") || node.getAttribute("href") || "");
-        return ref.includes("/faith-gallery-files/") || (node.hasAttribute("data-faith-image-key") && !ref.includes("/faith-gallery-favorites/"));
-      })) message.remove();
-    });
-    thread.html = holder.innerHTML;
-  });
-  const active = faithWorkspace.threads.find(item => item.id === faithWorkspace.activeId);
-  if (active && chat) {
-    chat.innerHTML = active.html || "";
-    faithBindReplayButtons(chat);
-  }
-  faithSaveWorkspace();
-  faithRenderSidebar();
-  await faithLoadServerGallery();
-  setExpression("hazard", "Gallery cleared; favorites preserved");
+  window.faithStorageClearInProgress = false;
+  alert("The gallery deletion action is unavailable. Please use the Gallery panel's delete-all button.");
 }
 
 function faithCheckGalleryHazard(bytes) {
