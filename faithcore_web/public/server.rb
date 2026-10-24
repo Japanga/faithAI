@@ -4422,6 +4422,50 @@ server.mount_proc "/api/gallery" do |req, res|
         status, result = faith_gallery_set_favorite.call(payload)
         json_response.call(res, status, result)
         next
+      elsif payload["action"] == "delete"
+        # Use the same POST transport that fixed favoriting on older WEBrick builds.
+        # Resolve IDs/filenames/URLs against both regular and favorites folders.
+        if payload["all"] == true
+          Dir.glob(File.join(FAITH_GALLERY_DIR, "*")).each { |path| FileUtils.rm_f(path) if File.file?(path) }
+          json_response.call(res, 200, { ok: true })
+          next
+        end
+        id = payload["id"].to_s
+        requested_aliases = [id, payload["filename"].to_s, payload["url"].to_s].reject(&:empty?).map do |value|
+          value.to_s.split(/[?#]/, 2).first.to_s.sub(%r{\A.*/}, "")
+        end
+        deleted_path = nil
+        [[FAITH_GALLERY_DIR, false], [FAITH_GALLERY_FAVORITES_DIR, true]].each do |directory, _favorite_folder|
+          break if deleted_path
+          Dir.glob(File.join(directory, "*")).each do |image_path|
+            next unless File.file?(image_path) && image_path.match?(/\.(?:png|jpe?g|webp|gif)\z/i)
+            meta_path = image_path + ".json"
+            meta = File.file?(meta_path) ? (JSON.parse(File.read(meta_path, encoding: "UTF-8")) rescue {}) : {}
+            basename = File.basename(image_path)
+            requested_basename = begin
+              URI.decode_www_form_component(id.split(/[?#]/, 2).first.to_s.sub(%r{\A.*/}, ""))
+            rescue StandardError
+              id.split(/[?#]/, 2).first.to_s.sub(%r{\A.*/}, "")
+            end
+            meta_url_name = meta["url"].to_s.split(/[?#]/, 2).first.to_s.sub(%r{\A.*/}, "")
+            candidates = [meta["id"], basename, meta["filename"], meta_url_name].compact.map(&:to_s)
+            matches = candidates.any? do |candidate|
+              candidate == id || candidate == requested_basename || candidate.casecmp?(requested_basename) ||
+                requested_aliases.any? { |alias_name| candidate == alias_name || candidate.casecmp?(alias_name) }
+            end
+            next unless matches
+            FileUtils.rm_f(image_path)
+            FileUtils.rm_f(meta_path)
+            deleted_path = image_path unless File.exist?(image_path)
+            break
+          end
+        end
+        if deleted_path
+          json_response.call(res, 200, { ok: true, filename: File.basename(deleted_path) })
+        else
+          json_response.call(res, 404, { error: "Image not found in gallery storage for id: #{id}; refresh the gallery and try again." })
+        end
+        next
       end
       data_url = payload["url"].to_s
       match = data_url.match(/\Adata:image\/(png|jpeg|jpg|webp|gif);base64,([A-Za-z0-9+\/=\r\n]+)\z/)
@@ -4450,9 +4494,13 @@ server.mount_proc "/api/gallery" do |req, res|
     elsif req.request_method == "DELETE"
       payload = req.body.to_s.empty? ? {} : JSON.parse(req.body.to_s)
       if payload["all"] == true
-        # Only remove top-level gallery files. The favorites subfolder is preserved.
+        # Bulk delete is intentionally limited to non-favorite image files at
+        # the gallery root. Never recurse into, or delete anything from,
+        # FAITH_GALLERY_FAVORITES_DIR.
         Dir.glob(File.join(FAITH_GALLERY_DIR, "*")).each do |path|
-          File.delete(path) if File.file?(path)
+          next unless File.file?(path)
+          next unless path.match?(/\.(?:png|jpe?g|webp|gif)(?:\.json)?\z/i)
+          File.delete(path)
         end
       else
         id = payload["id"].to_s
