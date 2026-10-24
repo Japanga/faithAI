@@ -687,7 +687,15 @@
     </div>
     <div class="hintEl" id="fvs-castCapEl"></div>
     <div id="fvs-cutLoadEl" class="fvs-loadingEl" hidden><span class="fvs-dotsEl">painting your character</span></div>
-    <img id="fvs-cutPrevImgEl" class="fvs-checkerEl" hidden alt="your character cutout">
+    <div class="rowEl" id="fvs-eraseToolsEl" style="margin-top:8px" hidden>
+      <button id="fvs-eraseToggleBtn" type="button" aria-pressed="false"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="m3 15 9-9 9 9-5 5H8z" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linejoin="round"/><path d="m8 10 6 6" stroke="currentColor" stroke-width="1.8"/></svg> Fill bucket: off</button>
+      <label for="fvs-eraseSizeInput" style="align-self:center">Edge tolerance</label>
+      <input id="fvs-eraseSizeInput" type="range" min="0" max="100" value="28" style="max-width:150px">
+      <button id="fvs-eraseUndoBtn" type="button">Undo</button>
+      <button id="fvs-eraseResetBtn" type="button">Reset cutout</button>
+    </div>
+    <p class="hintEl" id="fvs-eraseHintEl" hidden>Turn on the fill bucket, then click a connected background area to make it transparent. Adjust edge tolerance for similar colors. Transparent areas show the checkerboard.</p>
+    <canvas id="fvs-cutPrevImgEl" class="fvs-checkerEl" width="768" height="768" hidden aria-label="Character cutout editor"></canvas>
     <div class="hintEl" id="fvs-cutCapEl"></div>
   </section>
 
@@ -727,7 +735,7 @@
       </div>
       <div class="fieldEl" style="max-width:200px">
         <label>&nbsp;</label>
-        <button id="fvs-genBgBtn" type="button">🖼️ Make background</button>
+        <button id="fvs-genBgBtn" type="button"><svg viewBox="0 0 24 24" aria-hidden="true"><rect x="3" y="4" width="18" height="16" rx="2" fill="none" stroke="currentColor" stroke-width="1.8"/><circle cx="8" cy="9" r="1.7" fill="currentColor"/><path d="m4 17 5-5 3 3 3-4 5 6" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linejoin="round"/></svg> Make background</button>
       </div>
     </div>
     <div id="fvs-bgLoadEl" class="fvs-loadingEl" hidden><span class="fvs-dotsEl">painting background</span></div>
@@ -761,8 +769,10 @@
           <input id="fvs-fpsInput" type="range" min="1" max="12" value="5" style="flex:1">
           <b id="fvs-fpsValEl">5</b>
         </div>
-        <label for="fvs-scaleInput">Character size <span id="fvs-scaleValEl">0.85</span></label>
-        <input id="fvs-scaleInput" type="range" min="0.3" max="1.2" step="0.05" value="0.85">
+        <div id="fvs-stageScaleCompatEl" hidden aria-hidden="true">
+          <label for="fvs-scaleInput">Character size <span id="fvs-scaleValEl">0.85</span></label>
+          <input id="fvs-scaleInput" type="range" min="0.3" max="1.2" step="0.05" value="0.85">
+        </div>
         <div class="hintEl" id="fvs-selCapEl">No character selected — click one on the stage or in the scene list.</div>
         <div style="display:flex; gap:6px; flex-wrap:wrap">
           <button id="fvs-setABtn" type="button">Set A ●</button>
@@ -865,7 +875,7 @@
     <p class="hintEl" style="margin:0 0 8px">Bank moments as clips, then join them into a single video. <b>＋ Add current stage</b> freezes this exact scene (which characters are visible, poses, paths, background) as a clip — handy with alternates: keep two similar characters on cast cards, hide one with its eye button, add the stage, then flip visibility and add it again for the next shot. <b>⬆ Upload</b> adds your exported .mp4s. Reorder with ◀ ▶, then export.</p>
     <div class="rowEl">
       <button id="fvs-tlAddStageBtn" type="button">＋ Add current stage as clip</button>
-      <button id="fvs-tlUploadBtn" type="button">⬆ Upload .mp4 clip(s)</button>
+      <button id="fvs-tlUploadBtn" type="button"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 15V3m-4 4 4-4 4 4M4 14v6h16v-6" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"/></svg> Upload .mp4 clip(s)</button>
       <button id="fvs-tlExportBtn" type="button" class="primaryBtn">⬇ Export timeline (.mp4)</button>
       <button id="fvs-tlClearBtn" type="button">Clear</button>
     </div>

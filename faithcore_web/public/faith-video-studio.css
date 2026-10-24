@@ -27,9 +27,9 @@
   #fvs-stripEl canvas { width: 84px; height: 84px; border-radius: 6px; border: 1px solid rgba(128,128,128,.4); }
   #fvs-bgPrevImgEl { max-width: min(100%, 420px); border-radius: 8px; display: block; margin-top: 8px; }
   #fvs-sheetPrevImgEl { max-width: min(100%, 460px); border-radius: 8px; margin-top: 8px; }
-  #fvs-stageCanvasEl { width: min(100%, 460px); aspect-ratio: 1; border-radius: 8px; border: 1px solid rgba(128,128,128,.4); touch-action: none; }
+  #fvs-stageCanvasEl { width: min(100%, 460px); height: auto; aspect-ratio: 1; flex: 0 0 auto; border-radius: 8px; border: 1px solid rgba(128,128,128,.4); touch-action: none; }
   #fvs-stageSideEl { flex: 1 1 220px; display: flex; flex-direction: column; gap: 8px; font-size: 0.85rem; }
-  #fvs-stageWrapEl { display: flex; gap: 12px; flex-wrap: wrap; }
+  #fvs-stageWrapEl { display: flex; gap: 12px; flex-wrap: wrap; align-items: flex-start; }
   .fvs-loadingEl { font-size: 0.85rem; opacity: 0.8; padding: 12px 0; }
   .fvs-dotsEl::after { content: ""; animation: dotsAnim 1.1s steps(4) infinite; }
   @keyframes dotsAnim { 0% { content: ""; } 25% { content: "."; } 50% { content: ".."; } 75% { content: "..."; } }
@@ -52,8 +52,8 @@
   #fvs-exportRowEl { display: flex; gap: 8px; flex-wrap: wrap; }
   #fvs-exportRowEl button { font-size: 0.85rem; }
   #fvs-playBtn { display: inline-flex; align-items: center; gap: 6px; }
-  #fvs-mp4PrevEl { width: min(100%, 460px); aspect-ratio: 1; border-radius: 8px; border: 1px solid rgba(128,128,128,.4); display: block; margin-top: 8px; background: #000; }
-  #fvs-tlPrevEl { width: min(100%, 460px); aspect-ratio: 1; border-radius: 8px; border: 1px solid rgba(128,128,128,.4); display: block; margin-top: 8px; background: #000; }
+  #fvs-mp4PrevEl { width: min(100%, 320px); max-width: 100%; height: auto !important; max-height: 190px; aspect-ratio: 16 / 9; object-fit: contain; border-radius: 8px; border: 1px solid rgba(128,128,128,.4); display: block; margin-top: 8px; background: #000; }
+  #fvs-tlPrevEl { width: min(100%, 320px); max-width: 100%; height: auto !important; max-height: 190px; aspect-ratio: 16 / 9; object-fit: contain; border-radius: 8px; border: 1px solid rgba(128,128,128,.4); display: block; margin-top: 8px; background: #000; }
   #fvs-tlEl { display: flex; gap: 8px; flex-wrap: wrap; margin-top: 6px; }
 
 /* Faith dark-theme fit (Faith hosts this on a dark page; our controls inherit light text). */
@@ -74,3 +74,21 @@
 #mp4PrevEl[hidden], #tlPrevEl[hidden] { display: none !important; }
 #stageCanvasEl { height: auto !important; }
 #mp4PrevEl, #tlPrevEl { object-fit: contain; height: auto !important; }
+
+/* Workspace action menu and compact clip trimming controls */
+#fvs-workspace-menu { position:fixed; z-index:99999; min-width:150px; padding:5px; border:1px solid rgba(255,255,255,.16); border-radius:9px; background:#111722; box-shadow:0 8px 28px rgba(0,0,0,.4); }
+#fvs-workspace-menu[hidden] { display:none !important; }
+#fvs-workspace-menu button { display:block; width:100%; text-align:left; border:0; background:transparent; padding:8px 10px; color:#ffaaaa; }
+#fvs-workspace-menu button:hover { background:rgba(255,90,90,.13); }
+.fvs-trim-controls { display:flex; flex-direction:column; gap:4px; padding:5px 0; }
+.fvs-trim-controls label { display:flex; align-items:center; justify-content:space-between; gap:5px; font-size:.7rem; }
+.fvs-trim-controls input { width:62px; min-width:0; padding:3px; font-size:.75rem; }
+
+  #fvs-cutPrevImgEl { width: min(100%, 320px); height: auto; aspect-ratio: 1 / 1; display: block; margin-top: 8px; touch-action: none; border-radius: 8px; }
+  #fvs-eraseToolsEl { align-items: center; flex-wrap: wrap; gap: 8px; }
+
+
+/* Consistent inline SVG controls; avoid missing/emoji-dependent icons. */
+#fvsRootEl button { display: inline-flex; align-items: center; justify-content: center; gap: 7px; }
+#fvsRootEl button svg { display: block; flex: 0 0 18px; width: 18px; height: 18px; overflow: visible; }
+#fvs-eraseToolsEl input[type="range"] { accent-color: #7c5cff; }

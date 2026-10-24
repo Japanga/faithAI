@@ -4129,6 +4129,20 @@ async function submitQuestion() {
     question = cyanPayload;
   }
 
+  const userVisibleQuestion = question;
+  // Video capability questions enter Faith's Video Mode behavior. Keep this as
+  // a normal chat response, but direct the answer to the dedicated Studio tab
+  // rather than implying that video generation starts automatically in chat.
+  const asksVideoCapability = /\b(?:can you|can faith|are you able to|are you capable of|do you (?:make|create|generate)|does faith)\b.{0,90}\b(?:video|videos|video clips|mp4)\b|\b(?:video|videos)\b.{0,60}\b(?:capable|capability|make|create|generate)\b/i.test(question)
+    && !/\b(?:how do i|how to|why does|fix|debug|edit this code)\b/i.test(question);
+  if (asksVideoCapability && !window.faithVoiceModeActive && sessionMode !== "build" && sessionMode !== "coding" && sessionMode !== "troubleshooting") {
+    sessionMode = "video";
+    const videoThread = faithWorkspace && faithWorkspace.threads ? faithWorkspace.threads.find(t => t.id === faithWorkspace.activeId) : null;
+    if (videoThread) { videoThread.behaviorState = "video"; videoThread.mode = "video"; faithPersistThreadState(videoThread); }
+    setExpression("explanation", "Video Mode — Studio workflow");
+    question += "\n\n[Faith behavior instruction: This user is asking about your video-making capability. Answer confidently that video creation/editing is supported through the dedicated Studio workspace. Explain that the workflow is not automatically started inside ordinary chat: they should open the Studio tab to build/edit the video there. Do not say video creation is impossible or that it must be done manually outside Faith. Keep the answer concise and helpful.]";
+  }
+
   if (window.faithVoiceModeActive) {
     if (!question.trim()) return;
     appendMessage("You", question, "you");
@@ -4150,7 +4164,7 @@ async function submitQuestion() {
   }
   // If a file is staged, defer rendering the user turn until uploadFileToFaith
   // can put the instruction and attachment card together in one message.
-  if (!pendingCodeFile) appendMessage("You", question, "you");
+  if (!pendingCodeFile) appendMessage("You", userVisibleQuestion, "you");
 
   const isTroubleshootingEntry = isTroubleshootingEntryRequest(question) || /\b(?:troubleshoot|troubleshooting|debug|debugging)\b/i.test(question);
   const isModeOnlyRequest = /\b(?:enter|start|begin|activate|switch\s+(?:to|into)|go\s+into)\s+(?:the\s+)?troubleshooting(?:\s+mode|\s+session)?\b/i.test(question) || /^\s*(?:let'?s\s+)?(?:do|start)\s+troubleshooting\s*$/i.test(question);

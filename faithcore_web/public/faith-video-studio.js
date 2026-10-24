@@ -346,6 +346,89 @@ function loadImg(dataUrl) {
   });
 }
 
+// Connected-region fill bucket for removing background patches from generated cutouts.
+let eraseActive = false, eraseDrawing = false, eraseOriginal = null, eraseUndoData = null;
+function showCutoutEditor(dataUrl, setOriginal = true) {
+  const canvas = $("cutPrevImgEl"), tools = $("eraseToolsEl"), hint = $("eraseHintEl");
+  if (!canvas) return Promise.resolve();
+  return new Promise((resolve, reject) => {
+    const img = new Image();
+    img.onload = () => {
+      const ctx = canvas.getContext("2d");
+      canvas.width = img.naturalWidth || 768; canvas.height = img.naturalHeight || 768;
+      ctx.clearRect(0, 0, canvas.width, canvas.height); ctx.drawImage(img, 0, 0, canvas.width, canvas.height);
+      if (setOriginal) eraseOriginal = canvas.toDataURL("image/png");
+      eraseUndoData = null;
+      canvas.hidden = false; tools.hidden = false; hint.hidden = false;
+      resolve();
+    };
+    img.onerror = reject;
+    img.src = dataUrl;
+  });
+}
+function erasePoint(e) {
+  const canvas = $("cutPrevImgEl"), rect = canvas.getBoundingClientRect();
+  if (!rect.width || !rect.height) return false;
+  const x = Math.max(0, Math.min(canvas.width - 1, Math.floor((e.clientX - rect.left) * canvas.width / rect.width)));
+  const y = Math.max(0, Math.min(canvas.height - 1, Math.floor((e.clientY - rect.top) * canvas.height / rect.height)));
+  const ctx = canvas.getContext("2d", { willReadFrequently: true });
+  const image = ctx.getImageData(0, 0, canvas.width, canvas.height);
+  const data = image.data, w = canvas.width, h = canvas.height, seed = (y * w + x) * 4;
+  if (data[seed + 3] === 0) return false;
+  const sr = data[seed], sg = data[seed + 1], sb = data[seed + 2];
+  const tolerance = Number($("eraseSizeInput").value) * 2.55;
+  const tol2 = tolerance * tolerance;
+  const queue = new Int32Array(w * h);
+  const seen = new Uint8Array(w * h);
+  let head = 0, tail = 0, changed = false;
+  const seedPixel = y * w + x; queue[tail++] = seedPixel; seen[seedPixel] = 1;
+  while (head < tail) {
+    const idx = queue[head++], p = idx * 4;
+    if (data[p + 3] === 0) continue;
+    const dr = data[p] - sr, dg = data[p + 1] - sg, db = data[p + 2] - sb;
+    if (dr * dr + dg * dg + db * db > tol2) continue;
+    data[p + 3] = 0; changed = true;
+    const px = idx % w, py = (idx / w) | 0;
+    const neighbors = [px > 0 ? idx - 1 : -1, px < w - 1 ? idx + 1 : -1, py > 0 ? idx - w : -1, py < h - 1 ? idx + w : -1];
+    for (let n = 0; n < 4; n++) { const ni = neighbors[n]; if (ni >= 0 && !seen[ni]) { seen[ni] = 1; queue[tail++] = ni; } }
+  }
+  if (changed) ctx.putImageData(image, 0, 0);
+  return changed;
+}
+async function commitCutoutEdit() {
+  const canvas = $("cutPrevImgEl"); if (!state.cutout || canvas.hidden) return;
+  const dataUrl = canvas.toDataURL("image/png");
+  state.cutout.dataUrl = dataUrl; state.cutout.img = await loadImg(dataUrl);
+  // Cast entries share this cutout object when they originate from the current character.
+  for (const c of state.cast) if (c.cutout && c.cutout.prompt === state.cutout.prompt) c.cutout = state.cutout;
+  renderCast(); drawStrip(); drawStage();
+  $("cutCapEl").textContent = "Cutout cleaned manually — transparent edits are included in exports.";
+}
+$("eraseToggleBtn").addEventListener("click", () => {
+  eraseActive = !eraseActive;
+  const b = $("eraseToggleBtn"); b.innerHTML = (eraseActive ? '<svg viewBox="0 0 24 24" aria-hidden="true"><path d="m3 15 9-9 9 9-5 5H8z" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linejoin="round"/><path d="m8 10 6 6" stroke="currentColor" stroke-width="1.8"/></svg> Fill bucket: ON' : '<svg viewBox="0 0 24 24" aria-hidden="true"><path d="m3 15 9-9 9 9-5 5H8z" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linejoin="round"/><path d="m8 10 6 6" stroke="currentColor" stroke-width="1.8"/></svg> Fill bucket: off');
+  b.setAttribute("aria-pressed", eraseActive ? "true" : "false");
+  b.style.background = eraseActive ? "#450a0a" : ""; b.style.color = eraseActive ? "#fff" : "";
+  $("cutPrevImgEl").style.cursor = eraseActive ? "crosshair" : "default";
+});
+$("cutPrevImgEl").addEventListener("pointerdown", (e) => {
+  if (!eraseActive || !state.cutout) return;
+  eraseDrawing = true; eraseUndoData = $("cutPrevImgEl").toDataURL("image/png");
+  $("cutPrevImgEl").setPointerCapture(e.pointerId); erasePoint(e); e.preventDefault();
+});
+$("cutPrevImgEl").addEventListener("pointermove", (e) => { if (eraseDrawing) erasePoint(e); });
+$("cutPrevImgEl").addEventListener("pointerup", async () => { if (!eraseDrawing) return; eraseDrawing = false; await commitCutoutEdit(); });
+$("cutPrevImgEl").addEventListener("pointercancel", () => { eraseDrawing = false; });
+$("eraseUndoBtn").addEventListener("click", async () => {
+  if (!eraseUndoData) { status("Nothing to undo yet.", false); return; }
+  const restore = eraseUndoData; await showCutoutEditor(restore, false); await commitCutoutEdit(); eraseUndoData = null;
+});
+$("eraseResetBtn").addEventListener("click", async () => {
+  if (!eraseOriginal) { status("Generate a character first.", false); return; }
+  const restore = eraseOriginal; await showCutoutEditor(restore, false); await commitCutoutEdit(); eraseUndoData = null;
+  status("Restored the original generated cutout.", false);
+});
+
 
 $("fpsInput").addEventListener("input", () => { $("fpsValEl").textContent = $("fpsInput").value; if (typeof renderTimeline === "function" && state.timeline) renderTimeline(); });
 $("scaleInput").addEventListener("input", () => { $("scaleValEl").textContent = $("scaleInput").value; drawStage(); drawStrip(); });
@@ -385,9 +468,7 @@ async function makeCharacter() {
   try {
     state.cutout = await generateCutout();
     state.playIdx = 0;
-    const prev = $("cutPrevImgEl");
-    prev.src = state.cutout.dataUrl;
-    prev.hidden = false;
+    await showCutoutEditor(state.cutout.dataUrl);
     $("cutCapEl").textContent = "Painted on white, keyed out — ready to animate.";
     drawStrip();
     drawStage();
@@ -1547,7 +1628,7 @@ async function tlAddFiles(files) {
       status("Reading " + (f.name || "video") + "…", true);
       const meta = await tlProbeVideo(f);
       state.tlSeq++;
-      state.timeline.push({ kind: "mp4", id: state.tlSeq, name: ((f.name || "clip.mp4").replace(/\.[^.]+$/, "") || ("Clip " + state.tlSeq)).slice(0, 24), url: meta.url, duration: meta.duration, thumb: meta.thumb });
+      state.timeline.push({ kind: "mp4", id: state.tlSeq, name: ((f.name || "clip.mp4").replace(/\.[^.]+$/, "") || ("Clip " + state.tlSeq)).slice(0, 24), url: meta.url, duration: meta.duration, trimStart: 0, trimEnd: meta.duration, thumb: meta.thumb });
     } catch (e) {
       console.warn("probe failed", e);
       status("Couldn't read " + (f.name || "that file") + " (" + (e && e.message ? e.message : e) + ").", false);
@@ -1584,8 +1665,32 @@ function renderTimeline() {
     dur.style.cssText = "font-size:0.8rem;opacity:0.7";
     dur.textContent = clip.kind === "stage"
       ? clip.frames + " frames (~" + (clip.frames / fps).toFixed(1) + "s)"
-      : clip.duration.toFixed(1) + "s video";
+      : (Math.max(0.05, (clip.trimEnd == null ? clip.duration : clip.trimEnd) - (clip.trimStart || 0))).toFixed(1) + "s selected";
     card.appendChild(dur);
+    const trim = document.createElement("div");
+    trim.className = "fvs-trim-controls";
+    if (clip.kind === "mp4") {
+      clip.trimStart = Math.max(0, Math.min(Number(clip.trimStart) || 0, Math.max(0, clip.duration - 0.05)));
+      clip.trimEnd = Math.max(clip.trimStart + 0.05, Math.min(Number(clip.trimEnd == null ? clip.duration : clip.trimEnd), clip.duration));
+      [["In (s)", "trimStart", 0, Math.max(0, clip.trimEnd - 0.05)], ["Out (s)", "trimEnd", Math.min(clip.trimStart + 0.05, clip.duration), clip.duration]].forEach(function (cfg) {
+        const lab = document.createElement("label"); lab.textContent = cfg[0];
+        const inp = document.createElement("input"); inp.type = "number"; inp.min = String(cfg[2]); inp.max = String(cfg[3]); inp.step = "0.1"; inp.value = Number(clip[cfg[1]]).toFixed(1);
+        inp.addEventListener("change", function () {
+          let v = Number(inp.value); if (!Number.isFinite(v)) v = cfg[2];
+          v = Math.max(cfg[2], Math.min(cfg[3], v));
+          if (cfg[1] === "trimStart") { clip.trimStart = Math.min(v, clip.trimEnd - 0.05); }
+          else { clip.trimEnd = Math.max(v, clip.trimStart + 0.05); }
+          renderTimeline(); saveWorkspaceSoon();
+        });
+        lab.appendChild(inp); trim.appendChild(lab);
+      });
+    } else {
+      const lab = document.createElement("label"); lab.textContent = "Length (frames)";
+      const inp = document.createElement("input"); inp.type = "number"; inp.min = "1"; inp.max = "300"; inp.step = "1"; inp.value = String(clip.frames || 1);
+      inp.addEventListener("change", function () { clip.frames = Math.max(1, Math.min(300, Math.round(Number(inp.value) || 1))); renderTimeline(); saveWorkspaceSoon(); });
+      lab.appendChild(inp); trim.appendChild(lab);
+    }
+    card.appendChild(trim);
     const row = document.createElement("div");
     row.style.cssText = "display:flex;gap:4px";
     const mk = (t, title) => {
@@ -1617,7 +1722,7 @@ function renderTimeline() {
   const n = state.timeline.length;
   if (!n) { $("tlCapEl").textContent = "No clips yet — add the current stage or upload .mp4s."; return; }
   let secs = 0;
-  for (const c of state.timeline) secs += c.kind === "stage" ? c.frames / fps : c.duration;
+  for (const c of state.timeline) secs += c.kind === "stage" ? c.frames / fps : Math.max(0.05, (c.trimEnd == null ? c.duration : c.trimEnd) - (c.trimStart || 0));
   $("tlCapEl").textContent = n + (n === 1 ? " clip" : " clips") + " · ~" + secs.toFixed(1) + "s at current speed · exports top to bottom, left to right.";
 }
 
@@ -1642,7 +1747,7 @@ $("tlExportBtn").addEventListener("click", async () => {
     const fps = Math.max(1, Number($("fpsInput").value) || 5);
     const plan = state.timeline.map((clip) => ({
       clip,
-      frames: clip.kind === "stage" ? clip.frames : Math.max(1, Math.round(clip.duration * fps)),
+      frames: clip.kind === "stage" ? clip.frames : Math.max(1, Math.round(Math.max(0.05, (clip.trimEnd == null ? clip.duration : clip.trimEnd) - (clip.trimStart || 0)) * fps)),
     }));
     const total = plan.reduce((a, p) => a + p.frames, 0);
     if (!total) throw new Error("nothing to export");
@@ -1689,7 +1794,9 @@ $("tlExportBtn").addEventListener("click", async () => {
         const v = await tlLoadVideo(p.clip.url);
         try {
           for (let j = 0; j < p.frames; j++) {
-            const t = Math.min(Math.max(0, (j + 0.5) / fps), Math.max(0, p.clip.duration - 0.05));
+            const clipStart = Math.max(0, Number(p.clip.trimStart) || 0);
+            const clipEnd = Math.min(p.clip.duration, Number(p.clip.trimEnd == null ? p.clip.duration : p.clip.trimEnd));
+            const t = Math.min(clipStart + (j + 0.5) / fps, Math.max(clipStart, clipEnd - 0.025));
             await seekVideo(v, t);
             px.fillStyle = "#000"; px.fillRect(0, 0, W, H);
             drawCoverFit(px, v, v.videoWidth || W, v.videoHeight || H, W, H);
@@ -2138,6 +2245,8 @@ $("sheetDiceBtn").addEventListener("click", () => {
 /* FVS-WORKSPACES-START */
 const FVS_STORE_KEY = "faithVideoStudioV1";
 let fvsWorkspace = null;
+let fvsWorkspaceMenu = null;
+let fvsWorkspaceOperation = 0;
 let fvsSaveTimer = 0;
 let fvsLoading = false;
 let fvsDirty = false;
@@ -2252,7 +2361,7 @@ function saveWorkspace(loud) {
 function saveWorkspaceSoon() {
   fvsDirty = true;
   clearTimeout(fvsSaveTimer);
-  fvsSaveTimer = setTimeout(function () { if (fvsDirty) saveWorkspace(false); }, 1500);
+  fvsSaveTimer = setTimeout(function () { if (fvsDirty && !fvsLoading) saveWorkspace(false); }, 1500);
 }
 function renderWorkspaceList() {
   const box = $("project-list");
@@ -2263,11 +2372,19 @@ function renderWorkspaceList() {
     b.type = "button";
     b.className = "fvs-thread" + (p.id === fvsWorkspace.activeId ? " active" : "");
     b.textContent = p.title || "Untitled workspace";
-    b.title = b.textContent + " \u2014 right-click to delete";
+    b.title = b.textContent + " \u2014 right-click for workspace actions";
     b.addEventListener("click", function () { switchWorkspace(p.id).catch(function (e) { console.warn("switch failed", e); }); });
     b.addEventListener("contextmenu", function (e) {
       e.preventDefault();
-      deleteWorkspace(p.id).catch(function (err) { console.warn("delete failed", err); });
+      if (!fvsWorkspaceMenu) {
+        fvsWorkspaceMenu = document.createElement("div"); fvsWorkspaceMenu.id = "fvs-workspace-menu"; fvsWorkspaceMenu.hidden = true;
+        const delAction = document.createElement("button"); delAction.type = "button"; delAction.textContent = "Delete workspace";
+        delAction.addEventListener("click", function () { const target = fvsWorkspaceMenu.dataset.workspaceId; fvsWorkspaceMenu.hidden = true; if (target) deleteWorkspace(target).catch(function (err) { console.warn("delete failed", err); }); });
+        fvsWorkspaceMenu.appendChild(delAction); document.body.appendChild(fvsWorkspaceMenu);
+        document.addEventListener("click", function (ev) { if (fvsWorkspaceMenu && !fvsWorkspaceMenu.contains(ev.target)) fvsWorkspaceMenu.hidden = true; });
+        document.addEventListener("keydown", function (ev) { if (ev.key === "Escape" && fvsWorkspaceMenu) fvsWorkspaceMenu.hidden = true; });
+      }
+      fvsWorkspaceMenu.dataset.workspaceId = p.id; fvsWorkspaceMenu.style.left = Math.min(e.clientX, window.innerWidth - 170) + "px"; fvsWorkspaceMenu.style.top = Math.min(e.clientY, window.innerHeight - 55) + "px"; fvsWorkspaceMenu.hidden = false;
     });
     box.appendChild(b);
   });
@@ -2367,8 +2484,8 @@ async function applyWorkspaceData(d) {
     state.playIdx = 0;
     refreshAllUI();
     const cp = $("cutPrevImgEl");
-    if (state.cutout) { cp.src = state.cutout.dataUrl; cp.hidden = false; $("cutCapEl").textContent = "Workspace loaded \u2014 ready to animate."; }
-    else { cp.hidden = true; $("cutCapEl").textContent = ""; }
+    if (state.cutout) { await showCutoutEditor(state.cutout.dataUrl); $("cutCapEl").textContent = "Workspace loaded — ready to animate."; }
+    else { cp.hidden = true; $("eraseToolsEl").hidden = true; $("eraseHintEl").hidden = true; $("cutCapEl").textContent = ""; }
     $("sheetDiceBtn").hidden = !state.sheet;
     if (!state.sheet) $("sheetPrevImgEl").hidden = true;
     renderTimeline();
@@ -2386,7 +2503,8 @@ async function switchWorkspace(id) {
   ensureWorkspaceStore();
   if (fvsLoading) { status("Still loading \u2014 one moment\u2026", false); return; }
   if (id === fvsWorkspace.activeId) return;
-  saveWorkspace(false);
+  clearTimeout(fvsSaveTimer); fvsSaveTimer = null;
+  saveWorkspace(false); fvsDirty = false;
   const next = fvsWorkspace.projects.find(function (p) { return p.id === id; });
   if (!next) return;
   fvsWorkspace.activeId = id;
@@ -2396,7 +2514,8 @@ async function switchWorkspace(id) {
 async function newWorkspace() {
   ensureWorkspaceStore();
   if (fvsLoading) { status("Still loading \u2014 one moment\u2026", false); return; }
-  saveWorkspace(false);
+  clearTimeout(fvsSaveTimer); fvsSaveTimer = null;
+  saveWorkspace(false); fvsDirty = false;
   const p = { id: fvsNowId(), title: "Untitled workspace", updatedAt: Date.now(), data: blankWorkspaceData() };
   fvsWorkspace.projects.push(p);
   fvsWorkspace.activeId = p.id;
@@ -2407,6 +2526,8 @@ async function deleteWorkspace(id) {
   ensureWorkspaceStore();
   if (fvsLoading) { status("Still loading \u2014 one moment\u2026", false); return; }
   const p = fvsWorkspace.projects.find(function (x) { return x.id === id; });
+  if (!p) return;
+  if (id === fvsWorkspace.activeId) { clearTimeout(fvsSaveTimer); saveWorkspace(false); fvsDirty = false; }
   const name = (p && p.title) || "this workspace";
   if (typeof confirm === "function" && !confirm("Delete the video workspace \u201c" + name + "\u201d? This cannot be undone.")) return;
   const wasActive = id === fvsWorkspace.activeId;
