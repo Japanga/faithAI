@@ -3,7 +3,7 @@ Artificial intelligence written in Ruby, Faith is powered on a llama-server.exe 
 
 # How to start Faith
 - Download the source .zip
-- Download qwen2-0_5b-instruct-q4_k_m, qwen2.5-coder-0.5b-instruct-q4_k_m, and Faith_Emotions_v2_Q4_K_M
+- Download [qwen2-0_5b-instruct-q4_k_m](https://huggingface.co/Qwen/Qwen2-0.5B-Instruct-GGUF), qwen2.5-coder-0.5b-instruct-q4_k_m, and Faith_Emotions_v2_Q4_K_M
 - Put all of them in the models folder
 - Run START_FAITH_QWEN.bat
 - Faith webserver now started at 127.0.0.1:4567 (or localhost:4567), close the web server by clicking Ctrl+C in the command prompt window.
