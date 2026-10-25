@@ -58,6 +58,8 @@
     .faith-video-title { margin-top:5px; font-size:.72rem; line-height:1.25; overflow-wrap:anywhere; color:#dce5f6; }
     .faith-video-actions { display:flex; gap:5px; flex-wrap:wrap; margin-top:5px; }
     .faith-video-actions button { font-size:.7rem; padding:4px 6px; }
+    .faith-video-actions .faith-video-delete { background:#6f2434 !important; color:#fff !important; border:1px solid #a7465d !important; font-weight:700; }
+    .faith-video-actions .faith-video-delete:hover { background:#922f45 !important; }
 
     .faith-gallery-star { position: absolute !important; top: 7px; right: 7px; z-index: 2; padding: 1px 5px !important; min-width: 28px; border: 1px solid rgba(255,255,255,.24) !important; background: rgba(5,9,18,.82) !important; border-radius: 99px !important; color: #d8e4f8 !important; font-size: 1.2rem !important; line-height: 1.25 !important; text-align: center !important; }
     .faith-gallery-star.favorited { color: #ffd66b !important; border-color: rgba(255,214,107,.48) !important; text-shadow: 0 0 9px rgba(255,214,107,.6); }
@@ -206,8 +208,68 @@
     /* Studio is a separate workspace: keep Faith's Studio expression visible,
        but temporarily hide the conversation and message composer. */
     body.faith-studio-mode .chat-panel,
-    body.faith-studio-mode .composer {
+    body.faith-studio-mode .composer,
+    body.faith-studio-mode .hint {
       display: none !important;
+    }
+    /* The Studio canvas should begin immediately below the app header; do not
+       leave the hidden chat/expression grid rows occupying vertical space. */
+    body.faith-studio-mode .app-shell {
+      display: flex !important;
+      flex-direction: column !important;
+      align-items: stretch !important;
+      gap: 0 !important;
+    }
+    body.faith-studio-mode #fvsRootEl {
+      flex: 0 0 auto !important;
+      margin-top: 0 !important;
+      padding-top: 0 !important;
+    }
+    /* Keep the Studio behavior/expression visible at the same compact scale
+       as Faith's normal expression panel, with the small header breathing gap. */
+    body.faith-studio-mode .character-panel {
+      flex: 0 0 auto !important;
+      height: 300px !important;
+      min-height: 300px !important;
+      max-height: 300px !important;
+      margin-top: 6px !important;
+      padding: 0 !important;
+      overflow: hidden !important;
+    }
+    body.faith-studio-mode .character-panel #expression {
+      display: block !important;
+      width: auto !important;
+      height: auto !important;
+      max-width: 100% !important;
+      max-height: 290px !important;
+      object-fit: contain !important;
+      margin: 0 auto !important;
+    }
+    /* Video actions are context-menu-only; never show legacy inline controls. */
+    #faith-videos-list .faith-video-actions,
+    #faith-videos-list .faith-video-open,
+    #faith-videos-list .faith-video-download,
+    #faith-videos-list .faith-video-delete { display: none !important; }
+
+    /* Keep the Ruby AI Assistant top header the same size in Chats, Gallery,
+       and Studio, regardless of the workspace content shown below it. */
+    body .app-shell > .topbar {
+      box-sizing: border-box !important;
+      height: 72px !important;
+      min-height: 72px !important;
+      max-height: 72px !important;
+      flex: 0 0 72px !important;
+      display: flex !important;
+      align-items: center !important;
+      justify-content: space-between !important;
+      gap: 12px !important;
+      padding-top: 10px !important;
+      padding-bottom: 10px !important;
+      overflow: hidden !important;
+    }
+    body .app-shell > .topbar > div { min-width: 0; }
+    @media (max-width: 480px) {
+      body .app-shell > .topbar { height: 68px !important; min-height: 68px !important; max-height: 68px !important; flex-basis: 68px !important; }
     }
 
     /* Video Studio lives in the main column; only shown in Studio mode. */

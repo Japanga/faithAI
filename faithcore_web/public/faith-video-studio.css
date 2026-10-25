@@ -92,3 +92,10 @@
 #fvsRootEl button { display: inline-flex; align-items: center; justify-content: center; gap: 7px; }
 #fvsRootEl button svg { display: block; flex: 0 0 18px; width: 18px; height: 18px; overflow: visible; }
 #fvs-eraseToolsEl input[type="range"] { accent-color: #7c5cff; }
+
+/* The Video Studio expression is a page-local illustration, not Faith's chat state. */
+
+/* Keep the Studio content tucked directly beneath Faith's fixed app header. */
+#fvsRootEl { padding-top: 0 !important; margin-top: 0 !important; }
+#fvsRootEl h1 { margin-top: 0.08em !important; margin-bottom: 0.08em !important; }
+#fvsRootEl .subEl { margin-top: 0 !important; margin-bottom: 0.65rem !important; }

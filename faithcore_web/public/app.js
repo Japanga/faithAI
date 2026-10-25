@@ -1102,7 +1102,7 @@ const expressionImages = {
   voiceMode: "/assets/voicemode.png",
   voiceModeTalking: "/assets/robot_talking.gif",
   hazard: "/assets/hazard.PNG",
-  videoStudio: "/assets/videostudio.png"
+  videoStudio: "/assets/videostudio.png",
 };
 
 const expressionNames = {
@@ -1126,7 +1126,7 @@ const expressionNames = {
   voiceMode: "Voice Mode",
   voiceModeTalking: "Voice Mode — Speaking",
   hazard: "Hazard",
-  videoStudio: "Video Studio"
+  videoStudio: "Video Studio",
 };
 
 // Voice may be controlled by the standalone voice module. Accept its common
@@ -1170,7 +1170,6 @@ const expressionDetails = {
   sad: "I'm here with you",
   anger: "Don't talk to me like that.",
   erotic: "Feeling artistic...",
-  videoStudio: "Working on video creation and editing..."
 };
 
 // Mirror server.rb's deterministic classifier for the three states handled by
@@ -1446,7 +1445,7 @@ function setExpression(name, customDetail = null) {
   // Each thread remembers its own last expression, so switching conversations
   // restores the correct behavior instead of inheriting the previous chat's face.
   try {
-    if (typeof faithWorkspace !== "undefined" && faithWorkspace) {
+    if (!window.__faithStudioExpressionActive && typeof faithWorkspace !== "undefined" && faithWorkspace) {
       const activeThread = faithWorkspace.threads.find(t => t.id === faithWorkspace.activeId);
       if (activeThread) {
         activeThread.expression = name;
@@ -1899,7 +1898,11 @@ function faithLoadWorkspace() {
     faithWorkspace.activeId = "main";
   }
   if (!faithWorkspace.threads.some(t => t.id === faithWorkspace.activeId)) faithWorkspace.activeId = faithWorkspace.threads[0].id;
-  faithWorkspace.threads.forEach(t => { if (!Number.isFinite(Number(t.createdAt))) t.createdAt = Number(t.updatedAt) || Date.now(); });
+  faithWorkspace.threads.forEach(t => {
+    if (!Number.isFinite(Number(t.createdAt))) t.createdAt = Number(t.updatedAt) || Date.now();
+    // Video Mode belongs to the conversation that invoked it. Preserve it
+    // when restoring that thread, but never apply it to unrelated conversations.
+  });
   faithWorkspaceReady = true;
 }
 function faithPersistThreadState(thread) {
@@ -2288,7 +2291,7 @@ function faithShowChatInfo(thread) {
   const hint=document.createElement('p'); hint.textContent='Restore the behavior and expression for this chat if they were saved incorrectly.'; hint.style.cssText='font-size:.82rem;color:#aab9d4;margin:0 0 10px;';controls.appendChild(hint);
   const behaviorLabel=document.createElement('label');behaviorLabel.textContent='Behavior / session';behaviorLabel.style.cssText='display:block;margin:8px 0 4px;font-size:.85rem;';controls.appendChild(behaviorLabel);
   const behavior=document.createElement('select');behavior.style.cssText='width:100%;padding:9px;border-radius:7px;background:#0d1320;color:#fff;border:1px solid #44516b;';
-  [['idle','Normal chat'],['video','Video Studio'],['coding','Coding'],['build','Build'],['troubleshooting','Troubleshooting']].forEach(([v,l])=>{const o=document.createElement('option');o.value=v;o.textContent=l;behavior.appendChild(o);});behavior.value=['idle','video','coding','build','troubleshooting'].includes(thread.behaviorState||thread.mode)?(thread.behaviorState||thread.mode):'idle';controls.appendChild(behavior);
+  [['idle','Normal chat'],['coding','Coding'],['build','Build'],['troubleshooting','Troubleshooting']].forEach(([v,l])=>{const o=document.createElement('option');o.value=v;o.textContent=l;behavior.appendChild(o);});behavior.value=['idle','coding','build','troubleshooting'].includes(thread.behaviorState||thread.mode)?(thread.behaviorState||thread.mode):'idle';controls.appendChild(behavior);
   const expressionLabel=document.createElement('label');expressionLabel.textContent='Expression';expressionLabel.style.cssText='display:block;margin:10px 0 4px;font-size:.85rem;';controls.appendChild(expressionLabel);
   const expression=document.createElement('select');expression.style.cssText=behavior.style.cssText;
   Object.keys(expressionNames).forEach(v=>{const o=document.createElement('option');o.value=v;o.textContent=expressionNames[v];expression.appendChild(o);});expression.value=expressionImages[thread.expression]?thread.expression:'ruby';controls.appendChild(expression);
@@ -2595,15 +2598,68 @@ function faithInitSidebar() {
       if (!videos.length) { list.innerHTML = '<div class="faith-gallery-missing">Completed MP4 exports will appear here.</div>'; return; }
       videos.forEach(entry => {
         const card = document.createElement("div"); card.className = "faith-video-card";
-        const video = document.createElement("video"); video.src = entry.url; video.controls = true; video.preload = "metadata"; video.playsInline = true; card.appendChild(video);
+        const video = document.createElement("video");
+        video.src = entry.url; video.preload = "metadata"; video.playsInline = true; video.muted = true;
+        video.controls = false; video.tabIndex = -1; video.setAttribute("aria-label", entry.title || entry.filename || "Completed video preview");
+        // Match the image Gallery: previews are passive and actions appear
+        // only in the card's right-click context menu.
+        card.appendChild(video);
         const title = document.createElement("div"); title.className = "faith-video-title"; title.textContent = entry.title || entry.filename || "Completed video"; card.appendChild(title);
-        const actions = document.createElement("div"); actions.className = "faith-video-actions";
-        const open = document.createElement("button"); open.type = "button"; open.textContent = "Open"; open.addEventListener("click", () => window.open(entry.url, "_blank", "noopener,noreferrer")); actions.appendChild(open);
-        const download = document.createElement("a"); download.href = entry.url; download.download = entry.filename || "faith-video.mp4"; download.textContent = "Download"; download.className = "faith-gallery-download"; actions.appendChild(download);
-        const del = document.createElement("button"); del.type = "button"; del.textContent = "Delete"; del.className = "faith-danger-button"; del.addEventListener("click", async () => { if (!confirm(`Delete completed video “${entry.title || entry.filename}”?`)) return; const r = await fetch("/api/videos", { method: "DELETE", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ id: entry.id }) }); if (!r.ok) { alert("Could not delete that video."); return; } faithLoadVideoLibrary(); }); actions.appendChild(del);
-        card.appendChild(actions); list.appendChild(card);
+        // Store the source entry on the card. A delegated listener on the list
+        // handles contextmenu events, including events originating on native
+        // video surfaces or nested title elements.
+        card.__faithVideoEntry = entry;
+        card.tabIndex = 0;
+        card.title = "Right-click for video options";
+        card.querySelectorAll(".faith-video-actions").forEach(node => node.remove());
+        list.appendChild(card);
       });
     } catch (error) { if (storage) storage.textContent = `Video folder unavailable: ${error.message}`; }
+  }
+  // Install once on the persistent list rather than on regenerated cards.
+  // This avoids event loss when the library is refreshed and works when the
+  // right-click begins on the video element itself.
+  const faithVideoListForMenu = document.getElementById("faith-videos-list");
+  if (faithVideoListForMenu && !faithVideoListForMenu.dataset.contextMenuReady) {
+    faithVideoListForMenu.dataset.contextMenuReady = "1";
+    faithVideoListForMenu.addEventListener("contextmenu", event => {
+      const card = event.target && event.target.closest ? event.target.closest(".faith-video-card") : null;
+      const entry = card && card.__faithVideoEntry;
+      if (!entry) return;
+      event.preventDefault();
+      event.stopPropagation();
+      faithShowContextMenu(event.clientX, event.clientY, [
+        { label: "View", action: () => faithOpenVideoEntry(entry) },
+        { label: "Download", action: () => {
+          const a = document.createElement("a"); a.href = entry.url;
+          a.download = entry.filename || "faith-video.mp4"; a.rel = "noopener";
+          document.body.appendChild(a); a.click(); a.remove();
+        } },
+        { label: "Delete", danger: true, action: async () => {
+          if (!confirm(`Permanently delete “${entry.title || entry.filename || "this video"}” from the videos folder?`)) return;
+          try {
+            const r = await fetch("/api/videos", { method: "POST", headers: { "Content-Type": "application/json", "X-Faith-Video-Action": "delete" }, body: JSON.stringify({ action: "delete", id: entry.id || entry.filename }) });
+            const result = await r.json().catch(() => ({}));
+            if (!r.ok || !result.ok) throw new Error(result.error || `Server returned ${r.status}`);
+            await faithLoadVideoLibrary();
+          } catch (error) { alert(`Could not delete video: ${error.message}`); }
+        } }
+      ]);
+    }, true);
+  }
+  function faithOpenVideoEntry(entry) {
+    const url = String(entry && entry.url || "");
+    if (!url) { alert("This video has no playable file URL."); return; }
+    // Open directly from the menu click so browsers do not treat it as a
+    // delayed popup. Keep a normal link fallback if window.open is blocked.
+    const opened = window.open(url, "_blank", "noopener,noreferrer");
+    if (!opened) {
+      const a = document.createElement("a");
+      a.href = url; a.target = "_blank"; a.rel = "noopener noreferrer";
+      a.textContent = "Open video"; a.style.cssText = "position:fixed;left:12px;bottom:12px;z-index:100000;background:#151b28;color:#fff;padding:10px;border-radius:8px";
+      a.addEventListener("click", () => a.remove(), { once: true });
+      document.body.appendChild(a);
+    }
   }
   window.faithLoadVideoLibrary = faithLoadVideoLibrary;
   const deleteAllCompletedVideos = document.getElementById("faith-delete-all-completed-videos");
@@ -2630,8 +2686,26 @@ function faithInitSidebar() {
     tabChat.classList.toggle("active", which === "chats");
     tabGallery.classList.toggle("active", which === "gallery");
     tabStudio.classList.toggle("active", which === "studio");
-    if (which === "studio") faithLoadVideoLibrary();
+    if (which === "studio") {
+      // Studio owns a private, non-visible system conversation. Its only job is
+      // to activate the Video Mode expression while Studio is open; it never
+      // enters the user's chat history or overwrites a chat's saved behavior.
+      window.__faithStudioExpressionActive = true;
+      window.__faithStudioSystemConversation = {
+        id: "__faith_internal_video_studio__",
+        internal: true,
+        messages: [
+          { role: "system", content: "You are in Faith's Video Studio workspace. Use the videomode expression while this workspace is open. Keep this context isolated from user conversations." },
+          { role: "assistant", content: "Video Studio expression context active." }
+        ],
+        expression: "videoStudio"
+      };
+      setExpression(window.__faithStudioSystemConversation.expression, "Working in Video Studio");
+      faithLoadVideoLibrary();
+    }
     if (which !== "studio") {
+      window.__faithStudioExpressionActive = false;
+      window.__faithStudioSystemConversation = null;
       // Restore the active conversation's saved expression after leaving Studio.
       const activeThread = typeof faithWorkspace !== "undefined" && faithWorkspace.threads
         ? faithWorkspace.threads.find(t => t.id === faithWorkspace.activeId) : null;
@@ -2643,9 +2717,9 @@ function faithInitSidebar() {
     tabChat.addEventListener("click", () => showSidebarTab("chats"));
     tabGallery.addEventListener("click", () => showSidebarTab("gallery"));
     tabStudio.addEventListener("click", () => {
+      // Enter Studio's separate internal expression context without changing
+      // the active conversation's saved expression or behavior.
       showSidebarTab("studio");
-      // Studio's expression is a view state, not a change to the conversation's saved behavior.
-      setExpression("videoStudio", "Video studio workspace");
     });
   }
 }
@@ -3160,12 +3234,13 @@ async function consumeQwenStream(response, qwenRelayLoading) {
       // Qwen is finished at this exact point. Do not wait for Wikimedia or
       // source research before returning Faith to her normal Explanation mode.
       // Those are post-message enrichments and must never control her expression.
-      const completedExpression = isFaithVoiceEnabled() ? "talking" : ([
+      const completedExpression = isFaithVoiceEnabled() ? "talking" : (isVideoStudioQuestion ? "videoStudio" : ([
         "robotic", "psychotic", "sad", "anger", "erotic",
         "greeting", "thinking", "explanation", "confusion",
         "troubleshooting", "observing", "coding", "build"
-      ].includes(event.expression) ? event.expression : getDefaultReplyExpression());
-      if (event.session_mode === "build") sessionMode = "build";
+      ].includes(event.expression) ? event.expression : getDefaultReplyExpression()));
+      if (isVideoStudioQuestion) sessionMode = "video";
+      else if (event.session_mode === "build") sessionMode = "build";
       else if (event.session_mode === "coding") sessionMode = "coding";
       else if (event.session_mode === "troubleshooting") sessionMode = "troubleshooting";
       else sessionMode = "idle";
@@ -4199,19 +4274,18 @@ async function submitQuestion() {
   // Video capability questions enter Faith's Video Mode behavior. Keep this as
   // a normal chat response, but direct the answer to the dedicated Studio tab
   // rather than implying that video generation starts automatically in chat.
-  const asksVideoCapability = /\b(?:video|videos|mp4|video studio|timeline editor|video editing|video creation)\b/i.test(question)
-    && /\b(?:make|making|create|creating|generate|generating|edit|editing|produce|producing|export|exporting|how|can you|can faith|capable|capability|workflow|studio|timeline|clip|clips|render|rendering)\b/i.test(question)
-    && !/\b(?:fix|debug|edit this code|javascript|ruby error|stack trace)\b/i.test(question);
+  const mentionsVideo = /\b(?:video|videos|mp4|mov|webm|timeline|video studio|video editing|video creation|animation|clip|clips|render|rendering|frame rate|frame-rate)\b/i.test(question);
+  const asksVideoCapability = mentionsVideo
+    && ( /[?]/.test(question)
+      || /\b(?:how|what|which|can|could|would|do you|does faith|can faith|capable|capability|make|making|create|creating|generate|generating|edit|editing|produce|producing|export|exporting|workflow|studio|timeline|render|rendering|help me|show me|want to|need to)\b/i.test(question) )
+    && !/\b(?:fix|debug|edit this code|javascript|ruby error|stack trace|error in (?:the )?video code)\b/i.test(question);
   const isVideoStudioQuestion = asksVideoCapability && !window.faithVoiceModeActive && sessionMode !== "build" && sessionMode !== "coding" && sessionMode !== "troubleshooting";
   if (isVideoStudioQuestion) {
-    // This is a turn-level behavior, not just an initial UI hint. Keep it
-    // available through the whole response so the backend's generic
-    // session_mode:"idle" cannot switch Faith back to Explanation.
+    // Video Mode is a per-conversation behavior. Persist it only on this
+    // thread, so switching to another chat restores that chat's own state.
     sessionMode = "video";
-    const videoThread = faithWorkspace && faithWorkspace.threads ? faithWorkspace.threads.find(t => t.id === faithWorkspace.activeId) : null;
-    if (videoThread) { videoThread.behaviorState = "video"; videoThread.mode = "video"; faithPersistThreadState(videoThread); }
-    setExpression("videoStudio", "Video Mode — Studio workflow");
-    question += "\n\n[Faith response instruction: Answer the user's actual question directly and promptly. Use the Faith Video Studio expression. Give a useful, complete answer in about 2–4 well-developed paragraphs, with concrete steps or examples when relevant; do not give a one-sentence answer or a vague promise. Explain which parts of the video workflow are supported by the dedicated Studio workspace and how to start there. Be accurate about what happens in chat versus inside Studio. Do not claim an export or edit has already started unless it really has. Avoid unnecessary preamble and do not repeat the user's question.]";
+    setExpression("videoStudio", "Video Mode — answering your video question");
+    question += "\n\n[Faith response instruction: Answer the user's actual video question directly and promptly in the usual helpful style. Explain the relevant video workflow and give concrete steps or examples when useful. Mention the dedicated Studio tab when it is relevant, but do not redirect every question there unnecessarily. Do not claim an export or edit has started unless it really has. Avoid unnecessary preamble and do not repeat the user's question.]";
   }
 
   if (window.faithVoiceModeActive) {
@@ -4452,7 +4526,7 @@ async function submitQuestion() {
       // keep Faith in Explanation mode BEFORE doing any Wikimedia/source work.
       // Enrichment continues independently on the already-completed message.
       if (data && data.post_enrichment && streamedFaithItem && !eroticCapabilityQuestion) {
-        setExpression(isVideoStudioQuestion ? "videoStudio" : "explanation");
+        setExpression("explanation");
         setBusy(false);
         input.focus();
         void runQwenPostEnrichment(streamedFaithItem, question, data.answer || "", wikimediaPreflight);
@@ -4545,10 +4619,7 @@ async function submitQuestion() {
     if (data.session_mode === "build") sessionMode = "build";
     else if (data.session_mode === "coding") sessionMode = "coding";
     else if (data.session_mode === "troubleshooting" || isTroubleshootingPrompt) sessionMode = "troubleshooting";
-    else if (data.session_mode === "idle") sessionMode = isVideoStudioQuestion ? "video" : "idle";
-    // The ordinary chat endpoint reports idle for every answer. Preserve this
-    // turn's explicit Video Studio routing unless a higher-priority mode won.
-    if (isVideoStudioQuestion && !["build", "coding", "troubleshooting"].includes(sessionMode)) sessionMode = "video";
+    else if (data.session_mode === "idle") sessionMode = "idle";
 
     if (shouldPaint) {
       // This is the actual Paint Me / image-generation path. The painter tab
@@ -4570,21 +4641,13 @@ async function submitQuestion() {
     } else {
       // A backend expression of "painting" is ignored unless image_mode
       // confirmed an actual generation request above.
-      const normalExpression = ["robotic", "psychotic", "sad", "anger", "erotic"].includes(data.expression)
-        ? data.expression
-        : ((isVideoStudioQuestion || sessionMode === "video")
-          ? "videoStudio"
-          : (sessionMode === "build"
-          ? "build"
-          : (sessionMode === "coding"
-          ? "coding"
-          : (sessionMode === "troubleshooting"
-            ? "troubleshooting"
-            : (isTroubleshootingPrompt
-              ? "troubleshooting"
-              : (["greeting", "thinking", "confusion", "troubleshooting", "observing"].includes(data.expression)
-                ? data.expression
-                : getDefaultReplyExpression("explanation")))))));
+      let normalExpression;
+      if (["robotic", "psychotic", "sad", "anger", "erotic"].includes(data.expression)) normalExpression = data.expression;
+      else if (sessionMode === "build") normalExpression = "build";
+      else if (sessionMode === "coding") normalExpression = "coding";
+      else if (sessionMode === "troubleshooting" || isTroubleshootingPrompt) normalExpression = "troubleshooting";
+      else if (["greeting", "thinking", "confusion", "troubleshooting", "observing"].includes(data.expression)) normalExpression = data.expression;
+      else normalExpression = getDefaultReplyExpression("explanation");
       setExpression(normalExpression);
     }
 
