@@ -52,6 +52,13 @@
     .faith-gallery-title { font-size: .72rem; line-height: 1.25; margin-top: 5px; overflow-wrap: anywhere; color: #dce5f6; }
     .faith-gallery-favorite { position: absolute; top: 9px; right: 9px; color: #ffd66b; font-size: 1.1rem; text-shadow: 0 0 10px rgba(255,214,107,.65); pointer-events: none; }
     .faith-gallery-card { position: relative; }
+    .faith-videos-list { display:grid; grid-template-columns:1fr 1fr; gap:8px; max-height:72vh; overflow-y:auto; }
+    .faith-video-card { min-width:0; padding:6px; border:1px solid rgba(255,255,255,.09); border-radius:10px; background:rgba(255,255,255,.025); }
+    .faith-video-card video { display:block; width:100%; aspect-ratio:16/9; object-fit:contain; background:#05070d; border-radius:6px; }
+    .faith-video-title { margin-top:5px; font-size:.72rem; line-height:1.25; overflow-wrap:anywhere; color:#dce5f6; }
+    .faith-video-actions { display:flex; gap:5px; flex-wrap:wrap; margin-top:5px; }
+    .faith-video-actions button { font-size:.7rem; padding:4px 6px; }
+
     .faith-gallery-star { position: absolute !important; top: 7px; right: 7px; z-index: 2; padding: 1px 5px !important; min-width: 28px; border: 1px solid rgba(255,255,255,.24) !important; background: rgba(5,9,18,.82) !important; border-radius: 99px !important; color: #d8e4f8 !important; font-size: 1.2rem !important; line-height: 1.25 !important; text-align: center !important; }
     .faith-gallery-star.favorited { color: #ffd66b !important; border-color: rgba(255,214,107,.48) !important; text-shadow: 0 0 9px rgba(255,214,107,.6); }
     .faith-gallery-storage { color: #aebbd2; font-size: .74rem; line-height: 1.4; padding: 4px 8px 8px; overflow-wrap: anywhere; }
@@ -143,7 +150,7 @@
       .faith-sidebar { width: 100%; min-width: 0; min-height: 0; padding: 8px; border-right: 0; border-bottom: 1px solid rgba(255,255,255,.09); }
       .faith-sidebar-brand { display: none; }
       #faith-thread-list { max-height: 150px; }
-      #faith-gallery-list { grid-template-columns: repeat(4, minmax(0,1fr)); max-height: 220px; }
+      #faith-gallery-list, .faith-videos-list { grid-template-columns: repeat(2, minmax(0,1fr)); max-height: 220px; }
       .app-shell { width: 100%; }
     }
     html, body {
@@ -573,9 +580,13 @@
       <div id="fvs-studio-note">The Video Studio canvas is in the main column.</div>
       <button id="fvs-new-workspace" type="button">＋ New workspace</button>
       <button id="fvs-save-workspace" type="button">💾 Save workspace</button>
-      <button id="fvs-delete-all-videos" type="button">Delete all videos</button>
+      <button id="fvs-delete-all-videos" type="button">Delete all workspaces</button>
       <div class="faith-sidebar-heading">Video projects <span class="faith-context-hint">(right-click to delete)</span></div>
       <nav id="fvs-project-list" aria-label="Video projects"></nav>
+      <div class="faith-sidebar-heading">Completed videos</div>
+      <button id="faith-delete-all-completed-videos" class="faith-danger-button" type="button">Delete all completed videos</button>
+      <div id="faith-videos-storage" class="faith-gallery-storage" aria-live="polite">Loading saved videos…</div>
+      <div id="faith-videos-list" class="faith-videos-list"></div>
     </div>
   </aside>
   <main class="app-shell">

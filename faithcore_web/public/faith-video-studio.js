@@ -467,6 +467,7 @@ async function makeCharacter() {
   status("Painting your character…", true);
   try {
     state.cutout = await generateCutout();
+    await fvsSaveImageToGallery(state.cutout.dataUrl, "Video Studio character cut-out", state.cutout.prompt || $("charInput").value);
     state.playIdx = 0;
     await showCutoutEditor(state.cutout.dataUrl);
     $("cutCapEl").textContent = "Painted on white, keyed out — ready to animate.";
@@ -1329,6 +1330,7 @@ $("genBgBtn").addEventListener("click", async () => {
     }
     state.bgs = list;
     state.bg = list[0];
+    for (let i = 0; i < list.length; i++) await fvsSaveImageToGallery(list[i].dataUrl, "Video Studio background " + (i + 1), list[i].prompt || scene);
     const mean = (a) => Math.round(a.reduce((x, y) => x + y, 0) / a.length);
     const avgs = list.map((b) => bgAverage(b.img));
     state.bgAvg = { r: mean(avgs.map((a) => a.r)), g: mean(avgs.map((a) => a.g)), b: mean(avgs.map((a) => a.b)) };
@@ -1351,6 +1353,27 @@ $("genBgBtn").addEventListener("click", async () => {
 });
 
 /* ---------- save ---------- */
+async function fvsSaveImageToGallery(dataUrl, title, prompt) {
+  if (!dataUrl || !/^data:image\//i.test(dataUrl)) return null;
+  try {
+    const response = await fetch("/api/gallery", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ url: dataUrl, title: String(title || "Video Studio image").slice(0, 100), prompt: String(prompt || title || "Created in Video Studio").slice(0, 500), filename: String(title || "faith-studio-image").replace(/[^a-z0-9_.-]+/gi, "-").slice(0, 100) + ".png" }) });
+    const result = await response.json().catch(() => ({}));
+    if (!response.ok) throw new Error(result.error || "Gallery save failed");
+    if (typeof window.faithLoadServerGallery === "function") window.faithLoadServerGallery();
+    // faithLoadServerGallery is a classic-script function; this fallback dispatches
+    // a lightweight signal for any future gallery listener.
+    window.dispatchEvent(new CustomEvent("faith-gallery-updated", { detail: result.entry || null }));
+    return result.entry || null;
+  } catch (error) { console.warn("Video Studio image could not be saved to Gallery", error); status("Image created, but Gallery save failed: " + error.message, false); return null; }
+}
+async function fvsSaveCompletedVideo(blob, filename) {
+  if (!(blob instanceof Blob) || !blob.size) throw new Error("The completed video file is empty.");
+  const response = await fetch("/api/videos?name=" + encodeURIComponent(filename), { method: "POST", headers: { "Content-Type": "video/mp4", "X-Faith-Video-Name": filename }, body: blob });
+  const result = await response.json().catch(() => ({}));
+  if (!response.ok || !result.ok) throw new Error(result.error || "Could not save completed video to the videos folder.");
+  if (typeof window.faithLoadVideoLibrary === "function") window.faithLoadVideoLibrary();
+  return result.entry;
+}
 function downloadUrl(url, name) {
   const a = document.createElement("a");
   a.href = url;
@@ -1416,6 +1439,7 @@ $("mp4Btn").addEventListener("click", async () => {
     source.close();
     await output.finalize();
     const blob = new Blob([output.target.buffer], { type: "video/mp4" });
+    await fvsSaveCompletedVideo(blob, "cutout-anim.mp4");
     const url = URL.createObjectURL(blob);
     downloadUrl(url, "cutout-anim.mp4");
     if (lastMp4Url) { try { URL.revokeObjectURL(lastMp4Url); } catch (e) { /* noop */ } }
@@ -1812,6 +1836,7 @@ $("tlExportBtn").addEventListener("click", async () => {
     source.close();
     await output.finalize();
     const blob = new Blob([output.target.buffer], { type: "video/mp4" });
+    await fvsSaveCompletedVideo(blob, "timeline.mp4");
     const url = URL.createObjectURL(blob);
     downloadUrl(url, "timeline.mp4");
     if (lastTlUrl) { try { URL.revokeObjectURL(lastTlUrl); } catch (e) { /* noop */ } }
@@ -2193,6 +2218,7 @@ async function runPoseSheet() {
     status("Painting one sheet with " + texts.length + " poses…", true);
     let sheet = await genSheetImage(texts);
     state.sheet = sheet;
+    await fvsSaveImageToGallery(sheet.dataUrl, "Video Studio pose sheet", texts.join(", "));
     showSheetPreview();
     let cells = null, even = false;
     try {
@@ -2203,6 +2229,7 @@ async function runPoseSheet() {
       status("That sheet came out uneven — painting one more…", true);
       sheet = await genSheetImage(texts);
       state.sheet = sheet;
+      await fvsSaveImageToGallery(sheet.dataUrl, "Video Studio pose sheet retry", texts.join(", "));
       showSheetPreview();
       try {
         const r = await sliceSheet(sheet.img, texts);
@@ -2214,6 +2241,7 @@ async function runPoseSheet() {
       return;
     }
     state.poses = texts.map((text, i) => ({ text, dataUrl: cells[i].dataUrl, img: cells[i].img }));
+    for (let i = 0; i < state.poses.length; i++) await fvsSaveImageToGallery(state.poses[i].dataUrl, "Video Studio pose " + (i + 1), state.poses[i].text);
     state.poses.forEach((p, i) => poseCard(i, p));
     state.playIdx = 0;
     drawStage();
@@ -2244,6 +2272,9 @@ $("sheetDiceBtn").addEventListener("click", () => {
    on tab switch, on hide/close; the sidebar also has an explicit save button. */
 /* FVS-WORKSPACES-START */
 const FVS_STORE_KEY = "faithVideoStudioV1";
+const FVS_DB_NAME = "FaithVideoStudioStore";
+const FVS_DB_VERSION = 1;
+let fvsDbPromise = null;
 let fvsWorkspace = null;
 let fvsWorkspaceMenu = null;
 let fvsWorkspaceOperation = 0;
@@ -2326,35 +2357,74 @@ function fvsReadStore() {
     return s;
   } catch (_) { return null; }
 }
+function fvsOpenDb() {
+  if (fvsDbPromise) return fvsDbPromise;
+  fvsDbPromise = new Promise(function (resolve, reject) {
+    if (!window.indexedDB) { reject(new Error("IndexedDB unavailable")); return; }
+    const req = indexedDB.open(FVS_DB_NAME, FVS_DB_VERSION);
+    req.onupgradeneeded = function () { const db = req.result; if (!db.objectStoreNames.contains("workspace")) db.createObjectStore("workspace"); };
+    req.onsuccess = function () { resolve(req.result); };
+    req.onerror = function () { reject(req.error || new Error("Could not open workspace database")); };
+  });
+  return fvsDbPromise;
+}
+async function fvsLoadPersistedStore() {
+  try {
+    const db = await fvsOpenDb();
+    const value = await new Promise(function (resolve, reject) {
+      const tx = db.transaction("workspace", "readonly");
+      const req = tx.objectStore("workspace").get("main");
+      req.onsuccess = function () { resolve(req.result || null); };
+      req.onerror = function () { reject(req.error); };
+    });
+    if (value && Array.isArray(value.projects)) return value;
+  } catch (e) { console.warn("IndexedDB read unavailable; trying legacy workspace storage", e); }
+  const legacy = fvsReadStore();
+  if (legacy) {
+    try { await fvsPersistStore(legacy); localStorage.removeItem(FVS_STORE_KEY); } catch (e) { console.warn("Workspace migration could not finish", e); }
+  }
+  return legacy;
+}
+async function fvsPersistStore(store) {
+  const db = await fvsOpenDb();
+  return new Promise(function (resolve, reject) {
+    const tx = db.transaction("workspace", "readwrite");
+    tx.objectStore("workspace").put(store, "main");
+    tx.oncomplete = function () { resolve(true); };
+    tx.onerror = function () { reject(tx.error || new Error("Workspace database write failed")); };
+    tx.onabort = function () { reject(tx.error || new Error("Workspace database write aborted")); };
+  });
+}
 function ensureWorkspaceStore() {
-  fvsWorkspace = fvsReadStore();
-  if (!fvsWorkspace || !fvsWorkspace.projects.length) {
+  if (!fvsWorkspace) {
     const p = { id: fvsNowId(), title: "Untitled workspace", updatedAt: Date.now(), data: blankWorkspaceData() };
     fvsWorkspace = { activeId: p.id, projects: [p] };
   }
-  if (!fvsWorkspace.projects.some(function (p) { return p.id === fvsWorkspace.activeId; })) {
-    fvsWorkspace.activeId = fvsWorkspace.projects[0].id;
+  if (!fvsWorkspace.projects.length) {
+    const p = { id: fvsNowId(), title: "Untitled workspace", updatedAt: Date.now(), data: blankWorkspaceData() };
+    fvsWorkspace = { activeId: p.id, projects: [p] };
   }
+  if (!fvsWorkspace.projects.some(function (p) { return p.id === fvsWorkspace.activeId; })) fvsWorkspace.activeId = fvsWorkspace.projects[0].id;
 }
 function activeWorkspace() {
   ensureWorkspaceStore();
   return fvsWorkspace.projects.find(function (p) { return p.id === fvsWorkspace.activeId; });
 }
-function saveWorkspace(loud) {
+async function saveWorkspace(loud) {
   try {
     const a = activeWorkspace();
     a.data = collectWorkspaceData();
     const ch = (a.data.charInput || "").trim();
     a.title = ch ? ch.slice(0, 32) : (a.title || "Untitled workspace");
     a.updatedAt = Date.now();
-    localStorage.setItem(FVS_STORE_KEY, JSON.stringify(fvsWorkspace));
+    await fvsPersistStore(fvsWorkspace);
     fvsDirty = false;
     renderWorkspaceList();
     if (loud) status("Workspace saved \u2713 \u2014 " + a.title, false);
     return true;
   } catch (e) {
     console.warn("workspace save failed", e);
-    status("Couldn't save workspace (" + (e && e.name === "QuotaExceededError" ? "browser storage is full \u2014 delete old workspaces" : (e && e.message) || e) + ").", false);
+    status("Couldn't save workspace safely: " + ((e && e.message) || e) + ". Your current workspace has not been switched away from.", false);
     return false;
   }
 }
@@ -2504,22 +2574,30 @@ async function switchWorkspace(id) {
   if (fvsLoading) { status("Still loading \u2014 one moment\u2026", false); return; }
   if (id === fvsWorkspace.activeId) return;
   clearTimeout(fvsSaveTimer); fvsSaveTimer = null;
-  saveWorkspace(false); fvsDirty = false;
+  const saved = await saveWorkspace(false);
+  if (!saved) return;
   const next = fvsWorkspace.projects.find(function (p) { return p.id === id; });
   if (!next) return;
+  const previousId = fvsWorkspace.activeId;
   fvsWorkspace.activeId = id;
-  try { localStorage.setItem(FVS_STORE_KEY, JSON.stringify(fvsWorkspace)); } catch (_) {}
+  try { await fvsPersistStore(fvsWorkspace); }
+  catch (e) { fvsWorkspace.activeId = previousId; status("Couldn't switch workspace because its selection could not be saved. Your current workspace is still active.", false); return; }
+  fvsDirty = false;
   await applyWorkspaceData(next.data);
 }
 async function newWorkspace() {
   ensureWorkspaceStore();
   if (fvsLoading) { status("Still loading \u2014 one moment\u2026", false); return; }
   clearTimeout(fvsSaveTimer); fvsSaveTimer = null;
-  saveWorkspace(false); fvsDirty = false;
+  const saved = await saveWorkspace(false);
+  if (!saved) return;
+  const previousId = fvsWorkspace.activeId;
   const p = { id: fvsNowId(), title: "Untitled workspace", updatedAt: Date.now(), data: blankWorkspaceData() };
   fvsWorkspace.projects.push(p);
   fvsWorkspace.activeId = p.id;
-  try { localStorage.setItem(FVS_STORE_KEY, JSON.stringify(fvsWorkspace)); } catch (_) {}
+  try { await fvsPersistStore(fvsWorkspace); }
+  catch (e) { fvsWorkspace.projects = fvsWorkspace.projects.filter(function (x) { return x.id !== p.id; }); fvsWorkspace.activeId = previousId; status("Couldn't create workspace: browser storage could not save it.", false); return; }
+  fvsDirty = false;
   await applyWorkspaceData(p.data);
 }
 async function deleteWorkspace(id) {
@@ -2527,16 +2605,17 @@ async function deleteWorkspace(id) {
   if (fvsLoading) { status("Still loading \u2014 one moment\u2026", false); return; }
   const p = fvsWorkspace.projects.find(function (x) { return x.id === id; });
   if (!p) return;
-  if (id === fvsWorkspace.activeId) { clearTimeout(fvsSaveTimer); saveWorkspace(false); fvsDirty = false; }
+  if (id === fvsWorkspace.activeId) { clearTimeout(fvsSaveTimer); const saved = await saveWorkspace(false); if (!saved) return; }
   const name = (p && p.title) || "this workspace";
   if (typeof confirm === "function" && !confirm("Delete the video workspace \u201c" + name + "\u201d? This cannot be undone.")) return;
+  const oldProjects = fvsWorkspace.projects.slice();
+  const oldActiveId = fvsWorkspace.activeId;
   const wasActive = id === fvsWorkspace.activeId;
   fvsWorkspace.projects = fvsWorkspace.projects.filter(function (x) { return x.id !== id; });
-  if (!fvsWorkspace.projects.length) {
-    fvsWorkspace.projects.push({ id: fvsNowId(), title: "Untitled workspace", updatedAt: Date.now(), data: blankWorkspaceData() });
-  }
+  if (!fvsWorkspace.projects.length) fvsWorkspace.projects.push({ id: fvsNowId(), title: "Untitled workspace", updatedAt: Date.now(), data: blankWorkspaceData() });
   if (wasActive) fvsWorkspace.activeId = fvsWorkspace.projects[0].id;
-  try { localStorage.setItem(FVS_STORE_KEY, JSON.stringify(fvsWorkspace)); } catch (_) {}
+  try { await fvsPersistStore(fvsWorkspace); }
+  catch (e) { fvsWorkspace.projects = oldProjects; fvsWorkspace.activeId = oldActiveId; renderWorkspaceList(); status("Couldn't delete workspace because the updated workspace list could not be saved.", false); return; }
   const a = fvsWorkspace.projects.find(function (x) { return x.id === fvsWorkspace.activeId; });
   await applyWorkspaceData(a.data);
 }
@@ -2544,9 +2623,12 @@ async function deleteAllWorkspaces() {
   ensureWorkspaceStore();
   if (fvsLoading) { status("Still loading \u2014 one moment\u2026", false); return; }
   if (typeof confirm === "function" && !confirm("Delete ALL video workspaces? This cannot be undone.")) return;
+  const oldProjects = fvsWorkspace.projects;
+  const oldActiveId = fvsWorkspace.activeId;
   fvsWorkspace.projects = [{ id: fvsNowId(), title: "Untitled workspace", updatedAt: Date.now(), data: blankWorkspaceData() }];
   fvsWorkspace.activeId = fvsWorkspace.projects[0].id;
-  try { localStorage.setItem(FVS_STORE_KEY, JSON.stringify(fvsWorkspace)); } catch (_) {}
+  try { await fvsPersistStore(fvsWorkspace); }
+  catch (e) { fvsWorkspace.projects = oldProjects; fvsWorkspace.activeId = oldActiveId; renderWorkspaceList(); status("Couldn't delete workspaces because the change could not be saved.", false); return; }
   await applyWorkspaceData(fvsWorkspace.projects[0].data);
   status("All video workspaces deleted.", false);
 }
@@ -2570,9 +2652,13 @@ if ($("delete-all-videos")) $("delete-all-videos").addEventListener("click", fun
     if (t) t.addEventListener("click", function () { if (fvsDirty) saveWorkspace(false); });
   }
 })();
-ensureWorkspaceStore();
-renderWorkspaceList();
-applyWorkspaceData(activeWorkspace().data).catch(function (e) { console.warn("workspace boot failed", e); });
+(async function bootWorkspaces() {
+  fvsWorkspace = await fvsLoadPersistedStore();
+  ensureWorkspaceStore();
+  renderWorkspaceList();
+  try { await fvsPersistStore(fvsWorkspace); } catch (e) { console.warn("Initial workspace persistence unavailable", e); }
+  await applyWorkspaceData(activeWorkspace().data);
+})().catch(function (e) { console.warn("workspace boot failed", e); ensureWorkspaceStore(); renderWorkspaceList(); applyWorkspaceData(activeWorkspace().data); });
 window.FaithVideoStudio = { state };
 
 })();

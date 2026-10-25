@@ -1101,7 +1101,8 @@ const expressionImages = {
   talking: "/assets/Talking.gif",
   voiceMode: "/assets/voicemode.png",
   voiceModeTalking: "/assets/robot_talking.gif",
-  hazard: "/assets/hazard.PNG"
+  hazard: "/assets/hazard.PNG",
+  videoStudio: "/assets/videostudio.png"
 };
 
 const expressionNames = {
@@ -1124,7 +1125,8 @@ const expressionNames = {
   talking: "Talking...",
   voiceMode: "Voice Mode",
   voiceModeTalking: "Voice Mode — Speaking",
-  hazard: "Hazard"
+  hazard: "Hazard",
+  videoStudio: "Video Studio"
 };
 
 // Voice may be controlled by the standalone voice module. Accept its common
@@ -1167,7 +1169,8 @@ const expressionDetails = {
   psychotic: "Something is watching...",
   sad: "I'm here with you",
   anger: "Don't talk to me like that.",
-  erotic: "Feeling artistic..."
+  erotic: "Feeling artistic...",
+  videoStudio: "Working on video creation and editing..."
 };
 
 // Mirror server.rb's deterministic classifier for the three states handled by
@@ -2539,6 +2542,38 @@ function faithInitSidebar() {
     favoritesFilter.textContent = faithGalleryFavoritesOnly ? "★ Showing favorites · Show all" : "☆ Favorites only";
     faithRenderSidebar();
   });
+  async function faithLoadVideoLibrary() {
+    const list = document.getElementById("faith-videos-list");
+    const storage = document.getElementById("faith-videos-storage");
+    if (!list) return;
+    try {
+      const response = await fetch("/api/videos", { cache: "no-store" });
+      if (!response.ok) throw new Error("Could not load saved videos");
+      const payload = await response.json();
+      const videos = Array.isArray(payload.videos) ? payload.videos : [];
+      list.innerHTML = "";
+      if (storage) storage.textContent = `${videos.length} completed video${videos.length === 1 ? "" : "s"} · ${faithFormatBytes(Number(payload.bytes) || 0)} in videos folder`;
+      if (!videos.length) { list.innerHTML = '<div class="faith-gallery-missing">Completed MP4 exports will appear here.</div>'; return; }
+      videos.forEach(entry => {
+        const card = document.createElement("div"); card.className = "faith-video-card";
+        const video = document.createElement("video"); video.src = entry.url; video.controls = true; video.preload = "metadata"; video.playsInline = true; card.appendChild(video);
+        const title = document.createElement("div"); title.className = "faith-video-title"; title.textContent = entry.title || entry.filename || "Completed video"; card.appendChild(title);
+        const actions = document.createElement("div"); actions.className = "faith-video-actions";
+        const open = document.createElement("button"); open.type = "button"; open.textContent = "Open"; open.addEventListener("click", () => window.open(entry.url, "_blank", "noopener,noreferrer")); actions.appendChild(open);
+        const download = document.createElement("a"); download.href = entry.url; download.download = entry.filename || "faith-video.mp4"; download.textContent = "Download"; download.className = "faith-gallery-download"; actions.appendChild(download);
+        const del = document.createElement("button"); del.type = "button"; del.textContent = "Delete"; del.className = "faith-danger-button"; del.addEventListener("click", async () => { if (!confirm(`Delete completed video “${entry.title || entry.filename}”?`)) return; const r = await fetch("/api/videos", { method: "DELETE", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ id: entry.id }) }); if (!r.ok) { alert("Could not delete that video."); return; } faithLoadVideoLibrary(); }); actions.appendChild(del);
+        card.appendChild(actions); list.appendChild(card);
+      });
+    } catch (error) { if (storage) storage.textContent = `Video folder unavailable: ${error.message}`; }
+  }
+  window.faithLoadVideoLibrary = faithLoadVideoLibrary;
+  const deleteAllCompletedVideos = document.getElementById("faith-delete-all-completed-videos");
+  if (deleteAllCompletedVideos) deleteAllCompletedVideos.addEventListener("click", async () => {
+    if (!confirm("Delete all completed videos from the videos folder? This will not delete workspaces or gallery images.")) return;
+    try { const response = await fetch("/api/videos", { method: "DELETE", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ all: true }) }); if (!response.ok) throw new Error("Server rejected deletion"); await faithLoadVideoLibrary(); }
+    catch (error) { alert(`Could not delete completed videos: ${error.message}`); }
+  });
+
   const tabChat = document.getElementById("faith-sidebar-chats");
   const tabGallery = document.getElementById("faith-sidebar-gallery");
   const tabStudio = document.getElementById("faith-sidebar-studio");
@@ -2556,6 +2591,7 @@ function faithInitSidebar() {
     tabChat.classList.toggle("active", which === "chats");
     tabGallery.classList.toggle("active", which === "gallery");
     tabStudio.classList.toggle("active", which === "studio");
+    if (which === "studio") faithLoadVideoLibrary();
     if (which !== "studio") {
       // Restore the active conversation's saved expression after leaving Studio.
       const activeThread = typeof faithWorkspace !== "undefined" && faithWorkspace.threads
@@ -2570,16 +2606,7 @@ function faithInitSidebar() {
     tabStudio.addEventListener("click", () => {
       showSidebarTab("studio");
       // Studio's expression is a view state, not a change to the conversation's saved behavior.
-      const img = document.getElementById("expression");
-      if (img) {
-        img.onerror = null;
-        img.src = "/assets/videostudio.png";
-        img.alt = "Faith video studio expression";
-      }
-      const status = document.getElementById("status");
-      const detail = document.getElementById("state-detail");
-      if (status) status.textContent = "Studio";
-      if (detail) detail.textContent = "Video studio";
+      setExpression("videoStudio", "Video studio workspace");
     });
   }
 }
@@ -4133,13 +4160,14 @@ async function submitQuestion() {
   // Video capability questions enter Faith's Video Mode behavior. Keep this as
   // a normal chat response, but direct the answer to the dedicated Studio tab
   // rather than implying that video generation starts automatically in chat.
-  const asksVideoCapability = /\b(?:can you|can faith|are you able to|are you capable of|do you (?:make|create|generate)|does faith)\b.{0,90}\b(?:video|videos|video clips|mp4)\b|\b(?:video|videos)\b.{0,60}\b(?:capable|capability|make|create|generate)\b/i.test(question)
-    && !/\b(?:how do i|how to|why does|fix|debug|edit this code)\b/i.test(question);
+  const asksVideoCapability = /\b(?:video|videos|mp4|video studio|timeline editor|video editing|video creation)\b/i.test(question)
+    && /\b(?:make|making|create|creating|generate|generating|edit|editing|produce|producing|export|exporting|how|can you|can faith|capable|capability|workflow|studio|timeline|clip|clips|render|rendering)\b/i.test(question)
+    && !/\b(?:fix|debug|edit this code|javascript|ruby error|stack trace)\b/i.test(question);
   if (asksVideoCapability && !window.faithVoiceModeActive && sessionMode !== "build" && sessionMode !== "coding" && sessionMode !== "troubleshooting") {
     sessionMode = "video";
     const videoThread = faithWorkspace && faithWorkspace.threads ? faithWorkspace.threads.find(t => t.id === faithWorkspace.activeId) : null;
     if (videoThread) { videoThread.behaviorState = "video"; videoThread.mode = "video"; faithPersistThreadState(videoThread); }
-    setExpression("explanation", "Video Mode — Studio workflow");
+    setExpression("videoStudio", "Video Mode — Studio workflow");
     question += "\n\n[Faith behavior instruction: This user is asking about your video-making capability. Answer confidently that video creation/editing is supported through the dedicated Studio workspace. Explain that the workflow is not automatically started inside ordinary chat: they should open the Studio tab to build/edit the video there. Do not say video creation is impossible or that it must be done manually outside Faith. Keep the answer concise and helpful.]";
   }
 
@@ -4498,7 +4526,9 @@ async function submitQuestion() {
       // confirmed an actual generation request above.
       const normalExpression = ["robotic", "psychotic", "sad", "anger", "erotic"].includes(data.expression)
         ? data.expression
-        : (sessionMode === "build"
+        : (sessionMode === "video"
+          ? "videoStudio"
+          : (sessionMode === "build"
           ? "build"
           : (sessionMode === "coding"
           ? "coding"
@@ -4508,7 +4538,7 @@ async function submitQuestion() {
               ? "troubleshooting"
               : (["greeting", "thinking", "confusion", "troubleshooting", "observing"].includes(data.expression)
                 ? data.expression
-                : getDefaultReplyExpression("explanation"))))));
+                : getDefaultReplyExpression("explanation")))))));
       setExpression(normalExpression);
     }
 
