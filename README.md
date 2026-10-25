@@ -44,7 +44,7 @@ Preview of the fire breathing dragon animation:
 
 # Text-To-Speech
 - Faith has a built in voice, which uses an Australian accent ran through modulation & bit crushing to create the "robotic" signature sound.
-- You can turn a chat into Faith's "Voice mode" by sending a message with [cyan][/cyan] BBCode
+- You can turn a chat into Faith's "Voice mode" by sending a message with [cyan][/cyan] BBCode. In this mode, Faith will not send any replies and will only read aloud the user's text message.
 - Voice mode is only enabled per every conversation, but can be exited by typing [cyan]exit[/cyan]
 <table>
   <tr>
