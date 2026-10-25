@@ -32,6 +32,7 @@ Artificial intelligence written in Ruby, Faith is powered on a llama-server runn
 # Image-To-Video
 - Faith has a dedicated separate section exclusively for video creation & editing, called Studio
 - Studio allows for dedicated video creation workspaces and project saving, allowing for full-motion videos with progression, frames, and stories.
+- Studio differs vastly from regular image generation, as it is designed specifically for generating transparent cutouts of characters, which are then maneuvered into becoming semi-motion graphics.
 <img src="https://i.imgur.com/jjdLuyL.png" alt="Descriptive Text">
 <img src="https://i.imgur.com/Zhj1hGT.png" alt="Descriptive Text">
 <img src="https://i.imgur.com/4hBI7Yw.png" alt="Descriptive Text">
