@@ -13,3 +13,9 @@ Artificial intelligence written in Ruby, Faith is powered on a llama-server runn
 - All chats can be exported to .txt by right clicking a chat and clicking "Export chat (.txt)
 - All chats usually embed a few images from Wikimedia Commons that go along with the current conversation.
 <img src="https://i.imgur.com/GMFuUJI.png" alt="Descriptive Text">
+
+
+# Text-To-Image
+- Use the "paint a " prompt to have Faith generate an image for you.
+- Faith can generate up to 32 images at one time, with a high range of resolutions supporting up to 1K, 2K, 4K and 8K image generation and 79 different art styles.
+<img src="https://i.imgur.com/zHdwonM.png" alt="Descriptive Text">
