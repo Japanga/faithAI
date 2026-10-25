@@ -1,6 +1,5 @@
 # faithAI
 Artificial intelligence written in Ruby, Faith is powered on a llama-server running Qwen that relays messages to the visual avatar frontend.
-<img src="https://i.imgur.com/oRn9Ta4.png" alt="Descriptive Text">
 
 # How to start Faith
 - Download the source .zip
@@ -39,7 +38,7 @@ Artificial intelligence written in Ruby, Faith is powered on a llama-server runn
 <img src="https://i.imgur.com/Hdiq1sk.png" alt="Descriptive Text">
 <img src="https://i.imgur.com/SzlquuM.png" alt="Descriptive Text">
 Preview of the fire breathing dragon animation:
-<img src="https://i.imgur.com/IkjH767.gif" alt="Descriptive Text">
+<img src="https://i.imgur.com/IkjH767.gif"  width="200" height="200" alt="Descriptive Text">
 
 # Text-To-Speech
 - Faith has a built in voice, which uses an Australian accent ran through modulation & bit crushing to create the "robotic" signature sound.
