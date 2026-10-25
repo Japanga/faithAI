@@ -62,7 +62,7 @@ Preview of the fire breathing dragon animation:
 # Coding: Build Mode
 - Faith handles code requests in 2 different forms: Build and Troubleshooting
 - Build represents code that the user directly asked Faith to "build" for them from the ground up.
-<img src="https://i.imgur.com/RUj2bUU.png" alt="Descriptive Text">
+<img src="https://i.imgur.com/sDZgCbW.png" alt="Descriptive Text">
 
 <img src="https://i.imgur.com/DTK3W2M.png" alt="Descriptive Text">
 
