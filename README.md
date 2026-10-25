@@ -18,7 +18,7 @@ Artificial intelligence written in Ruby, Faith is powered on a llama-server runn
 # Text-To-Image
 - Use the "paint a " prompt to have Faith generate an image for you.
 - Faith can generate up to 32 images at one time, with a high range of resolutions supporting up to 1K, 2K, 4K and 8K image generation and 79 different art styles.
-- You have no limits to how many image you can generate with Faith, but a reminder will start popping up after you have generated 100 MB of images that you are reaching high levels of storage, and should consider cleaning up. (Faith has very  advanced image storage & deletion that will not remove any images marked as a favorite, to make mass batch generation/cleaning much easier)
+- You have no limits to how many image you can generate with Faith, but a reminder will start popping up after you have generated 100 MB of images that you are reaching high levels of storage, and should consider cleaning up. (Faith has very  advanced image storage management that will not remove any images marked as a favorite, to make mass batch generation/cleaning much easier)
 <img src="https://i.imgur.com/zHdwonM.png" alt="Descriptive Text">
 
 # Image-To-Image
