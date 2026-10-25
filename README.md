@@ -1,4 +1,4 @@
-<img width="1347" height="621" alt="image" src="https://github.com/user-attachments/assets/b6177ddf-e465-4bd5-a5c4-68d325feb663" /># faithAI
+# faithAI
 Artificial intelligence written in Ruby, Faith is powered on a llama-server running Qwen that relays messages to the visual avatar frontend.
 <img src="https://i.imgur.com/oRn9Ta4.png" alt="Descriptive Text">
 
