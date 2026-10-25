@@ -70,6 +70,6 @@ Preview of the fire breathing dragon animation:
 # Coding: Troubleshooting Mode
 - Troubleshooting represents already existing code that was sent to Faith for analysis and automatic fixing.
 - Code generation works very similarly to images in that retrospect, that they can either be created from the ground up: or re-worked from existing items.
-<img src="https://i.imgur.com/RUj2bUU.png" alt="Descriptive Text">
+<img src="https://i.imgur.com/mXS1gI5.png" alt="Descriptive Text">
 
-<img src="https://i.imgur.com/DTK3W2M.png" alt="Descriptive Text">
+<img src="https://i.imgur.com/xURl3RL.png" alt="Descriptive Text">
