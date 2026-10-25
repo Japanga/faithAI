@@ -9,7 +9,7 @@ Artificial intelligence written in Ruby, Faith is powered on a llama-server runn
 <img src="https://i.imgur.com/1BBDlB1.png" alt="Descriptive Text">
 
 # Basic chatting
-- Faith uses her basic Qwen chat model for basic encyclopedic, religious, historical and political conversations
+- Faith uses her Qwen chat model for basic encyclopedic, religious, historical and political conversations
 - All chats can be exported to .txt by right clicking a chat and clicking "Export chat (.txt)
 - All chats usually embed a few images from Wikimedia Commons that go along with the current conversation.
 <img src="https://i.imgur.com/GMFuUJI.png" alt="Descriptive Text">
