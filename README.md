@@ -55,3 +55,12 @@ Preview of the fire breathing dragon animation:
   </tr>
 </table>
 <img src="https://i.imgur.com/n5w5CAR.png" alt="Descriptive Text">
+
+
+# Coding: Build Mode
+- Faith handles code requests in 2 different forms: Build and Troubleshooting
+- Build represents code that the user directly asked Faith to "build" for them from the ground up
+- Troubleshooting represents already existing code that was sent to Faith for analysis and automatic fixing.
+<img src="https://i.imgur.com/RUj2bUU.png" alt="Descriptive Text">
+
+<img src="https://i.imgur.com/DTK3W2M.png" alt="Descriptive Text">
