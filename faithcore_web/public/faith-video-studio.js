@@ -371,12 +371,37 @@ function showCutoutEditor(dataUrl, setOriginal = true) {
       if (setOriginal) eraseOriginal = canvas.toDataURL("image/png");
       eraseUndoData = null;
       canvas.hidden = false; tools.hidden = false; hint.hidden = false;
+      const viewport = $("cutPreviewViewport"); if (viewport) viewport.hidden = false;
+      applyCutoutPreviewZoom();
       resolve();
     };
     img.onerror = reject;
     img.src = dataUrl;
   });
 }
+let cutoutPreviewZoom = 100;
+function applyCutoutPreviewZoom() {
+  const canvas = $("cutPrevImgEl"), value = $("cutZoomValEl");
+  if (!canvas) return;
+  const zoomInput = $("cutZoomInput");
+  if (zoomInput) cutoutPreviewZoom = Number(zoomInput.value) || 100;
+  if (value) value.textContent = `${cutoutPreviewZoom}%`;
+  const zoomButton = $("cutZoomBtn");
+  if (zoomButton) zoomButton.textContent = `🔍 Zoom: ${cutoutPreviewZoom}%`;
+  canvas.style.width = `${Math.round(320 * cutoutPreviewZoom / 100)}px`;
+  canvas.style.maxWidth = "none";
+}
+const cutZoomInput = $("cutZoomInput");
+if (cutZoomInput) cutZoomInput.addEventListener("input", applyCutoutPreviewZoom);
+const cutZoomButton = $("cutZoomBtn");
+if (cutZoomButton) cutZoomButton.addEventListener("click", () => {
+  const input = $("cutZoomInput");
+  if (!input) return;
+  const current = Number(input.value) || 100;
+  input.value = current >= 300 ? "100" : String(Math.min(300, current + 50));
+  applyCutoutPreviewZoom();
+});
+
 function erasePoint(e) {
   const canvas = $("cutPrevImgEl"), rect = canvas.getBoundingClientRect();
   if (!rect.width || !rect.height) return false;
@@ -966,6 +991,7 @@ function selectCast(id) {
     } else {
       state.cutout = null;
       $("cutPrevImgEl").hidden = true;
+      const viewport = $("cutPreviewViewport"); if (viewport) viewport.hidden = true;
       $("eraseToolsEl").hidden = true;
       $("eraseHintEl").hidden = true;
       $("cutCapEl").textContent = "This character tab is empty. Describe it above and click Make my character.";

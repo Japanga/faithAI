@@ -99,3 +99,8 @@
 #fvsRootEl { padding-top: 0 !important; margin-top: 0 !important; }
 #fvsRootEl h1 { margin-top: 0.08em !important; margin-bottom: 0.08em !important; }
 #fvsRootEl .subEl { margin-top: 0 !important; margin-bottom: 0.65rem !important; }
+
+/* Zoomable character cutout preview: scroll the enlarged image instead of shrinking it. */
+#fvs-cutPreviewViewport { max-width:100%; width:100%; overflow:auto; overscroll-behavior:contain; border-radius:8px; margin-top:8px; }
+#fvs-cutPreviewViewport[hidden] { display:none !important; }
+#fvs-cutPreviewViewport #fvs-cutPrevImgEl { max-width:none !important; height:auto; aspect-ratio:1 / 1; margin-top:0; }

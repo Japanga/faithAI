@@ -1900,9 +1900,19 @@ function faithLoadWorkspace() {
   if (!faithWorkspace.threads.some(t => t.id === faithWorkspace.activeId)) faithWorkspace.activeId = faithWorkspace.threads[0].id;
   faithWorkspace.threads.forEach(t => {
     if (!Number.isFinite(Number(t.createdAt))) t.createdAt = Number(t.updatedAt) || Date.now();
-    // Video Mode belongs to the conversation that invoked it. Preserve it
-    // when restoring that thread, but never apply it to unrelated conversations.
+    // Video Studio is a tab-local expression, never a conversation mode. Clean
+    // up values saved by earlier builds so a reload cannot leak it into chat.
+    if (t.expression === "videoStudio" || t.expression === "videoMode") {
+      t.expression = "explanation";
+      t.detail = "";
+      if (t.mode === "video" || t.mode === "videoMode" || t.behaviorState === "video" || t.behaviorState === "videoMode") {
+        t.mode = "chat";
+        t.behaviorState = "idle";
+      }
+    }
   });
+  window.__faithStudioExpressionActive = false;
+  window.__faithStudioSystemConversation = null;
   faithWorkspaceReady = true;
 }
 function faithPersistThreadState(thread) {
@@ -1937,7 +1947,11 @@ function faithSaveWorkspace() {
     thread.voiceModeActive = !!window.faithVoiceModeActive;
     thread.mode = sessionMode || "idle";
     thread.behaviorState = sessionMode || "idle";
-    if (displayedExpressionName || pendingExpressionName) thread.expression = pendingExpressionName || displayedExpressionName;
+    if (displayedExpressionName || pendingExpressionName) {
+      const expressionToSave = pendingExpressionName || displayedExpressionName;
+      // Never serialize the Studio tab's private expression into a chat thread.
+      if (expressionToSave !== "videoStudio" && expressionToSave !== "videoMode") thread.expression = expressionToSave;
+    }
     if (!thread.detail && detail) thread.detail = detail.textContent || "";
   }
   try { localStorage.setItem(FAITH_WORKSPACE_KEY, JSON.stringify(faithWorkspace)); } catch (e) {
@@ -3234,13 +3248,12 @@ async function consumeQwenStream(response, qwenRelayLoading) {
       // Qwen is finished at this exact point. Do not wait for Wikimedia or
       // source research before returning Faith to her normal Explanation mode.
       // Those are post-message enrichments and must never control her expression.
-      const completedExpression = isFaithVoiceEnabled() ? "talking" : (isVideoStudioQuestion ? "videoStudio" : ([
+      const completedExpression = isFaithVoiceEnabled() ? "talking" : ([
         "robotic", "psychotic", "sad", "anger", "erotic",
         "greeting", "thinking", "explanation", "confusion",
         "troubleshooting", "observing", "coding", "build"
-      ].includes(event.expression) ? event.expression : getDefaultReplyExpression()));
-      if (isVideoStudioQuestion) sessionMode = "video";
-      else if (event.session_mode === "build") sessionMode = "build";
+      ].includes(event.expression) ? event.expression : getDefaultReplyExpression());
+      if (event.session_mode === "build") sessionMode = "build";
       else if (event.session_mode === "coding") sessionMode = "coding";
       else if (event.session_mode === "troubleshooting") sessionMode = "troubleshooting";
       else sessionMode = "idle";
@@ -4271,22 +4284,9 @@ async function submitQuestion() {
   }
 
   const userVisibleQuestion = question;
-  // Video capability questions enter Faith's Video Mode behavior. Keep this as
-  // a normal chat response, but direct the answer to the dedicated Studio tab
-  // rather than implying that video generation starts automatically in chat.
-  const mentionsVideo = /\b(?:video|videos|mp4|mov|webm|timeline|video studio|video editing|video creation|animation|clip|clips|render|rendering|frame rate|frame-rate)\b/i.test(question);
-  const asksVideoCapability = mentionsVideo
-    && ( /[?]/.test(question)
-      || /\b(?:how|what|which|can|could|would|do you|does faith|can faith|capable|capability|make|making|create|creating|generate|generating|edit|editing|produce|producing|export|exporting|workflow|studio|timeline|render|rendering|help me|show me|want to|need to)\b/i.test(question) )
-    && !/\b(?:fix|debug|edit this code|javascript|ruby error|stack trace|error in (?:the )?video code)\b/i.test(question);
-  const isVideoStudioQuestion = asksVideoCapability && !window.faithVoiceModeActive && sessionMode !== "build" && sessionMode !== "coding" && sessionMode !== "troubleshooting";
-  if (isVideoStudioQuestion) {
-    // Video Mode is a per-conversation behavior. Persist it only on this
-    // thread, so switching to another chat restores that chat's own state.
-    sessionMode = "video";
-    setExpression("videoStudio", "Video Mode — answering your video question");
-    question += "\n\n[Faith response instruction: Answer the user's actual video question directly and promptly in the usual helpful style. Explain the relevant video workflow and give concrete steps or examples when useful. Mention the dedicated Studio tab when it is relevant, but do not redirect every question there unnecessarily. Do not claim an export or edit has started unless it really has. Avoid unnecessary preamble and do not repeat the user's question.]";
-  }
+  // Video Studio's expression is private to the Studio tab. Ordinary chat
+  // messages (including video-related questions) never enter a persistent
+  // Video Mode, so unrelated threads cannot inherit the Studio expression.
 
   if (window.faithVoiceModeActive) {
     if (!question.trim()) return;

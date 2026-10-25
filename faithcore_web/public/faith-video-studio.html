@@ -46,11 +46,14 @@
       <button id="fvs-eraseToggleBtn" type="button" aria-pressed="false"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="m3 15 9-9 9 9-5 5H8z" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linejoin="round"/><path d="m8 10 6 6" stroke="currentColor" stroke-width="1.8"/></svg> Fill bucket: off</button>
       <label for="fvs-eraseSizeInput" style="align-self:center">Edge tolerance</label>
       <input id="fvs-eraseSizeInput" type="range" min="0" max="100" value="28" style="max-width:150px">
+      <button id="fvs-cutZoomBtn" type="button" title="Zoom in on the character cutout" aria-label="Zoom in on the character cutout">🔍 Zoom: 100%</button>
+      <label for="fvs-cutZoomInput" style="align-self:center">Preview zoom <span id="fvs-cutZoomValEl">100%</span></label>
+      <input id="fvs-cutZoomInput" type="range" min="100" max="300" step="25" value="100" style="max-width:130px">
       <button id="fvs-eraseUndoBtn" type="button">Undo</button>
       <button id="fvs-eraseResetBtn" type="button">Reset cutout</button>
     </div>
     <p class="hintEl" id="fvs-eraseHintEl" hidden>Turn on the fill bucket, then click a connected background area to make it transparent. Adjust edge tolerance for similar colors. Transparent areas show the checkerboard.</p>
-    <canvas id="fvs-cutPrevImgEl" class="fvs-checkerEl" width="768" height="768" hidden aria-label="Character cutout editor"></canvas>
+    <div id="fvs-cutPreviewViewport" hidden><canvas id="fvs-cutPrevImgEl" class="fvs-checkerEl" width="768" height="768" hidden aria-label="Character cutout editor"></canvas></div>
     <div class="hintEl" id="fvs-cutCapEl"></div>
   </section>
 
