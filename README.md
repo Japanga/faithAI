@@ -23,7 +23,15 @@ Artificial intelligence written in Ruby, Faith is powered on a llama-server runn
 # Image-To-Image
 - Faith's pipeline for Image-to-Image editing, designed specifically for re-creating images and getting prompt descriptions from images
 - Send an image through Faith's upload attachments, and it will automatically be sent through the Image-to-Image pipeline.
-- 
+
+- <table>
+  <tr>
+    <td>▶️</td>
+    <td><b>Track Title.mp3</b></td>
+    <td>00:00 / 02:15</td>
+    <td><a href="URL_TO_YOUR_MP3">Download / Listen</a></td>
+  </tr>
+</table>
 <img src="https://i.imgur.com/JIJcWlp.png" alt="Descriptive Text">
 
 <img src="https://i.imgur.com/e2qBaby.png" alt="Descriptive Text">
