@@ -24,14 +24,6 @@ Artificial intelligence written in Ruby, Faith is powered on a llama-server runn
 - Faith's pipeline for Image-to-Image editing, designed specifically for re-creating images and getting prompt descriptions from images
 - Send an image through Faith's upload attachments, and it will automatically be sent through the Image-to-Image pipeline.
 
-- <table>
-  <tr>
-    <td>▶️</td>
-    <td><b>Faith Voice Preview</b></td>
-    <td>00:00 / 00:05</td>
-    <td><a href="https://audio.jukehost.co.uk/01a17452-487e-7053-b2c8-ea32cfe6c369">Download / Listen</a></td>
-  </tr>
-</table>
 <img src="https://i.imgur.com/JIJcWlp.png" alt="Descriptive Text">
 
 <img src="https://i.imgur.com/e2qBaby.png" alt="Descriptive Text">
@@ -40,4 +32,12 @@ Artificial intelligence written in Ruby, Faith is powered on a llama-server runn
 - Faith has a built in voice, which uses an Australian accent ran through modulation & bit crushing to create the "robotic" signature sound.
 - You can turn a chat into Faith's "Voice mode" by sending a message with [cyan][/cyan] BBCode
 - Voice mode is only enabled per every conversation, but can be exited by typing [cyan]exit[/cyan]
+<table>
+  <tr>
+    <td>▶️</td>
+    <td><b>Faith Voice Preview</b></td>
+    <td>00:00 / 00:05</td>
+    <td><a href="https://audio.jukehost.co.uk/01a17452-487e-7053-b2c8-ea32cfe6c369">Download / Listen</a></td>
+  </tr>
+</table>
 <img src="https://i.imgur.com/n5w5CAR.png" alt="Descriptive Text">
