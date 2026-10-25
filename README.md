@@ -29,6 +29,18 @@ Artificial intelligence written in Ruby, Faith is powered on a llama-server runn
 
 <img src="https://i.imgur.com/e2qBaby.png" alt="Descriptive Text">
 
+
+# Image-To-Video
+- Faith has a dedicated separate section exclusively for video creation & editing, called Studio
+- Studio allows for dedicated video creation workspaces and project saving, allowing for full-motion videos with progression, frames, and stories.
+<img src="https://i.imgur.com/jjdLuyL.png" alt="Descriptive Text">
+<img src="https://i.imgur.com/Zhj1hGT.png" alt="Descriptive Text">
+<img src="https://i.imgur.com/4hBI7Yw.png" alt="Descriptive Text">
+<img src="https://i.imgur.com/Hdiq1sk.png" alt="Descriptive Text">
+<img src="https://i.imgur.com/SzlquuM.png" alt="Descriptive Text">
+Preview of the fire breathing dragon animation:
+<img src="https://i.imgur.com/IkjH767.gif" alt="Descriptive Text">
+
 # Text-To-Speech
 - Faith has a built in voice, which uses an Australian accent ran through modulation & bit crushing to create the "robotic" signature sound.
 - You can turn a chat into Faith's "Voice mode" by sending a message with [cyan][/cyan] BBCode
