@@ -1,5 +1,5 @@
-# faithAI
-Artificial intelligence written in Ruby, Faith is powered on a llama-server running Qwen that relays messages to the visual avatar frontend.
+# FaithAI
+Artificial intelligence written in Ruby, Faith is powered on a llama-server running Qwen that relays messages to the visual avatar frontend and uses several custom Perchance image generators to handle image requests.
 
 # How to start Faith
 - Download the source .zip
