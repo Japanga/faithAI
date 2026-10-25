@@ -7,7 +7,7 @@ Artificial intelligence written in Ruby, Faith is powered on a llama-server.exe 
 - Put all of them in the models folder
 - Run START_FAITH_QWEN.bat
 - Faith webserver now started at 127.0.0.1:4567 (or localhost:4567), close the web server by clicking Ctrl+C in the command prompt window.
-- Faith sometimes hiccups and doesn't run properly if there is another process of Faith currently running. If it asks you to run CLEAR_FAITH_PORT_4567.bat, just do it.
+- Faith sometimes hiccups and doesn't start properly if there is another process of Faith currently running. If it asks you to run CLEAR_FAITH_PORT_4567.bat, just do it.
 <img src="https://i.imgur.com/1BBDlB1.png" alt="Descriptive Text">
 
 # Basic chatting
