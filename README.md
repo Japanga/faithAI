@@ -27,9 +27,9 @@ Artificial intelligence written in Ruby, Faith is powered on a llama-server runn
 - <table>
   <tr>
     <td>▶️</td>
-    <td><b>Track Title.mp3</b></td>
-    <td>00:00 / 02:15</td>
-    <td><a href="URL_TO_YOUR_MP3">Download / Listen</a></td>
+    <td><b>Faith Voice Preview</b></td>
+    <td>00:00 / 00:05</td>
+    <td><a href="https://audio.jukehost.co.uk/01a17452-487e-7053-b2c8-ea32cfe6c369">Download / Listen</a></td>
   </tr>
 </table>
 <img src="https://i.imgur.com/JIJcWlp.png" alt="Descriptive Text">
