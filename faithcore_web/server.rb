@@ -4422,6 +4422,53 @@ server.mount_proc "/api/gallery" do |req, res|
         status, result = faith_gallery_set_favorite.call(payload)
         json_response.call(res, status, result)
         next
+      elsif payload["action"] == "delete"
+        # Deletion requests are JSON commands, not image uploads. Handle them
+        # before validating the upload-only base64 data URL below.
+        if payload["all"] == true
+          Dir.glob(File.join(FAITH_GALLERY_DIR, "*")).each do |path|
+            File.delete(path) if File.file?(path)
+          end
+          json_response.call(res, 200, { ok: true })
+          next
+        end
+        id = payload["id"].to_s
+        filename = File.basename(payload["filename"].to_s) unless payload["filename"].to_s.empty?
+        url_name = File.basename(payload["url"].to_s.split(/[?#]/, 2).first.to_s) unless payload["url"].to_s.empty?
+        matched = false
+        [[FAITH_GALLERY_DIR, false], [FAITH_GALLERY_FAVORITES_DIR, true]].each do |directory, _favorite_folder|
+          Dir.glob(File.join(directory, "*.json")).each do |meta_path|
+            meta = (JSON.parse(File.read(meta_path, encoding: "UTF-8")) rescue {})
+            stored_name = File.basename(meta_path.sub(/\.json\z/, ""))
+            next unless (!id.empty? && meta["id"].to_s == id) ||
+                        (!filename.to_s.empty? && (meta["filename"].to_s == filename || stored_name == filename)) ||
+                        (!url_name.to_s.empty? && stored_name == url_name)
+            image_path = meta_path.sub(/\.json\z/, "")
+            File.delete(image_path) if File.file?(image_path)
+            File.delete(meta_path) if File.file?(meta_path)
+            matched = true
+            break
+          end
+          break if matched
+        end
+        # Support older gallery files that have no metadata sidecar.
+        unless matched
+          [FAITH_GALLERY_DIR, FAITH_GALLERY_FAVORITES_DIR].each do |directory|
+            candidate = [filename, url_name, id].compact.reject(&:empty?).map { |name| File.join(directory, File.basename(name)) }.find { |path| File.file?(path) }
+            if candidate
+              File.delete(candidate)
+              File.delete(candidate + ".json") if File.file?(candidate + ".json")
+              matched = true
+              break
+            end
+          end
+        end
+        if matched
+          json_response.call(res, 200, { ok: true })
+        else
+          json_response.call(res, 404, { error: "Gallery image not found for deletion." })
+        end
+        next
       end
       data_url = payload["url"].to_s
       match = data_url.match(/\Adata:image\/(png|jpeg|jpg|webp|gif);base64,([A-Za-z0-9+\/=\r\n]+)\z/)
@@ -4538,6 +4585,35 @@ server.mount_proc "/api/videos" do |req, res|
       end.sort_by { |entry| -entry[:createdAt].to_i }
       json_response.call(res, 200, { videos: entries, count: entries.length, bytes: entries.sum { |entry| entry[:bytes].to_i } })
     elsif req.request_method == "POST"
+      # Accept JSON action requests as POST as well as DELETE. Some bundled
+      # WEBrick setups or older proxies reject DELETE with HTTP 405, while POST
+      # is already supported by the completed-video endpoint.
+      if req["content-type"].to_s.downcase.include?("application/json")
+        payload = JSON.parse(req.body.to_s.empty? ? "{}" : req.body.to_s)
+        unless payload["action"].to_s == "delete"
+          json_response.call(res, 400, { error: "Unsupported video library action." })
+          next
+        end
+        if payload["all"] == true
+          Dir.glob(File.join(FAITH_VIDEOS_DIR, "*.mp4")).each do |path|
+            FileUtils.rm_f(path); FileUtils.rm_f(path + ".json")
+          end
+        else
+          id = (payload["id"] || payload["filename"]).to_s
+          found = false
+          Dir.glob(File.join(FAITH_VIDEOS_DIR, "*.mp4")).each do |path|
+            meta = File.file?(path + ".json") ? (JSON.parse(File.read(path + ".json", encoding: "UTF-8")) rescue {}) : {}
+            next unless meta["id"].to_s == id || File.basename(path) == File.basename(id.gsub("\\", "/"))
+            FileUtils.rm_f(path); FileUtils.rm_f(path + ".json"); found = true; break
+          end
+          unless found
+            json_response.call(res, 404, { error: "Completed video not found." })
+            next
+          end
+        end
+        json_response.call(res, 200, { ok: true })
+        next
+      end
       bytes = req.body.to_s.b
       if bytes.empty? || bytes.bytesize > 1024 * 1024 * 1024
         json_response.call(res, 413, { error: "Completed video is empty or exceeds the 1 GB video limit." })
