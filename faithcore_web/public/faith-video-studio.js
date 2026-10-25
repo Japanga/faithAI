@@ -300,6 +300,17 @@ for (const n of STYLE_NAMES) {
 }
 fvsStyleSel.value = "Anime";
 
+// Backgrounds have their own independent art-style picker. It intentionally
+// defaults to Concept Art while characters default to Anime.
+const fvsBgStyleSel = $("bgStyleSelect");
+for (const n of STYLE_NAMES) {
+  const o = document.createElement("option");
+  o.value = n;
+  o.textContent = n;
+  fvsBgStyleSel.appendChild(o);
+}
+fvsBgStyleSel.value = "Concept Art";
+
 const state = {
   cutout: null, // {dataUrl, img, seed, prompt}
   bg: null,     // {dataUrl, img, prompt}
@@ -444,36 +455,97 @@ $("loopFramesInput").addEventListener("change", () => {
 function basePose() { return $("basePoseInput").value.trim(); }
 function cutoutVisual() {
   const char = $("charInput").value.trim();
-  const desc = [char, basePose(), "full body, centered, isolated character, plain solid white background, no shadows, no text, no watermark"].filter(Boolean).join(", ");
+  const desc = [char, basePose(), "full body, centered, isolated character, plain solid vivid chroma-green (#00FF00) background, strong color separation, no green on the character, no shadows, no text, no watermark"].filter(Boolean).join(", ");
   return buildStyledPrompt(studioStyle(), desc);
 }
 
 async function generateCutout() {
-  // Faith's bridge has no background removal: paint on solid white and cut it
-  // out here with the sheet pipeline's flood-fill keying.
+  // Use chroma green for single characters so white costume details (gloves,
+  // eyes, teeth) cannot merge with the background during keying.
   const visual = cutoutVisual();
   const painted = await faithGenerateImage(visual, "768x768");
-  const keyed = keyCanvasWhite(painted.img);
+  const keyed = keyCanvasGreen(painted.img);
   cleanupCellEdges(keyed);
   const dataUrl = keyed.toDataURL("image/png");
   return { dataUrl, img: await loadImg(dataUrl), prompt: visual };
 }
 
-async function makeCharacter() {
+async function makeCharacter(createCharacterTab = false) {
   const char = $("charInput").value.trim();
   if (!char) { status("First tell me what your character looks like.", false); return; }
+  if ($("genCutBtn").disabled) return;
+  const generationSettings = {
+    charInput: char,
+    basePoseInput: $("basePoseInput").value,
+    style: $("styleSelect").value,
+    bgStyle: $("bgStyleSelect").value,
+    mode: $("modeSelect").value,
+    bgPromptInput: $("bgPromptInput").value,
+    poseTexts: typeof readPoseTexts === "function" ? readPoseTexts() : [],
+    loopFrames: $("loopFramesInput").value,
+    fps: $("fpsInput").value,
+    scale: $("scaleInput").value
+  };
+  const existingSelected = selCast();
+  let newCharacter = null;
+  // A new generation creates a character card inside the CURRENT workspace.
+  // It must never create or switch the workspace itself.
   $("genCutBtn").disabled = true;
   $("cutLoadEl").hidden = false;
   status("Painting your character…", true);
   try {
-    state.cutout = await generateCutout();
-    await fvsSaveImageToGallery(state.cutout.dataUrl, "Video Studio character cut-out", state.cutout.prompt || $("charInput").value);
+    const generated = await generateCutout();
+    if (createCharacterTab || !existingSelected) {
+      state.castSeq = (state.castSeq || 0) + 1;
+      const spots = [0.5, 0.28, 0.72, 0.38, 0.62];
+      const inSceneCount = state.cast.filter(c => c.inScene !== false).length;
+      newCharacter = {
+        id: state.castSeq,
+        label: char.length > 28 ? char.slice(0, 28) + "…" : char,
+        cutout: generated,
+        charInput: generationSettings.charInput,
+        basePoseInput: generationSettings.basePoseInput,
+        style: generationSettings.style,
+        bgStyle: generationSettings.bgStyle,
+        mode: generationSettings.mode,
+        bgPromptInput: generationSettings.bgPromptInput,
+        poseTexts: generationSettings.poseTexts,
+        loopFrames: generationSettings.loopFrames,
+        fps: generationSettings.fps,
+        scale: Number(generationSettings.scale) || 0.85,
+        x: spots[inSceneCount % spots.length], y: 0.5,
+        pathA: null, pathB: null, preset: "none", strength: 45,
+        offset: (state.castSeq * 29) % 100, flip: false, rot: 0,
+        frames: loopFrames(), hidden: false, inScene: false
+      };
+      state.cast.push(newCharacter);
+      state.selId = newCharacter.id;
+    } else {
+      // Retry/edit on a selected character updates that character only.
+      existingSelected.cutout = generated;
+      existingSelected.label = char.length > 28 ? char.slice(0, 28) + "…" : char;
+      existingSelected.charInput = generationSettings.charInput;
+      existingSelected.basePoseInput = generationSettings.basePoseInput;
+      existingSelected.style = generationSettings.style;
+      existingSelected.bgStyle = generationSettings.bgStyle;
+      existingSelected.mode = generationSettings.mode;
+      existingSelected.bgPromptInput = generationSettings.bgPromptInput;
+      existingSelected.poseTexts = generationSettings.poseTexts;
+      existingSelected.loopFrames = generationSettings.loopFrames;
+      existingSelected.fps = generationSettings.fps;
+      existingSelected.scale = Number(generationSettings.scale) || existingSelected.scale || 0.85;
+    }
+    state.cutout = generated;
+    await fvsSaveImageToGallery(generated.dataUrl, "Video Studio character cut-out", generated.prompt || char);
     state.playIdx = 0;
-    await showCutoutEditor(state.cutout.dataUrl);
-    $("cutCapEl").textContent = "Painted on white, keyed out — ready to animate.";
+    await showCutoutEditor(generated.dataUrl);
+    $("cutCapEl").textContent = "Character ready — select any character card to edit it, or add the selected character to the scene.";
     drawStrip();
     drawStage();
-    status("Character ready — press play below.", false);
+    renderCast();
+    updateSelCap();
+    if (typeof saveWorkspace === "function") await saveWorkspace(false);
+    status(newCharacter ? "New character saved as a tab in this workspace." : "Selected character updated.", false);
   } catch (e) {
     console.warn("cutout failed", e);
     status("Painting failed (" + (e && e.message ? e.message : e) + "). Try ↻ retry.", false);
@@ -483,10 +555,10 @@ async function makeCharacter() {
   }
 }
 
-$("genCutBtn").addEventListener("click", () => makeCharacter());
-$("retryCutBtn").addEventListener("click", () => makeCharacter());
+$("genCutBtn").addEventListener("click", () => makeCharacter(true));
+$("retryCutBtn").addEventListener("click", () => makeCharacter(false));
 $("newCharBtn").addEventListener("click", () => {
-  makeCharacter();
+  makeCharacter(true);
 });
 $("flipPrevBtn").addEventListener("click", () => {
   state.pFlip = !state.pFlip;
@@ -885,9 +957,40 @@ function selCast() {
 }
 function selectCast(id) {
   state.selId = id || 0;
+  const selected = selCast();
+  if (selected) {
+    if (selected.cutout && selected.cutout.dataUrl) {
+      state.cutout = selected.cutout;
+      showCutoutEditor(selected.cutout.dataUrl).catch((error) => console.warn("Could not show selected character preview:", error));
+      $("cutCapEl").textContent = "Editing " + selected.label + " — changes and retries apply to this character.";
+    } else {
+      state.cutout = null;
+      $("cutPrevImgEl").hidden = true;
+      $("eraseToolsEl").hidden = true;
+      $("eraseHintEl").hidden = true;
+      $("cutCapEl").textContent = "This character tab is empty. Describe it above and click Make my character.";
+    }
+    if (selected.charInput != null) $("charInput").value = selected.charInput;
+    if (selected.basePoseInput != null) $("basePoseInput").value = selected.basePoseInput;
+    if (STYLE_NAMES.includes(selected.style)) $("styleSelect").value = selected.style;
+    if (STYLE_NAMES.includes(selected.bgStyle)) $("bgStyleSelect").value = selected.bgStyle;
+    if (selected.mode) $("modeSelect").value = selected.mode === "poses" ? "poses" : "moves";
+    $("movesBox").hidden = $("modeSelect").value === "poses";
+    $("posesBox").hidden = $("modeSelect").value !== "poses";
+    if (selected.bgPromptInput != null) $("bgPromptInput").value = selected.bgPromptInput;
+    if (selected.poseTexts && selected.poseTexts.length) {
+      $("poseRowsEl").innerHTML = "";
+      selected.poseTexts.forEach(t => addPoseRow(t));
+    }
+    if (selected.loopFrames != null) $("loopFramesInput").value = selected.loopFrames;
+    if (selected.fps != null) { $("fpsInput").value = selected.fps; $("fpsValEl").textContent = selected.fps; }
+    if (selected.scale != null) { $("scaleInput").value = selected.scale; $("scaleValEl").textContent = selected.scale; }
+  }
   renderCast();
   updateSelCap();
+  drawStrip();
   drawStage();
+  saveWorkspaceSoon();
 }
 function updateSelCap() {
   const c = selCast();
@@ -1242,7 +1345,9 @@ function gcd2(a, b) { return b ? gcd2(b, a % b) : a; }
 
 /* ---------- background (still images + saved Background Tabs) ---------- */
 async function genBgVariant(bit) {
-  const prompt = buildStyledPrompt(studioStyle(), bit);
+  const backgroundStyle = (STYLE_NAMES.indexOf($("bgStyleSelect").value) !== -1)
+    ? $("bgStyleSelect").value : "Concept Art";
+  const prompt = buildStyledPrompt(backgroundStyle, bit);
   const painted = await faithGenerateImage(prompt, "768x768");
   return { dataUrl: painted.dataUrl, img: painted.img, prompt };
 }
@@ -1977,6 +2082,38 @@ function keyCanvasWhite(src) {
   return c;
 }
 
+// Flood-fill chroma green only when connected to the image border. Unlike white
+// keying, this preserves white gloves, eyes, teeth and other pale costume details.
+function keyCanvasGreen(src) {
+  const w = src.width, h = src.height;
+  const c = document.createElement("canvas"); c.width = w; c.height = h;
+  const ctx = c.getContext("2d", { willReadFrequently: true }); ctx.drawImage(src, 0, 0);
+  const image = ctx.getImageData(0, 0, w, h), px = image.data;
+  const isGreen = (i, loose = false) => {
+    const r = px[i], g = px[i + 1], b = px[i + 2];
+    return loose ? (g > 95 && g > r * 1.18 && g > b * 1.12 && g - Math.max(r, b) > 18)
+                 : (g > 115 && g > r * 1.28 && g > b * 1.18 && g - Math.max(r, b) > 28);
+  };
+  const total = w * h, masked = new Uint8Array(total), seen = new Uint8Array(total), stack = [];
+  for (let x = 0; x < w; x++) stack.push(x, (h - 1) * w + x);
+  for (let y = 0; y < h; y++) stack.push(y * w, y * w + w - 1);
+  while (stack.length) {
+    const p = stack.pop(); if (p < 0 || p >= total || seen[p]) continue;
+    seen[p] = 1; if (!isGreen(p * 4)) continue; masked[p] = 1;
+    const x = p % w, y = (p / w) | 0;
+    if (x > 0) stack.push(p - 1); if (x < w - 1) stack.push(p + 1);
+    if (y > 0) stack.push(p - w); if (y < h - 1) stack.push(p + w);
+  }
+  const fringe = new Uint8Array(total);
+  for (let y = 0; y < h; y++) for (let x = 0; x < w; x++) {
+    const p = y * w + x; if (masked[p] || !isGreen(p * 4, true)) continue;
+    if ((x > 0 && masked[p - 1]) || (x < w - 1 && masked[p + 1]) ||
+        (y > 0 && masked[p - w]) || (y < h - 1 && masked[p + w])) fringe[p] = 1;
+  }
+  for (let p = 0; p < total; p++) if (masked[p] || fringe[p]) px[p * 4 + 3] = 0;
+  ctx.putImageData(image, 0, 0); return c;
+}
+
 // Find vertical white gutters, snapped to ideal panel edges. Null = uneven.
 function findStrictGutters(img, n) {
   if (n <= 1) return [0, img.naturalWidth];
@@ -2312,7 +2449,7 @@ function fvsStripSnap(s) {
 function blankWorkspaceData() {
   return {
     v: 4, charInput: "", basePoseInput: "standing, facing forward",
-    style: "Anime", mode: "moves",
+    style: "Anime", mode: "moves", bgStyle: "Concept Art",
     bgPromptInput: "sunny meadow with soft hills and a dirt path, empty, no characters",
     poseTexts: DEFAULT_POSES.slice(),
     loopFrames: 4, fps: 5, scale: 0.85, bgAnim: false,
@@ -2328,6 +2465,7 @@ function collectWorkspaceData() {
     v: 3,
     charInput: $("charInput").value, basePoseInput: $("basePoseInput").value,
     style: $("styleSelect").value, mode: $("modeSelect").value,
+    bgStyle: $("bgStyleSelect").value || "Concept Art",
     bgPromptInput: $("bgPromptInput").value, poseTexts: readPoseTexts(),
     loopFrames: $("loopFramesInput").value, fps: $("fpsInput").value, scale: $("scaleInput").value,
     fx: {
@@ -2536,6 +2674,8 @@ async function applyWorkspaceData(d) {
     $("charInput").value = d.charInput || "";
     $("basePoseInput").value = d.basePoseInput || "standing, facing forward";
     if (STYLE_NAMES.indexOf(d.style) !== -1) $("styleSelect").value = d.style;
+    if (STYLE_NAMES.indexOf(d.bgStyle) !== -1) $("bgStyleSelect").value = d.bgStyle;
+    else $("bgStyleSelect").value = "Concept Art";
     $("modeSelect").value = d.mode === "poses" ? "poses" : "moves";
     $("movesBox").hidden = $("modeSelect").value === "poses";
     $("posesBox").hidden = $("modeSelect").value !== "poses";
