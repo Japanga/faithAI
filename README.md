@@ -25,4 +25,4 @@ Artificial intelligence written in Ruby, Faith is powered on a llama-server runn
 - Send an image through Faith's upload attachments, and it will automatically be sent through the Image-to-Image pipeline.
 <img src="https://i.imgur.com/JIJcWlp.png" alt="Descriptive Text">
 
-<img src="https://i.imgur.com/kWJlBip.png" alt="Descriptive Text">
+<img src="https://i.imgur.com/e2qBaby.png" alt="Descriptive Text">
