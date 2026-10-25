@@ -2276,7 +2276,7 @@ $("sheetDiceBtn").addEventListener("click", () => {
 /* FVS-WORKSPACES-START */
 const FVS_STORE_KEY = "faithVideoStudioV1";
 const FVS_DB_NAME = "FaithVideoStudioStore";
-const FVS_DB_VERSION = 2;
+const FVS_DB_VERSION = 3;
 let fvsDbPromise = null;
 let fvsWorkspace = null;
 let fvsWorkspaceMenu = null;
@@ -2373,17 +2373,37 @@ function fvsOpenDb() {
 async function fvsLoadPersistedStore() {
   try {
     const db = await fvsOpenDb();
-    const value = await new Promise(function (resolve, reject) {
+    const main = await new Promise(function (resolve, reject) {
       const tx = db.transaction("workspace", "readonly");
       const req = tx.objectStore("workspace").get("main");
       req.onsuccess = function () { resolve(req.result || null); };
       req.onerror = function () { reject(req.error); };
     });
-    if (value && Array.isArray(value.projects)) return value;
+    if (main && Array.isArray(main.projects)) {
+      // Version 3 stores each workspace independently. Older versions stored
+      // every workspace in one large record, which could make all workspace
+      // changes fail once image data grew too large. Migrate without deleting
+      // the old record until the new records have been written successfully.
+      const isIndex = main.storageVersion === 3 || main.projects.every(function (p) { return p && !Object.prototype.hasOwnProperty.call(p, "data"); });
+      if (isIndex) {
+        const projects = await Promise.all(main.projects.map(async function (meta) {
+          const data = await new Promise(function (resolve, reject) {
+            const tx = db.transaction("workspace", "readonly");
+            const req = tx.objectStore("workspace").get("project:" + meta.id);
+            req.onsuccess = function () { resolve(req.result || null); };
+            req.onerror = function () { reject(req.error); };
+          });
+          return { id: meta.id, title: meta.title || "Untitled workspace", updatedAt: meta.updatedAt || Date.now(), data: data || blankWorkspaceData() };
+        }));
+        return { activeId: main.activeId, projects: projects };
+      }
+      // Legacy record: return intact; boot will migrate it via fvsPersistStore.
+      return main;
+    }
   } catch (e) { console.warn("IndexedDB read unavailable; trying legacy workspace storage", e); }
   const legacy = fvsReadStore();
   if (legacy) {
-    try { await fvsPersistStore(legacy); localStorage.removeItem(FVS_STORE_KEY); } catch (e) { console.warn("Workspace migration could not finish", e); }
+    try { await fvsPersistStore(legacy); localStorage.removeItem(FVS_STORE_KEY); } catch (e) { console.warn("Workspace migration could not finish; keeping legacy copy", e); }
   }
   return legacy;
 }
@@ -2391,7 +2411,25 @@ async function fvsPersistStore(store) {
   const db = await fvsOpenDb();
   return new Promise(function (resolve, reject) {
     const tx = db.transaction("workspace", "readwrite");
-    tx.objectStore("workspace").put(store, "main");
+    const os = tx.objectStore("workspace");
+    // Write project payloads separately, then update the small index in the
+    // same transaction. One large project can no longer force every other
+    // workspace to be rewritten on every save/switch.
+    const metadata = [];
+    const keepKeys = new Set(["main"]);
+    (store.projects || []).forEach(function (p) {
+      metadata.push({ id: p.id, title: p.title || "Untitled workspace", updatedAt: p.updatedAt || Date.now() });
+      const key = "project:" + p.id;
+      keepKeys.add(key);
+      os.put(p.data || blankWorkspaceData(), key);
+    });
+    const keysReq = os.getAllKeys();
+    keysReq.onsuccess = function () {
+      (keysReq.result || []).forEach(function (key) {
+        if (typeof key === "string" && key.indexOf("project:") === 0 && !keepKeys.has(key)) os.delete(key);
+      });
+    };
+    os.put({ storageVersion: 3, activeId: store.activeId, projects: metadata }, "main");
     tx.oncomplete = function () { resolve(true); };
     tx.onerror = function () { reject(tx.error || new Error("Workspace database write failed")); };
     tx.onabort = function () { reject(tx.error || new Error("Workspace database write aborted")); };
@@ -2567,7 +2605,7 @@ async function applyWorkspaceData(d) {
   } catch (e) {
     fvsLoading = false;
     console.warn("workspace load failed", e);
-    status("Couldn't load workspace (" + ((e && e.message) || e) + "). Starting fresh.", false);
+    status("Couldn't load workspace (" + ((e && e.message) || e) + "). Saved workspace data was not intentionally deleted; try selecting it again.", false);
   }
 }
 async function switchWorkspace(id) {

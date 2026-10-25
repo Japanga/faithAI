@@ -1899,6 +1899,7 @@ function faithLoadWorkspace() {
     faithWorkspace.activeId = "main";
   }
   if (!faithWorkspace.threads.some(t => t.id === faithWorkspace.activeId)) faithWorkspace.activeId = faithWorkspace.threads[0].id;
+  faithWorkspace.threads.forEach(t => { if (!Number.isFinite(Number(t.createdAt))) t.createdAt = Number(t.updatedAt) || Date.now(); });
   faithWorkspaceReady = true;
 }
 function faithPersistThreadState(thread) {
@@ -2241,7 +2242,7 @@ function faithArchiveThread(thread) {
     const isUser = message.classList.contains("you") || message.classList.contains("user");
     const speaker = isUser ? "User" : "Faith";
     const textNode = message.querySelector(".message-text");
-    let body = (textNode ? (textNode.innerText || textNode.textContent) : "").replace(/\u00a0/g, " ").trim();
+    let body = (textNode ? (textNode.innerText || textNode.textContent) : "").replace(/\u00a0/g, " ").replace(/\r\n?/g, "\n").replace(/[ \t]+\n/g, "\n").replace(/\n{3,}/g, "\n\n").trim();
     const attachmentNames = Array.from(message.querySelectorAll(".message-attachment-name")).map(n => n.textContent.trim()).filter(Boolean);
     if (attachmentNames.length) body += (body ? "\n" : "") + "Attachments: " + attachmentNames.join(", ");
     const imageCount = message.querySelectorAll(".message-image img, img[data-faith-image-key], .message-images img").length;
@@ -2252,7 +2253,7 @@ function faithArchiveThread(thread) {
       lines.push("");
     }
   });
-  const content = lines.join("\n").trimEnd() + "\n";
+  const content = "\uFEFF" + lines.join("\r\n").trimEnd() + "\r\n";
   const blob = new Blob([content], { type: "text/plain;charset=utf-8" });
   const url = URL.createObjectURL(blob);
   const link = document.createElement("a");
@@ -2260,6 +2261,43 @@ function faithArchiveThread(thread) {
   link.href = url; link.download = `${safeTitle}-archive.txt`; link.style.display = "none";
   document.body.appendChild(link); link.click(); link.remove();
   setTimeout(() => URL.revokeObjectURL(url), 1000);
+}
+
+function faithShowChatInfo(thread) {
+  if (!thread) return;
+  document.querySelectorAll('.faith-chat-info-overlay').forEach(n => n.remove());
+  const holder = document.createElement('div');
+  holder.className = 'faith-chat-info-overlay';
+  holder.style.cssText = 'position:fixed;inset:0;z-index:100000;background:rgba(0,0,0,.68);display:flex;align-items:center;justify-content:center;padding:14px;';
+  const panel = document.createElement('section');
+  panel.style.cssText = 'width:min(560px,100%);max-height:88vh;overflow:auto;background:#151b28;color:#edf3ff;border:1px solid rgba(140,170,230,.35);border-radius:14px;padding:18px;box-shadow:0 18px 55px rgba(0,0,0,.55);';
+  const title = document.createElement('h2'); title.textContent = 'Chat info'; title.style.cssText='margin:0 0 12px;font-size:1.15rem;'; panel.appendChild(title);
+  const temp = document.createElement('div'); temp.innerHTML = String(thread.html || '');
+  const messages = Array.from(temp.querySelectorAll('.message'));
+  const words = messages.reduce((sum,m) => { const node=m.querySelector('.message-text'); const t=node?(node.innerText||node.textContent):m.textContent; return sum + ((String(t||'').trim().match(/\S+/g)||[]).length); },0);
+  const images = messages.reduce((sum,m)=>sum+m.querySelectorAll('img').length,0);
+  const created = new Date(Number(thread.createdAt) || Number(thread.updatedAt) || Date.now());
+  const rows = [
+    ['Chat', thread.title || 'New conversation'], ['Messages', String(messages.length)], ['Words', String(words)], ['Images exchanged', String(images)],
+    ['Created', Number.isNaN(created.getTime()) ? 'Unknown' : created.toLocaleString()], ['Voice mode', thread.voiceModeActive ? 'Enabled' : 'Disabled'],
+    ['Saved behavior', thread.behaviorState || thread.mode || 'idle'], ['Saved expression', thread.expression || 'ruby'], ['Last updated', Number(thread.updatedAt) ? new Date(Number(thread.updatedAt)).toLocaleString() : 'Unknown']
+  ];
+  const table=document.createElement('div'); table.style.cssText='display:grid;grid-template-columns:minmax(120px,.8fr) minmax(0,1.2fr);gap:8px 12px;font-size:.9rem;';
+  rows.forEach(([k,v])=>{const a=document.createElement('div');a.textContent=k;a.style.cssText='color:#aab9d4;';const b=document.createElement('div');b.textContent=v;b.style.cssText='overflow-wrap:anywhere;';table.append(a,b);}); panel.appendChild(table);
+  const controls=document.createElement('div'); controls.style.cssText='margin-top:18px;padding-top:14px;border-top:1px solid rgba(255,255,255,.12);';
+  const hint=document.createElement('p'); hint.textContent='Restore the behavior and expression for this chat if they were saved incorrectly.'; hint.style.cssText='font-size:.82rem;color:#aab9d4;margin:0 0 10px;';controls.appendChild(hint);
+  const behaviorLabel=document.createElement('label');behaviorLabel.textContent='Behavior / session';behaviorLabel.style.cssText='display:block;margin:8px 0 4px;font-size:.85rem;';controls.appendChild(behaviorLabel);
+  const behavior=document.createElement('select');behavior.style.cssText='width:100%;padding:9px;border-radius:7px;background:#0d1320;color:#fff;border:1px solid #44516b;';
+  [['idle','Normal chat'],['video','Video Studio'],['coding','Coding'],['build','Build'],['troubleshooting','Troubleshooting']].forEach(([v,l])=>{const o=document.createElement('option');o.value=v;o.textContent=l;behavior.appendChild(o);});behavior.value=['idle','video','coding','build','troubleshooting'].includes(thread.behaviorState||thread.mode)?(thread.behaviorState||thread.mode):'idle';controls.appendChild(behavior);
+  const expressionLabel=document.createElement('label');expressionLabel.textContent='Expression';expressionLabel.style.cssText='display:block;margin:10px 0 4px;font-size:.85rem;';controls.appendChild(expressionLabel);
+  const expression=document.createElement('select');expression.style.cssText=behavior.style.cssText;
+  Object.keys(expressionNames).forEach(v=>{const o=document.createElement('option');o.value=v;o.textContent=expressionNames[v];expression.appendChild(o);});expression.value=expressionImages[thread.expression]?thread.expression:'ruby';controls.appendChild(expression);
+  const actions=document.createElement('div');actions.style.cssText='display:flex;gap:8px;justify-content:flex-end;flex-wrap:wrap;margin-top:14px;';
+  const close=document.createElement('button');close.type='button';close.textContent='Close';
+  const apply=document.createElement('button');apply.type='button';apply.textContent='Save chat state';apply.style.cssText='background:#6336a6;color:#fff;border:0;border-radius:7px;padding:9px 12px;';
+  close.style.cssText='background:#252e40;color:#fff;border:1px solid #46516a;border-radius:7px;padding:9px 12px;';
+  close.onclick=()=>holder.remove(); apply.onclick=()=>{thread.behaviorState=behavior.value;thread.mode=behavior.value;thread.expression=expression.value;thread.detail=expressionDetails[expression.value]||'';thread.updatedAt=Date.now();if(thread.id===faithWorkspace.activeId){sessionMode=behavior.value;window.faithVoiceModeActive=!!thread.voiceModeActive;setExpression(expression.value,thread.detail);faithSaveWorkspace();}else{try{localStorage.setItem(FAITH_WORKSPACE_KEY,JSON.stringify(faithWorkspace));}catch(_){faithSaveWorkspace();}faithRenderSidebar();}holder.remove();};
+  actions.append(close,apply);controls.appendChild(actions);panel.appendChild(controls);holder.appendChild(panel);holder.addEventListener('click',e=>{if(e.target===holder)holder.remove();});document.addEventListener('keydown',function esc(e){if(e.key==='Escape'&&holder.isConnected){holder.remove();document.removeEventListener('keydown',esc);}});document.body.appendChild(holder);
 }
 
 function faithShowContextMenu(x, y, items) {
@@ -2291,6 +2329,7 @@ function faithRenderSidebar() {
       b.addEventListener("contextmenu", (event) => {
         event.preventDefault();
         faithShowContextMenu(event.clientX, event.clientY, [
+          { label: "View chat info", action: () => faithShowChatInfo(thread) },
           { label: "Archive chat (.txt)", action: () => faithArchiveThread(thread) },
           { label: "Delete chat", danger: true, action: () => {
             if (confirm(`Delete the conversation “${thread.title || "New conversation"}”? This cannot be undone.`)) faithDeleteThread(thread.id);
@@ -2494,7 +2533,7 @@ async function faithDeleteAllGalleryImages() {
 }
 function faithNewThread() {
   faithSaveWorkspace();
-  const thread = { id: "thread-" + Date.now().toString(36), title: "New conversation", html: "", updatedAt: Date.now(), mode: "idle", behaviorState: "idle", expression: "ruby", detail: "Ready" };
+  const thread = { id: "thread-" + Date.now().toString(36), title: "New conversation", html: "", createdAt: Date.now(), updatedAt: Date.now(), mode: "idle", behaviorState: "idle", expression: "ruby", detail: "Ready" };
   faithWorkspace.threads.unshift(thread);
   faithWorkspace.activeId = thread.id;
   window.faithVoiceModeActive = false;
