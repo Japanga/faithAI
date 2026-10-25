@@ -94,23 +94,14 @@
       </div>
     </div>
     <div id="fvs-bgLoadEl" class="fvs-loadingEl" hidden><span class="fvs-dotsEl">painting background</span></div>
-    <div class="rowEl" style="margin-top:8px; align-items:flex-end">
-      <div class="fieldEl" style="flex:0 1 auto">
-        <label>&nbsp;</label>
-        <label style="font-size:0.9rem; font-weight:400"><input id="fvs-bgAnimCheck" type="checkbox"> Animate background <span class="hintEl">(optional — shifting variants, e.g. drifting clouds, glowing lights)</span></label>
-        <label style="font-size:0.9rem; font-weight:400"><input id="fvs-bgStrictCheck" type="checkbox" checked> Strict sameness</label>
-      </div>
-      <div class="fieldEl" style="max-width:100px; flex:0 1 auto">
-        <label for="fvs-bgCountSelect">Variants</label>
-        <select id="fvs-bgCountSelect">
-          <option value="2" selected>2</option>
-          <option value="3">3</option>
-          <option value="4">4</option>
-        </select>
-      </div>
-    </div>
     <div id="fvs-bgStripEl" style="display:flex; gap:6px; flex-wrap:wrap; margin-top:8px"></div>
     <img id="fvs-bgPrevImgEl" hidden alt="background preview">
+    <div class="hintEl" style="margin-top:8px">Backgrounds are still images for predictable results. Save useful backgrounds below, then choose a different background for each stage clip in the timeline.</div>
+    <div class="rowEl" style="margin-top:8px">
+      <div class="fieldEl grow2"><label for="fvs-bgLibraryNameInput">Save current background as</label><input id="fvs-bgLibraryNameInput" type="text" placeholder="e.g. Castle courtyard"></div>
+      <div class="fieldEl" style="max-width:180px"><label>&nbsp;</label><button id="fvs-bgLibrarySaveBtn" type="button">Save to Background Tabs</button></div>
+    </div>
+    <div id="fvs-bgLibraryEl" style="display:flex;gap:8px;flex-wrap:wrap;margin-top:8px"></div>
   </section>
 
   <section>

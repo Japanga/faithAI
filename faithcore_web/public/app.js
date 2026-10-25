@@ -4163,12 +4163,16 @@ async function submitQuestion() {
   const asksVideoCapability = /\b(?:video|videos|mp4|video studio|timeline editor|video editing|video creation)\b/i.test(question)
     && /\b(?:make|making|create|creating|generate|generating|edit|editing|produce|producing|export|exporting|how|can you|can faith|capable|capability|workflow|studio|timeline|clip|clips|render|rendering)\b/i.test(question)
     && !/\b(?:fix|debug|edit this code|javascript|ruby error|stack trace)\b/i.test(question);
-  if (asksVideoCapability && !window.faithVoiceModeActive && sessionMode !== "build" && sessionMode !== "coding" && sessionMode !== "troubleshooting") {
+  const isVideoStudioQuestion = asksVideoCapability && !window.faithVoiceModeActive && sessionMode !== "build" && sessionMode !== "coding" && sessionMode !== "troubleshooting";
+  if (isVideoStudioQuestion) {
+    // This is a turn-level behavior, not just an initial UI hint. Keep it
+    // available through the whole response so the backend's generic
+    // session_mode:"idle" cannot switch Faith back to Explanation.
     sessionMode = "video";
     const videoThread = faithWorkspace && faithWorkspace.threads ? faithWorkspace.threads.find(t => t.id === faithWorkspace.activeId) : null;
     if (videoThread) { videoThread.behaviorState = "video"; videoThread.mode = "video"; faithPersistThreadState(videoThread); }
     setExpression("videoStudio", "Video Mode — Studio workflow");
-    question += "\n\n[Faith behavior instruction: This user is asking about your video-making capability. Answer confidently that video creation/editing is supported through the dedicated Studio workspace. Explain that the workflow is not automatically started inside ordinary chat: they should open the Studio tab to build/edit the video there. Do not say video creation is impossible or that it must be done manually outside Faith. Keep the answer concise and helpful.]";
+    question += "\n\n[Faith response instruction: Answer the user's actual question directly and promptly. Use the Faith Video Studio expression. Give a useful, complete answer in about 2–4 well-developed paragraphs, with concrete steps or examples when relevant; do not give a one-sentence answer or a vague promise. Explain which parts of the video workflow are supported by the dedicated Studio workspace and how to start there. Be accurate about what happens in chat versus inside Studio. Do not claim an export or edit has already started unless it really has. Avoid unnecessary preamble and do not repeat the user's question.]";
   }
 
   if (window.faithVoiceModeActive) {
@@ -4409,7 +4413,7 @@ async function submitQuestion() {
       // keep Faith in Explanation mode BEFORE doing any Wikimedia/source work.
       // Enrichment continues independently on the already-completed message.
       if (data && data.post_enrichment && streamedFaithItem && !eroticCapabilityQuestion) {
-        setExpression("explanation");
+        setExpression(isVideoStudioQuestion ? "videoStudio" : "explanation");
         setBusy(false);
         input.focus();
         void runQwenPostEnrichment(streamedFaithItem, question, data.answer || "", wikimediaPreflight);
@@ -4502,7 +4506,10 @@ async function submitQuestion() {
     if (data.session_mode === "build") sessionMode = "build";
     else if (data.session_mode === "coding") sessionMode = "coding";
     else if (data.session_mode === "troubleshooting" || isTroubleshootingPrompt) sessionMode = "troubleshooting";
-    else if (data.session_mode === "idle") sessionMode = "idle";
+    else if (data.session_mode === "idle") sessionMode = isVideoStudioQuestion ? "video" : "idle";
+    // The ordinary chat endpoint reports idle for every answer. Preserve this
+    // turn's explicit Video Studio routing unless a higher-priority mode won.
+    if (isVideoStudioQuestion && !["build", "coding", "troubleshooting"].includes(sessionMode)) sessionMode = "video";
 
     if (shouldPaint) {
       // This is the actual Paint Me / image-generation path. The painter tab
@@ -4526,7 +4533,7 @@ async function submitQuestion() {
       // confirmed an actual generation request above.
       const normalExpression = ["robotic", "psychotic", "sad", "anger", "erotic"].includes(data.expression)
         ? data.expression
-        : (sessionMode === "video"
+        : ((isVideoStudioQuestion || sessionMode === "video")
           ? "videoStudio"
           : (sessionMode === "build"
           ? "build"

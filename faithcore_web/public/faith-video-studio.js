@@ -306,7 +306,7 @@ const state = {
   bgAvg: null,   // average background colour, for the ambient-match wash
   pFlip: false,  // mirror the single preview / pose character
   pRot: 0,       // ...and rotate it (degrees)
-  bgs: [],      // animated background variants (optional), first = still
+  bgs: [],      // legacy compatibility only; animated backgrounds are disabled
   cast: [],     // scene cast: {id, label, cutout, x, y, scale, pathA, pathB}
   selId: 0,
   castSeq: 0,
@@ -1225,7 +1225,6 @@ $("playBtn").addEventListener("click", () => {
 });
 
 function bgList() {
-  if ($("bgAnimCheck").checked && state.bgs.length > 1) return state.bgs;
   return state.bg ? [state.bg] : [];
 }
 function stageFrameCount() {
@@ -1241,116 +1240,101 @@ function stageFrameCount() {
 }
 function gcd2(a, b) { return b ? gcd2(b, a % b) : a; }
 
-/* ---------- background (still or animated variants) ---------- */
-const BG_VARIETIES = [
-  "the same scene a moment later, clouds rearranged and drifting to new positions across the sky",
-  "the same scene a moment later, sunlight flaring brighter, warm glow blooming over the land",
-  "the same scene a moment later, breeze sweeping through, grass and leaves leaning, shadows shifted",
-  "the same scene a moment later, mist curling through, lights glowing, dreamy haze",
-];
-const BG_MILD = "the same scene, nearly identical, only the light shimmering faintly";
-// Structural similarity at postage-stamp size: layout drift survives the
-// downscale, cloud shimmer does not. 1 = identical, ~0.9 = same scene,
-// well under 0.8 = recomposed.
-function tiny24(img) {
-  const c = document.createElement("canvas");
-  c.width = 24; c.height = 24;
-  const x = c.getContext("2d", { willReadFrequently: true });
-  x.drawImage(img, 0, 0, 24, 24);
-  return x.getImageData(0, 0, 24, 24).data;
-}
-function structSim(baseData, img) {
-  const d = tiny24(img);
-  let diff = 0;
-  for (let i = 0; i < d.length; i += 4) {
-    diff += Math.abs(d[i] - baseData[i]) + Math.abs(d[i + 1] - baseData[i + 1]) + Math.abs(d[i + 2] - baseData[i + 2]);
-  }
-  return 1 - diff / (24 * 24 * 3 * 255);
-}
+/* ---------- background (still images + saved Background Tabs) ---------- */
 async function genBgVariant(bit) {
   const prompt = buildStyledPrompt(studioStyle(), bit);
   const painted = await faithGenerateImage(prompt, "768x768");
   return { dataUrl: painted.dataUrl, img: painted.img, prompt };
 }
 function renderBgStrip() {
-  const list = state.bgs;
   const strip = $("bgStripEl");
   strip.innerHTML = "";
-  list.forEach((b, i) => {
-    const t = document.createElement("img");
-    t.src = b.dataUrl;
-    t.alt = "background variant " + (i + 1);
-    t.title = (list.length > 1 ? "Variant " + (i + 1) + (b.sim != null && i > 0 ? " (match " + b.sim.toFixed(2) + ")" : "") + " — click to use as the still" : "Background — click to preview");
-    t.style.cssText = "width:84px;height:84px;border-radius:6px;border:2px solid " + (b === state.bg ? "#2b7de9" : "rgba(128,128,128,.4)") + ";cursor:pointer;object-fit:cover";
-    t.addEventListener("click", () => {
-      state.bg = b;
-      state.bgAvg = bgAverage(b.img);
-      [...strip.children].forEach((el, j) => { el.style.borderColor = list[j] === state.bg ? "#2b7de9" : "rgba(128,128,128,.4)"; });
-      $("bgPrevImgEl").src = b.dataUrl;
-      drawStrip();
-      drawStage();
-      status("Using variant " + (i + 1) + " as the still background.", false);
-    });
-    strip.appendChild(t);
-  });
+  if (!state.bg) return;
+  const t = document.createElement("img");
+  t.src = state.bg.dataUrl; t.alt = "Current still background"; t.title = "Current background";
+  t.style.cssText = "width:84px;height:84px;border-radius:6px;border:2px solid #2b7de9;object-fit:cover";
+  strip.appendChild(t);
 }
-$("bgAnimCheck").addEventListener("change", () => { state.playIdx = 0; drawStrip(); drawStage(); });
 $("genBgBtn").addEventListener("click", async () => {
   const scene = $("bgPromptInput").value.trim();
   if (!scene) { status("Tell me where your character is first.", false); return; }
-  const animated = $("bgAnimCheck").checked;
-  const count = animated ? Math.max(2, Math.min(4, Number($("bgCountSelect").value) || 2)) : 1;
-  const btn = $("genBgBtn");
-  btn.disabled = true;
-  $("bgLoadEl").hidden = false;
+  const btn = $("genBgBtn"); btn.disabled = true; $("bgLoadEl").hidden = false;
   try {
-    const strict = $("bgStrictCheck").checked;
-    const list = [];
-    let baseTiny = null;
-    const notes = [];
-    for (let i = 0; i < count; i++) {
-      if (count > 1) status("Painting background " + (i + 1) + "/" + count + "…", true);
-      else status("Painting background…", true);
-      const bit = i === 0 ? scene : scene + ", " + BG_VARIETIES[(i - 1) % BG_VARIETIES.length];
-      let v = await genBgVariant(bit);
-      if (i === 0) {
-        baseTiny = tiny24(v.img);
-        v.sim = 1;
-      } else if (strict) {
-        v.sim = structSim(baseTiny, v.img);
-        if (v.sim < 0.8) {
-          status("Variant " + (i + 1) + " drifted (" + v.sim.toFixed(2) + ") — retrying milder…", true);
-          const m = await genBgVariant(scene + ", " + BG_MILD);
-          m.sim = structSim(baseTiny, m.img);
-          if (m.sim >= v.sim) { v = m; notes.push("variant " + (i + 1) + " needed a milder take (" + v.sim.toFixed(2) + ")"); }
-          else notes.push("variant " + (i + 1) + " kept at " + v.sim.toFixed(2));
-        }
-      }
-      list.push(v);
-    }
-    state.bgs = list;
-    state.bg = list[0];
-    for (let i = 0; i < list.length; i++) await fvsSaveImageToGallery(list[i].dataUrl, "Video Studio background " + (i + 1), list[i].prompt || scene);
-    const mean = (a) => Math.round(a.reduce((x, y) => x + y, 0) / a.length);
-    const avgs = list.map((b) => bgAverage(b.img));
-    state.bgAvg = { r: mean(avgs.map((a) => a.r)), g: mean(avgs.map((a) => a.g)), b: mean(avgs.map((a) => a.b)) };
-    const prev = $("bgPrevImgEl");
-    prev.src = list[0].dataUrl;
-    prev.hidden = false;
-    renderBgStrip();
-    state.playIdx = 0;
-    drawStrip();
-    drawStage();
-    const doneMsg = count > 1 ? "Background ready — " + count + " variants, cycling on the stage." + (notes.length ? " " + notes.join("; ") + "." : "") : "Background ready.";
-    status(doneMsg, false);
-  } catch (e) {
-    console.warn("bg failed", e);
-    status("Background failed (" + (e && e.message ? e.message : e) + ").", false);
-  } finally {
-    btn.disabled = false;
-    $("bgLoadEl").hidden = true;
-  }
+    status("Painting background…", true);
+    const b = await genBgVariant(scene);
+    state.bg = b; state.bgs = [b]; state.bgAvg = bgAverage(b.img);
+    $("bgPrevImgEl").src = b.dataUrl; $("bgPrevImgEl").hidden = false;
+    renderBgStrip(); drawStrip(); drawStage();
+    await fvsSaveImageToGallery(b.dataUrl, "Video Studio background", b.prompt || scene);
+    saveWorkspaceSoon();
+    status("Still background ready and saved to Gallery.", false);
+  } catch (e) { console.warn("background generation failed", e); status("Background failed (" + (e && e.message ? e.message : e) + ").", false); }
+  finally { btn.disabled = false; $("bgLoadEl").hidden = true; }
 });
+
+/* ---------- persistent Background Tabs library (separate from workspaces) ---------- */
+let fvsBackgroundLibrary = [];
+function fvsBgId() { return "bg-" + Date.now().toString(36) + Math.floor(Math.random() * 100000).toString(36); }
+function fvsCurrentWorkspaceId() {
+  try { return activeWorkspace().id; } catch (_) { return "main"; }
+}
+async function fvsBgLibraryReadAll() {
+  const db = await fvsOpenDb();
+  const all = await new Promise((resolve, reject) => {
+    const tx = db.transaction("backgrounds", "readonly"), req = tx.objectStore("backgrounds").getAll();
+    req.onsuccess = () => resolve(req.result || []); req.onerror = () => reject(req.error || new Error("Could not read Background Tabs"));
+  });
+  const workspaceId = fvsCurrentWorkspaceId();
+  // One-time compatibility migration: legacy unscoped backgrounds are assigned
+  // to the workspace that is active when the library is first opened. They are
+  // never displayed in every workspace.
+  const legacy = all.filter(item => !item.workspaceId);
+  if (legacy.length) {
+    await new Promise((resolve, reject) => {
+      const tx = db.transaction("backgrounds", "readwrite"), store = tx.objectStore("backgrounds");
+      legacy.forEach(item => store.put(Object.assign({}, item, { workspaceId })));
+      tx.oncomplete = resolve; tx.onerror = () => reject(tx.error || new Error("Could not migrate saved backgrounds"));
+    });
+    legacy.forEach(item => { item.workspaceId = workspaceId; });
+  }
+  return all.filter(item => item.workspaceId === workspaceId);
+}
+async function fvsBgLibraryWrite(item) {
+  const db = await fvsOpenDb();
+  return new Promise((resolve, reject) => {
+    const tx = db.transaction("backgrounds", "readwrite"); tx.objectStore("backgrounds").put(item);
+    tx.oncomplete = () => resolve(true); tx.onerror = () => reject(tx.error || new Error("Could not save background")); tx.onabort = () => reject(tx.error || new Error("Background save was cancelled"));
+  });
+}
+async function fvsBgLibraryDelete(id) {
+  const db = await fvsOpenDb();
+  return new Promise((resolve, reject) => {
+    const tx = db.transaction("backgrounds", "readwrite"); tx.objectStore("backgrounds").delete(id);
+    tx.oncomplete = () => resolve(true); tx.onerror = () => reject(tx.error || new Error("Could not delete background"));
+  });
+}
+function renderBackgroundLibrary() {
+  const box = $("bgLibraryEl"); box.innerHTML = "";
+  if (!fvsBackgroundLibrary.length) { box.innerHTML = '<span class="hintEl">No saved backgrounds yet.</span>'; return; }
+  for (const item of fvsBackgroundLibrary) {
+    const card = document.createElement("div"); card.style.cssText = "width:112px;border:1px solid rgba(128,128,128,.35);border-radius:8px;padding:6px;display:flex;flex-direction:column;gap:5px";
+    const img = document.createElement("img"); img.src = item.dataUrl; img.alt = item.name; img.style.cssText = "width:100%;aspect-ratio:1;object-fit:cover;border-radius:5px;cursor:pointer";
+    img.title = "Click to use this background"; img.addEventListener("click", async () => { const loaded = await loadImg(item.dataUrl); state.bg = { dataUrl:item.dataUrl, img:loaded, prompt:item.prompt || item.name }; state.bgs=[state.bg]; state.bgAvg=bgAverage(loaded); $("bgPrevImgEl").src=item.dataUrl; $("bgPrevImgEl").hidden=false; renderBgStrip(); drawStage(); saveWorkspaceSoon(); status("Background loaded: " + item.name, false); });
+    const name = document.createElement("div"); name.textContent = item.name; name.title = item.name; name.style.cssText = "font-size:.78rem;overflow-wrap:anywhere";
+    const row = document.createElement("div"); row.style.cssText = "display:flex;gap:4px";
+    const use = document.createElement("button"); use.type="button"; use.textContent="Use"; use.style.flex="1"; use.addEventListener("click", () => img.click());
+    const del = document.createElement("button"); del.type="button"; del.textContent="×"; del.title="Delete saved background"; del.addEventListener("click", async () => { try { await fvsBgLibraryDelete(item.id); fvsBackgroundLibrary=fvsBackgroundLibrary.filter(x=>x.id!==item.id); renderBackgroundLibrary(); renderTimeline(); status("Saved background deleted.", false); } catch(e) { status("Could not delete background: " + e.message, false); } });
+    row.append(use,del); card.append(img,name,row); box.appendChild(card);
+  }
+}
+async function loadBackgroundLibrary() { try { fvsBackgroundLibrary = await fvsBgLibraryReadAll(); renderBackgroundLibrary(); renderTimeline(); } catch(e) { console.warn("Background Tabs unavailable",e); $("bgLibraryEl").textContent="Background Tabs could not be opened in this browser."; } }
+$("bgLibrarySaveBtn").addEventListener("click", async () => {
+  if (!state.bg || !state.bg.dataUrl) { status("Make or load a background first.", false); return; }
+  const name = $("bgLibraryNameInput").value.trim() || (state.bg.prompt || "Saved background").slice(0,48) || "Saved background";
+  try { const item={id:fvsBgId(),workspaceId:fvsCurrentWorkspaceId(),name:name.slice(0,80),dataUrl:state.bg.dataUrl,prompt:state.bg.prompt||name,createdAt:Date.now()}; await fvsBgLibraryWrite(item); fvsBackgroundLibrary=await fvsBgLibraryReadAll(); renderBackgroundLibrary(); renderTimeline(); $("bgLibraryNameInput").value=""; status("Background saved to Background Tabs.",false); }
+  catch(e) { status("Could not save background: " + e.message,false); }
+});
+setTimeout(loadBackgroundLibrary, 0);
 
 /* ---------- save ---------- */
 async function fvsSaveImageToGallery(dataUrl, title, prompt) {
@@ -1496,7 +1480,6 @@ $("zipBtn").addEventListener("click", async () => {
     }
     const o = fxOpts();
     infoLines.push("post: bloom " + o.bloom + ", ambient-match " + o.ambient + ", tint " + o.tint + " (" + o.tintColor + "), warmth " + o.warmth + ", vignette " + o.vignette + ", sat " + o.sat + ", con " + o.con + ", grain " + o.grain);
-    if (state.bgs.length > 1) infoLines.push("background: " + state.bgs.length + " animated variants" + ($("bgAnimCheck").checked ? " (on)" : " (off)"));
     state.cast.forEach((c, k) => {
       const path = (c.pathA && c.pathB)
         ? " path A(" + c.pathA.x.toFixed(2) + "," + c.pathA.y.toFixed(2) + ")→B(" + c.pathB.x.toFixed(2) + "," + c.pathB.y.toFixed(2) + ")"
@@ -1537,9 +1520,9 @@ function snapScene() {
     cast: state.cast.map((c) => ({ ...c, pathA: c.pathA ? { ...c.pathA } : null, pathB: c.pathB ? { ...c.pathB } : null })),
     selId: state.selId,
     bg: state.bg,
-    bgs: [...state.bgs],
+    bgs: state.bg ? [state.bg] : [],
     bgAvg: state.bgAvg ? { ...state.bgAvg } : null,
-    bgAnim: $("bgAnimCheck").checked,
+    bgAnim: false,
     poses: state.poses.map((p) => ({ ...p })),
     sheet: state.sheet,
   };
@@ -1559,9 +1542,8 @@ function applySnap(s) {
   state.cast = s.cast.map((c) => ({ ...c, pathA: c.pathA ? { ...c.pathA } : null, pathB: c.pathB ? { ...c.pathB } : null }));
   state.selId = s.selId;
   state.bg = s.bg;
-  state.bgs = [...s.bgs];
+  state.bgs = state.bg ? [state.bg] : [];
   state.bgAvg = s.bgAvg ? { ...s.bgAvg } : null;
-  $("bgAnimCheck").checked = !!s.bgAnim;
   state.poses = (s.poses || []).map((p) => ({ ...p }));
   state.sheet = s.sheet || null;
   state.playIdx = 0;
@@ -1590,7 +1572,7 @@ $("tlAddStageBtn").addEventListener("click", () => {
   thumb.width = 168; thumb.height = 168;
   thumb.getContext("2d").drawImage(composeFrame(168, 168, frameAt(0)), 0, 0);
   state.tlSeq++;
-  state.timeline.push({ kind: "stage", id: state.tlSeq, name: "Stage " + state.tlSeq, snap, frames, thumb: thumb.toDataURL("image/jpeg", 0.72) });
+  state.timeline.push({ kind: "stage", id: state.tlSeq, name: "Stage " + state.tlSeq, snap, frames, backgroundOverride: null, thumb: thumb.toDataURL("image/jpeg", 0.72) });
   renderTimeline();
   status("Clip added — " + frames + " frames of this exact scene.", false);
 });
@@ -1741,6 +1723,16 @@ function renderTimeline() {
     }
     row.appendChild(del);
     card.appendChild(row);
+    if (clip.kind === "stage") {
+      const bgLabel = document.createElement("label"); bgLabel.textContent = "Background tab"; bgLabel.style.cssText = "font-size:.75rem;margin-top:3px";
+      const bgSel = document.createElement("select"); bgSel.style.cssText = "width:100%;font-size:.75rem";
+      const addOpt=(value,label)=>{const o=document.createElement("option");o.value=value;o.textContent=label;bgSel.appendChild(o);};
+      addOpt("default","Use captured background"); addOpt("off","No background");
+      for (const b of fvsBackgroundLibrary) addOpt(b.id,b.name);
+      const ov=clip.backgroundOverride; bgSel.value = !ov ? "default" : (ov.mode==="off" ? "off" : (ov.id || "default"));
+      bgSel.addEventListener("change",()=>{ if(bgSel.value==="default") clip.backgroundOverride=null; else if(bgSel.value==="off") clip.backgroundOverride={mode:"off"}; else { const b=fvsBackgroundLibrary.find(x=>x.id===bgSel.value); clip.backgroundOverride=b?{mode:"image",id:b.id,name:b.name}:null; } saveWorkspaceSoon(); status("Background for " + clip.name + " updated.",false); });
+      bgLabel.appendChild(bgSel); card.appendChild(bgLabel);
+    }
     box.appendChild(card);
   });
   const n = state.timeline.length;
@@ -1809,6 +1801,17 @@ $("tlExportBtn").addEventListener("click", async () => {
     for (const p of plan) {
       if (p.clip.kind === "stage") {
         applySnap(p.clip.snap);
+        if (p.clip.backgroundOverride) {
+          if (p.clip.backgroundOverride.mode === "off") { state.bg = null; state.bgAvg = null; }
+          else if (p.clip.backgroundOverride.mode === "image" && p.clip.backgroundOverride.id) {
+            const savedBg = fvsBackgroundLibrary.find((b) => b.id === p.clip.backgroundOverride.id);
+            if (savedBg && savedBg.dataUrl) {
+              const overrideImg = await loadImg(savedBg.dataUrl);
+              state.bg = { dataUrl:savedBg.dataUrl, img:overrideImg, prompt:savedBg.prompt || savedBg.name || "Background tab" };
+              state.bgAvg = bgAverage(overrideImg);
+            } else { state.bg = null; state.bgAvg = null; }
+          }
+        }
         for (let j = 0; j < p.frames; j++) {
           px.fillStyle = "#000"; px.fillRect(0, 0, W, H);
           px.drawImage(composeFrame(W, H, frameAt(j)), 0, 0);
@@ -2273,7 +2276,7 @@ $("sheetDiceBtn").addEventListener("click", () => {
 /* FVS-WORKSPACES-START */
 const FVS_STORE_KEY = "faithVideoStudioV1";
 const FVS_DB_NAME = "FaithVideoStudioStore";
-const FVS_DB_VERSION = 1;
+const FVS_DB_VERSION = 2;
 let fvsDbPromise = null;
 let fvsWorkspace = null;
 let fvsWorkspaceMenu = null;
@@ -2308,11 +2311,11 @@ function fvsStripSnap(s) {
 }
 function blankWorkspaceData() {
   return {
-    v: 3, charInput: "", basePoseInput: "standing, facing forward",
+    v: 4, charInput: "", basePoseInput: "standing, facing forward",
     style: "Anime", mode: "moves",
     bgPromptInput: "sunny meadow with soft hills and a dirt path, empty, no characters",
     poseTexts: DEFAULT_POSES.slice(),
-    loopFrames: 4, fps: 5, scale: 0.85, bgAnim: false, bgStrict: true, bgCount: "2",
+    loopFrames: 4, fps: 5, scale: 0.85, bgAnim: false,
     fx: { bloom: "30", ambient: "35", tintStrength: "0", tintColor: "#ffb46b", warmth: "0", vignette: "20", sat: "100", con: "100", grain: "0" },
     pFlip: false, pRot: 0,
     cutout: null, bg: null, bgAvg: null, bgs: [],
@@ -2327,7 +2330,6 @@ function collectWorkspaceData() {
     style: $("styleSelect").value, mode: $("modeSelect").value,
     bgPromptInput: $("bgPromptInput").value, poseTexts: readPoseTexts(),
     loopFrames: $("loopFramesInput").value, fps: $("fpsInput").value, scale: $("scaleInput").value,
-    bgAnim: $("bgAnimCheck").checked, bgStrict: $("bgStrictCheck").checked, bgCount: $("bgCountSelect").value,
     fx: {
       bloom: $("bloomInput").value, ambient: $("ambientInput").value,
       tintStrength: $("tintStrengthInput").value, tintColor: $("tintColorInput").value,
@@ -2343,7 +2345,7 @@ function collectWorkspaceData() {
     poses: state.poses.map(function (p) { return { text: p.text || "", dataUrl: p.dataUrl || "" }; }),
     sheet: fvsStripImg(state.sheet),
     timeline: state.timeline.filter(function (c) { return c && c.kind === "stage" && c.snap; }).map(function (c) {
-      return { kind: "stage", id: c.id, name: c.name, frames: c.frames, thumb: c.thumb, snap: fvsStripSnap(c.snap) };
+      return { kind: "stage", id: c.id, name: c.name, frames: c.frames, thumb: c.thumb, backgroundOverride: c.backgroundOverride || null, snap: fvsStripSnap(c.snap) };
     }),
     tlSeq: state.tlSeq
   };
@@ -2362,7 +2364,7 @@ function fvsOpenDb() {
   fvsDbPromise = new Promise(function (resolve, reject) {
     if (!window.indexedDB) { reject(new Error("IndexedDB unavailable")); return; }
     const req = indexedDB.open(FVS_DB_NAME, FVS_DB_VERSION);
-    req.onupgradeneeded = function () { const db = req.result; if (!db.objectStoreNames.contains("workspace")) db.createObjectStore("workspace"); };
+    req.onupgradeneeded = function () { const db = req.result; if (!db.objectStoreNames.contains("workspace")) db.createObjectStore("workspace"); if (!db.objectStoreNames.contains("backgrounds")) db.createObjectStore("backgrounds", { keyPath: "id" }); };
     req.onsuccess = function () { resolve(req.result); };
     req.onerror = function () { reject(req.error || new Error("Could not open workspace database")); };
   });
@@ -2507,9 +2509,6 @@ async function applyWorkspaceData(d) {
     $("fpsValEl").textContent = $("fpsInput").value;
     $("scaleInput").value = d.scale != null ? d.scale : 0.85;
     $("scaleValEl").textContent = $("scaleInput").value;
-    $("bgAnimCheck").checked = !!d.bgAnim;
-    $("bgStrictCheck").checked = d.bgStrict !== false;
-    $("bgCountSelect").value = d.bgCount || "2";
     const fx = d.fx || {};
     const fxMap = [["bloomInput", "bloomValEl", "bloom", "30"], ["ambientInput", "ambientValEl", "ambient", "35"], ["tintStrengthInput", "tintValEl", "tintStrength", "0"], ["warmthInput", "warmthValEl", "warmth", "0"], ["vignetteInput", "vignetteValEl", "vignette", "20"], ["satInput", "satValEl", "sat", "100"], ["conInput", "conValEl", "con", "100"], ["grainInput", "grainValEl", "grain", "0"]];
     for (const triple of fxMap) {
@@ -2526,8 +2525,7 @@ async function applyWorkspaceData(d) {
     state.bgAvg = d.bgAvg ? Object.assign({}, d.bgAvg) : null;
     state.cutout = await fvsTake(d.cutout);
     state.bg = await fvsTake(d.bg);
-    state.bgs = [];
-    for (const b of (d.bgs || [])) { const o = await fvsTake(b); if (o) state.bgs.push(o); }
+    state.bgs = state.bg ? [state.bg] : [];
     state.cast = [];
     state.castSeq = d.castSeq || 0;
     state.selId = d.selId || 0;
@@ -2549,7 +2547,7 @@ async function applyWorkspaceData(d) {
     state.tlSeq = d.tlSeq || 0;
     for (const c of (d.timeline || [])) {
       if (!c || c.kind !== "stage" || !c.snap) continue;
-      state.timeline.push({ kind: "stage", id: c.id, name: c.name, frames: c.frames, thumb: c.thumb, snap: await fvsHydrateSnap(c.snap) });
+      state.timeline.push({ kind: "stage", id: c.id, name: c.name, frames: c.frames, thumb: c.thumb, backgroundOverride: c.backgroundOverride || null, snap: await fvsHydrateSnap(c.snap) });
     }
     state.playIdx = 0;
     refreshAllUI();
@@ -2560,6 +2558,9 @@ async function applyWorkspaceData(d) {
     if (!state.sheet) $("sheetPrevImgEl").hidden = true;
     renderTimeline();
     renderWorkspaceList();
+    // Reload the saved-background shelf only after the target workspace is
+    // active and its data is applied, preventing cross-workspace leakage.
+    await loadBackgroundLibrary();
     const hasWork = !!(state.cutout || state.cast.length || state.poses.length || state.sheet);
     fvsLoading = false;
     status(hasWork ? "Workspace loaded." : "New workspace \u2014 describe a character to begin.", false);
