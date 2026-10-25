@@ -4422,50 +4422,6 @@ server.mount_proc "/api/gallery" do |req, res|
         status, result = faith_gallery_set_favorite.call(payload)
         json_response.call(res, status, result)
         next
-      elsif payload["action"] == "delete"
-        # Use the same POST transport that fixed favoriting on older WEBrick builds.
-        # Resolve IDs/filenames/URLs against both regular and favorites folders.
-        if payload["all"] == true
-          Dir.glob(File.join(FAITH_GALLERY_DIR, "*")).each { |path| FileUtils.rm_f(path) if File.file?(path) }
-          json_response.call(res, 200, { ok: true })
-          next
-        end
-        id = payload["id"].to_s
-        requested_aliases = [id, payload["filename"].to_s, payload["url"].to_s].reject(&:empty?).map do |value|
-          value.to_s.split(/[?#]/, 2).first.to_s.sub(%r{\A.*/}, "")
-        end
-        deleted_path = nil
-        [[FAITH_GALLERY_DIR, false], [FAITH_GALLERY_FAVORITES_DIR, true]].each do |directory, _favorite_folder|
-          break if deleted_path
-          Dir.glob(File.join(directory, "*")).each do |image_path|
-            next unless File.file?(image_path) && image_path.match?(/\.(?:png|jpe?g|webp|gif)\z/i)
-            meta_path = image_path + ".json"
-            meta = File.file?(meta_path) ? (JSON.parse(File.read(meta_path, encoding: "UTF-8")) rescue {}) : {}
-            basename = File.basename(image_path)
-            requested_basename = begin
-              URI.decode_www_form_component(id.split(/[?#]/, 2).first.to_s.sub(%r{\A.*/}, ""))
-            rescue StandardError
-              id.split(/[?#]/, 2).first.to_s.sub(%r{\A.*/}, "")
-            end
-            meta_url_name = meta["url"].to_s.split(/[?#]/, 2).first.to_s.sub(%r{\A.*/}, "")
-            candidates = [meta["id"], basename, meta["filename"], meta_url_name].compact.map(&:to_s)
-            matches = candidates.any? do |candidate|
-              candidate == id || candidate == requested_basename || candidate.casecmp?(requested_basename) ||
-                requested_aliases.any? { |alias_name| candidate == alias_name || candidate.casecmp?(alias_name) }
-            end
-            next unless matches
-            FileUtils.rm_f(image_path)
-            FileUtils.rm_f(meta_path)
-            deleted_path = image_path unless File.exist?(image_path)
-            break
-          end
-        end
-        if deleted_path
-          json_response.call(res, 200, { ok: true, filename: File.basename(deleted_path) })
-        else
-          json_response.call(res, 404, { error: "Image not found in gallery storage for id: #{id}; refresh the gallery and try again." })
-        end
-        next
       end
       data_url = payload["url"].to_s
       match = data_url.match(/\Adata:image\/(png|jpeg|jpg|webp|gif);base64,([A-Za-z0-9+\/=\r\n]+)\z/)
@@ -4494,36 +4450,21 @@ server.mount_proc "/api/gallery" do |req, res|
     elsif req.request_method == "DELETE"
       payload = req.body.to_s.empty? ? {} : JSON.parse(req.body.to_s)
       if payload["all"] == true
-        # Bulk delete is intentionally limited to non-favorite image files at
-        # the gallery root. Never recurse into, or delete anything from,
-        # FAITH_GALLERY_FAVORITES_DIR.
+        # Only remove top-level gallery files. The favorites subfolder is preserved.
         Dir.glob(File.join(FAITH_GALLERY_DIR, "*")).each do |path|
-          next unless File.file?(path)
-          next unless path.match?(/\.(?:png|jpe?g|webp|gif)(?:\.json)?\z/i)
-          File.delete(path)
+          File.delete(path) if File.file?(path)
         end
       else
         id = payload["id"].to_s
-        deleted = false
         [[FAITH_GALLERY_DIR, false], [FAITH_GALLERY_FAVORITES_DIR, true]].each do |directory, _|
-          next if deleted
-          # Resolve by metadata ID first, but older gallery entries can use the
-          # filename as their UI ID or have missing/corrupt sidecar metadata.
-          Dir.glob(File.join(directory, "*.*")).each do |image_path|
-            next unless File.file?(image_path) && image_path.match?(/\.(?:png|jpe?g|webp|gif)\z/i)
-            meta_path = image_path + ".json"
-            meta = File.file?(meta_path) ? (JSON.parse(File.read(meta_path, encoding: "UTF-8")) rescue {}) : {}
-            matches = meta["id"].to_s == id || File.basename(image_path) == id || meta["filename"].to_s == id
-            next unless matches
+          Dir.glob(File.join(directory, "*.json")).each do |meta_path|
+            meta = (JSON.parse(File.read(meta_path, encoding: "UTF-8")) rescue {})
+            next unless meta["id"].to_s == id
+            image_path = meta_path.sub(/\.json\z/, "")
             File.delete(image_path) if File.file?(image_path)
             File.delete(meta_path) if File.file?(meta_path)
-            deleted = true
             break
           end
-        end
-        unless deleted
-          json_response.call(res, 404, { error: "Image not found in gallery storage; it may already have been deleted or its record is stale." })
-          next
         end
       end
       json_response.call(res, 200, { ok: true })
@@ -4579,6 +4520,82 @@ end
 # fragile: the trap can run while WEBrick is blocked in server.start, and the
 # cleanup then depends on SystemExit/at_exit completing cleanly. Handle SIGINT by
 # shutting WEBrick down directly so server.start returns normally, then let the
+# Durable completed-video library. Finished exports are independent of editable workspaces.
+FAITH_VIDEOS_DIR = File.join(ROOT, "videos")
+FileUtils.mkdir_p(FAITH_VIDEOS_DIR) unless Dir.exist?(FAITH_VIDEOS_DIR)
+server.mount "/faith-video-files", WEBrick::HTTPServlet::FileHandler, FAITH_VIDEOS_DIR, FancyIndexing: false
+
+server.mount_proc "/api/videos" do |req, res|
+  begin
+    if req.request_method == "GET"
+      entries = Dir.glob(File.join(FAITH_VIDEOS_DIR, "*.mp4")).select { |path| File.file?(path) }.map do |path|
+        meta_path = path + ".json"
+        meta = File.file?(meta_path) ? (JSON.parse(File.read(meta_path, encoding: "UTF-8")) rescue {}) : {}
+        filename = File.basename(path)
+        { id: meta["id"] || filename, title: meta["title"] || filename, filename: filename,
+          url: "/faith-video-files/#{filename}", createdAt: meta["createdAt"] || (File.mtime(path).to_f * 1000).to_i,
+          bytes: File.size(path) }
+      end.sort_by { |entry| -entry[:createdAt].to_i }
+      json_response.call(res, 200, { videos: entries, count: entries.length, bytes: entries.sum { |entry| entry[:bytes].to_i } })
+    elsif req.request_method == "POST"
+      bytes = req.body.to_s.b
+      if bytes.empty? || bytes.bytesize > 1024 * 1024 * 1024
+        json_response.call(res, 413, { error: "Completed video is empty or exceeds the 1 GB video limit." })
+        next
+      end
+      content_type = req["content-type"].to_s.downcase
+      unless content_type.include?("video/mp4") || bytes.start_with?("\x00\x00\x00") || bytes.include?("ftyp")
+        json_response.call(res, 400, { error: "Only completed MP4 videos can be stored in the videos folder." })
+        next
+      end
+      requested = (req.query["name"] || req["x-faith-video-name"] || "faith-video.mp4").to_s
+      requested = File.basename(requested.gsub("\\", "/"))
+      requested = requested.gsub(/[^a-zA-Z0-9_.-]/, "_")
+      requested = "faith-video.mp4" unless requested.downcase.end_with?(".mp4")
+      stem = File.basename(requested, ".mp4")[0, 90]
+      filename = "#{stem}.mp4"
+      suffix = 2
+      while File.exist?(File.join(FAITH_VIDEOS_DIR, filename))
+        filename = "#{stem}_#{suffix}.mp4"; suffix += 1
+      end
+      path = File.join(FAITH_VIDEOS_DIR, filename)
+      File.binwrite(path, bytes)
+      id = SecureRandom.hex(10)
+      meta = { "id" => id, "title" => File.basename(filename, ".mp4").tr("_", " "), "filename" => filename,
+               "createdAt" => (Time.now.to_f * 1000).to_i, "bytes" => bytes.bytesize }
+      File.write(path + ".json", JSON.pretty_generate(meta), mode: "w:utf-8")
+      json_response.call(res, 201, { ok: true, entry: meta.merge("url" => "/faith-video-files/#{filename}") })
+    elsif req.request_method == "DELETE"
+      payload = req.body.to_s.empty? ? {} : JSON.parse(req.body.to_s)
+      if payload["all"] == true
+        Dir.glob(File.join(FAITH_VIDEOS_DIR, "*.mp4")).each do |path|
+          FileUtils.rm_f(path); FileUtils.rm_f(path + ".json")
+        end
+      else
+        id = payload["id"].to_s
+        found = false
+        Dir.glob(File.join(FAITH_VIDEOS_DIR, "*.mp4")).each do |path|
+          meta = File.file?(path + ".json") ? (JSON.parse(File.read(path + ".json", encoding: "UTF-8")) rescue {}) : {}
+          next unless meta["id"].to_s == id || File.basename(path) == id
+          FileUtils.rm_f(path); FileUtils.rm_f(path + ".json"); found = true; break
+        end
+        unless found
+          json_response.call(res, 404, { error: "Completed video not found." })
+          next
+        end
+      end
+      json_response.call(res, 200, { ok: true })
+    else
+      json_response.call(res, 405, { error: "GET, POST, or DELETE required." })
+    end
+  rescue JSON::ParserError
+    json_response.call(res, 400, { error: "Invalid video library JSON request." })
+  rescue StandardError => error
+    warn "Faith video library error: #{error.class}: #{error.message}"
+    json_response.call(res, 500, { error: error.message })
+  end
+end
+
 # normal cleanup path finish.
 shutdown_faith = lambda do
   begin
