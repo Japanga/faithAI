@@ -22,6 +22,19 @@ FAITH_LOCAL_AI_MODEL = ENV.fetch("FAITH_LOCAL_AI_MODEL", "local")
 FAITH_EMOTION_AI_URL = ENV.fetch("FAITH_EMOTION_AI_URL", "http://127.0.0.1:8070/v1/chat/completions")
 FAITH_EMOTION_BRIDGE_URL = ENV.fetch("FAITH_EMOTION_BRIDGE_URL", "http://127.0.0.1:8071")
 ROOT = File.expand_path(__dir__)
+FAITH_CODER_LOG_PATH = File.join(ROOT, "logs", "faith_coder.log")
+$faith_coder_log_mutex = Mutex.new
+
+def faith_coder_log(event, details = "")
+  timestamp = Time.now.strftime("%Y-%m-%d %H:%M:%S %z")
+  line = "[#{timestamp}] event=#{event} #{details}".strip + "\n"
+  $faith_coder_log_mutex.synchronize do
+    FileUtils.mkdir_p(File.dirname(FAITH_CODER_LOG_PATH))
+    File.open(FAITH_CODER_LOG_PATH, "a:utf-8") { |file| file.write(line) }
+  end
+rescue StandardError => log_error
+  warn "[Faith Coder Log] Could not write #{FAITH_CODER_LOG_PATH}: #{log_error.class}: #{log_error.message}"
+end
 FAITH_EMOTION_START_BAT = File.join(ROOT, "Test_Faith_Emotion_GGUF_Direct.bat")
 FAITH_EMOTION_STARTUP_TIMEOUT = Integer(ENV.fetch("FAITH_EMOTION_STARTUP_TIMEOUT", "300"))
 $faith_emotion_start_mutex = Mutex.new
@@ -174,6 +187,35 @@ rescue StandardError
   false
 end
 
+# Resolve the model advertised by the live OpenAI-compatible endpoint. When no
+# explicit model override is supplied, prefer the server's real model ID over
+# the placeholder "coding-local"; some servers reject unknown model aliases.
+def faith_coder_resolve_model(uri)
+  configured = ENV["FAITH_CODER_AI_MODEL"].to_s.strip
+  # Treat common generic aliases as placeholders and resolve the server's real
+  # ID even if a launcher exported one of them. Preserve explicit non-generic IDs.
+  return [configured, "environment"] unless configured.empty? || %w[coding-local local].include?(configured)
+
+  models_uri = URI::HTTP.build(host: uri.host, port: uri.port, path: "/v1/models")
+  started = Process.clock_gettime(Process::CLOCK_MONOTONIC)
+  http = Net::HTTP.new(models_uri.host, models_uri.port)
+  http.open_timeout = 3
+  http.read_timeout = 3
+  response = http.get(models_uri.request_uri)
+  elapsed = Process.clock_gettime(Process::CLOCK_MONOTONIC) - started
+  raise "Model discovery returned HTTP #{response.code}" unless response.is_a?(Net::HTTPSuccess)
+  data = JSON.parse(response.body.to_s) rescue {}
+  model_id = data.dig("data", 0, "id").to_s.strip
+  raise "The coding server's /v1/models response did not include a model ID" if model_id.empty?
+  faith_coder_log("model_discovery", "url=#{models_uri} elapsed=%.3fs model=#{model_id.inspect}" % elapsed)
+  [model_id, "server_discovery"]
+rescue StandardError => error
+  faith_coder_log("model_discovery_error", "url=#{uri.host}:#{uri.port} error_class=#{error.class} message=#{error.message.to_s.gsub(/[\r\n]+/, ' ')[0, 300].inspect}")
+  # Preserve compatibility with llama.cpp builds whose /v1/models endpoint is
+  # absent or nonstandard; the completion request will report any real error.
+  ["coding-local", "fallback"]
+end
+
 def ensure_faith_coder_server!(on_status: nil)
   endpoint = URI.parse(ENV.fetch("FAITH_CODER_AI_URL", "http://127.0.0.1:8090/v1/chat/completions"))
   return true if faith_coder_health_ready?(endpoint)
@@ -259,6 +301,7 @@ SYSTEM_PROMPT = <<~PROMPT
   - During an active coding/troubleshooting session, stay focused on that session until the user explicitly ends it or the session is cleared.
   - In Troubleshooting mode, remain in the Troubleshooting expression for follow-up error messages and diagnostic discussion.
   - When the user asks Faith to fix the uploaded code, enter Coding mode, apply the diagnosed fix to the actual uploaded source, and return the completed modified file.
+  - Whenever you output source code, always wrap each code section in a Markdown fenced block using triple backticks and an accurate language label (for example, ```ruby, ```javascript, ```html, or ```python). Never leave source code as plain unwrapped message text, even if it is a short snippet. Keep explanatory prose outside the fences. This is required for the browser to render the code as a syntax-highlighted <pre><code> block.
   - When returning fixed code, include the completed source inside a single fenced code block so the web client can render it as an embedded <code> section. Do not return a patch without the resulting code.
   - After a substantive Troubleshooting diagnosis, tell the user they can ask you to fix the code yourself; the application provides a Fix Code action for this.
   - During an active coding or troubleshooting session, never attach Wikimedia/reference images unless the user explicitly asks for a real photo/image. Code diagnosis and code solutions should remain text/code focused.
@@ -335,6 +378,7 @@ source_research_jobs_mutex = Mutex.new
 latest_code_context = nil
 latest_code_filename = nil
 latest_code_text = nil
+latest_code_stored_name = nil
 latest_troubleshooting_response = nil
 troubleshooting_active = false
 troubleshooting_diagnosis_ready = false
@@ -1992,6 +2036,7 @@ fix_code_from_active_session = lambda do |user_request|
     stored_name = "#{SecureRandom.hex(8)}-#{safe_name}"
     stored_path = File.join(UPLOAD_DIR, stored_name)
     File.binwrite(stored_path, fixed_code)
+    faith_write_code_file_metadata(stored_path, fixed_filename)
 
     # The fix response is intentionally code-only.  The browser adds the
     # clickable "Open fixed file" link separately, so Faith does not repeat
@@ -2001,6 +2046,7 @@ fix_code_from_active_session = lambda do |user_request|
     mutex.synchronize do
       latest_code_text = fixed_code
       latest_code_filename = fixed_filename
+      latest_code_stored_name = nil
       latest_code_context = "Uploaded file: #{fixed_filename}\n#{fixed_code}"[0, 16000]
       latest_troubleshooting_response = nil
       # Coding mode is a one-response action, not a persistent session flag.
@@ -2129,6 +2175,9 @@ prepare_attachment = lambda do |raw, request_base_url = ""|
   stored_name = "#{SecureRandom.hex(8)}-#{safe_name}"
   stored_path = File.join(UPLOAD_DIR, stored_name)
   File.binwrite(stored_path, bytes)
+  if defined?(FAITH_CODE_FILE_EXTENSIONS) && FAITH_CODE_FILE_EXTENSIONS.include?(ext)
+    faith_write_code_file_metadata(stored_path, name)
+  end
 
   image = mime.start_with?("image/")
   image_base_url = !PUBLIC_BASE_URL.empty? ? PUBLIC_BASE_URL : request_base_url.to_s.strip.sub(%r{/\z}, "")
@@ -2364,6 +2413,7 @@ server.mount_proc "/api/upload" do |req, res|
     if attachment && attachment[:text_content]
       mutex.synchronize do
         latest_code_filename = attachment[:name].to_s
+        latest_code_stored_name = nil
         latest_code_text = attachment[:text_content].to_s
         latest_code_context = "Uploaded file: #{attachment[:name]}\n#{attachment[:text_content]}"[0, 16000]
         latest_troubleshooting_response = nil
@@ -3403,6 +3453,7 @@ server.mount_proc "/api/chat" do |req, res|
       failed_diagnosis = answer.match?(/(?:I'm in Troubleshooting mode, but I couldn't retrieve live search results|diagnosis service returned HTTP (?:502|503|504))/i)
       mutex.synchronize do
         latest_code_filename = attachment[:name].to_s
+        latest_code_stored_name = nil
         latest_code_text = attachment[:text_content].to_s
         latest_code_context = "Uploaded file: #{attachment[:name]}\n#{attachment[:text_content]}"[0, 16000]
         troubleshooting_active = true
@@ -3819,7 +3870,7 @@ server.mount_proc "/api/build-chat" do |req, res|
           Do not merely promise to help, describe what you could build, or give a generic plan instead of building it. Produce the actual implementation now: complete usable code, file names, and concise run instructions where relevant.
           Ask a clarifying question only if a genuinely blocking decision makes any useful implementation impossible. Otherwise choose sensible defaults and proceed.
           Keep track of requirements and code decisions across this conversation. When revising code, preserve working features unless the user asks to remove them.
-          Do not claim you ran code or tests unless you actually did. When outputting code, use fenced code blocks with accurate language labels.
+          Do not claim you ran code or tests unless you actually did. Whenever you output source code, wrap every code section in triple-backtick fenced blocks with accurate language labels. Never leave code as raw message text; keep prose outside the fences so the browser can render syntax-highlighted <pre><code> blocks.
           You are still Faith. Do not identify yourself as Qwen or as a different assistant.
         BUILD_SYSTEM
       }]
@@ -3874,8 +3925,13 @@ server.mount_proc "/api/build-chat" do |req, res|
       out.write("data: #{JSON.generate(event)}\n\n") if current
     end
     begin
-      ensure_faith_coder_server!(on_status: lambda { |message| emit.call({ type: "status", phase: "waiting-coder", message: message }) })
-      emit.call({ type: "status", phase: "connecting", message: "The coding server on :8090 is ready. Sending the request now…" })
+      edit_stage = "waiting-coder"
+      ensure_faith_coder_server!(on_status: lambda do |message|
+        emit.call({ type: "status", phase: "waiting-coder", message: message })
+      end)
+      edit_stage = "connecting"
+      edit_stage = "connecting"
+      emit.call({ type: "status", phase: "connecting", message: "The coding server on :8090 is ready. Sending the build request now…" })
       uri = URI.parse(ENV.fetch("FAITH_CODER_AI_URL", "http://127.0.0.1:8090/v1/chat/completions"))
       model_id = ENV.fetch("FAITH_CODER_AI_MODEL", "coding-local")
       history = mutex.synchronize { build_messages.map(&:dup) }
@@ -3883,7 +3939,7 @@ server.mount_proc "/api/build-chat" do |req, res|
       # Keep the stream responsive, but detect the small coder model's common
       # generic non-answer and automatically retry once with an explicit build-now instruction.
       request_build_answer = lambda do |request_history|
-        body = { model: model_id, messages: request_history, stream: true, max_tokens: Integer(ENV.fetch("FAITH_BUILD_MAX_TOKENS", "4096")), temperature: 0.15 }
+        body = { model: model_id, messages: request_history, stream: true, max_tokens: Integer(ENV.fetch("FAITH_BUILD_MAX_TOKENS", "1024")), temperature: 0.15 }
         http = Net::HTTP.new(uri.host, uri.port)
         http.open_timeout = 5
         http.read_timeout = Integer(ENV.fetch("FAITH_BUILD_READ_TIMEOUT", "900"))
@@ -3924,7 +3980,8 @@ server.mount_proc "/api/build-chat" do |req, res|
         parts.join.strip
       end
 
-      emit.call({ type: "status", phase: "connecting", message: "The coding server on :8090 is ready. Sending the request now…" })
+      edit_stage = "connecting"
+      emit.call({ type: "status", phase: "connecting", message: "The coding server on :8090 is ready. Sending the build request now…" })
       answer = request_build_answer.call(history)
       raise "The coding model returned no text. Confirm the coding GGUF server is running on port 8090." if answer.empty?
 
@@ -3944,6 +4001,35 @@ server.mount_proc "/api/build-chat" do |req, res|
         end
       end
 
+      # Build mode often returns a complete HTML page inside a fenced code block.
+      # Save it as a real artifact before finalizing the reply so it is downloadable,
+      # copyable, previewable, and listed in the Files tab rather than text-only.
+      build_attachment = nil
+      html_match = answer.match(/```(?:html?|HTML?)\s*\n([\s\S]*?)```/)
+      html_source = html_match && html_match[1].to_s.strip
+      unless html_source && html_source.match?(/<(?:!doctype\s+html|html|head|body)\b/i)
+        if answer.match?(/<!doctype\s+html|<html\b/i)
+          candidate = answer[/<!doctype\s+html[\s\S]*|<html\b[\s\S]*/i]
+          html_source = candidate.to_s.sub(/```\s*\z/, "").strip if candidate
+        end
+      end
+      if html_source && html_source.match?(/<(?:!doctype\s+html|html|head|body)\b/i)
+        html_source = html_source.sub(/\A```[^\n]*\n/, "").sub(/```\s*\z/, "").strip
+        if !html_source.empty? && html_source.bytesize <= MAX_UPLOAD_BYTES
+          original_name = (answer.match(/(?:filename|file name|save as)\s*[:=]?\s*[`\"']?([A-Za-z0-9_. -]+\.html?)/i)&.[](1) || "faith_build_#{Time.now.strftime('%Y%m%d_%H%M%S')}.html").strip
+          original_name = File.basename(original_name).gsub(/[^A-Za-z0-9_.-]/, "_")
+          original_name = "index.html" unless original_name.match?(/\A[A-Za-z0-9_.-]+\.html?\z/i)
+          stored_name = "#{SecureRandom.hex(8)}-#{original_name}"
+          stored_path = File.join(UPLOAD_DIR, stored_name)
+          File.write(stored_path, html_source, mode: "w:utf-8")
+          faith_write_code_file_metadata(stored_path, original_name)
+          build_attachment = { name: original_name, url: "/uploads/#{URI.encode_www_form_component(stored_name)}", type: "text/html", size: File.size(stored_path), stored_name: stored_name }
+          # Keep the actual source out of the visible prose block; the dedicated
+          # artifact controls provide the full HTML source when the user asks to copy it.
+          answer = answer.sub(html_match[0], "[HTML file saved: #{original_name}]") if html_match
+        end
+      end
+
       still_current = mutex.synchronize do
         if build_generation == request_generation
           build_messages << { role: "assistant", content: answer }
@@ -3954,8 +4040,8 @@ server.mount_proc "/api/build-chat" do |req, res|
         end
       end
       next unless still_current
-      emit.call({ type: "text_complete", answer: answer, expression: "build", session_mode: "build" })
-      emit.call({ type: "done", answer: answer, expression: "build", session_mode: "build", images: [], image_mode: "none" })
+      emit.call({ type: "text_complete", answer: answer, expression: "build", session_mode: "build", attachment: build_attachment })
+      emit.call({ type: "done", answer: answer, expression: "build", session_mode: "build", images: [], image_mode: "none", attachment: build_attachment })
     rescue FaithBuildRequestSuperseded
       # Expected cancellation: Clear or a newer request invalidated this stream.
       # Closing the upstream HTTP body also asks llama-server to stop generating.
@@ -3987,10 +4073,11 @@ server.mount_proc "/api/coder-edit" do |req, res|
 
   payload = JSON.parse(req.body.to_s) rescue {}
   question = payload["question"].to_s.strip
+  faith_coder_log("edit_request_received", "request_bytes=#{req.body.to_s.bytesize} question_chars=#{question.length} automatic_fix_flag=#{payload["automatic_fix"] == true}")
   automatic_fix = payload["automatic_fix"] == true || question.match?(/\b(?:automatic\s+fix|auto(?:matic)?ally\s+fix|search\s+(?:the\s+)?web\s+for\s+(?:a\s+)?fix|find\s+(?:a\s+)?fix\s+online)\b/i)
   review_only = !automatic_fix && question.match?(/\b(?:review|check|inspect|analy[sz]e)\b/i) &&
     !question.match?(/\b(?:change|modify|edit|update|fix|repair|correct|patch|refactor|add|remove|replace|implement)\b/i)
-  state = mutex.synchronize { { filename: latest_code_filename.to_s, code: latest_code_text.to_s, diagnosis: latest_troubleshooting_response.to_s } }
+  state = mutex.synchronize { { filename: latest_code_filename.to_s, code: latest_code_text.to_s, stored_name: latest_code_stored_name.to_s, diagnosis: latest_troubleshooting_response.to_s } }
   if state[:filename].empty? || state[:code].strip.empty?
     json_response.call(res, 400, { error: "Upload an existing source-code file first, then describe the changes you want." })
     next
@@ -4008,44 +4095,29 @@ server.mount_proc "/api/coder-edit" do |req, res|
   res["X-Faith-Server-Version"] = FAITH_SERVER_VERSION
   res.chunked = true
   res.body = proc do |out|
+    edit_started_at = Process.clock_gettime(Process::CLOCK_MONOTONIC)
+    edit_stage = "starting"
+    log_edit_stage = lambda do |stage, detail = ""|
+      elapsed = Process.clock_gettime(Process::CLOCK_MONOTONIC) - edit_started_at
+      log_line = format("stage=%s elapsed=%.1fs%s", stage, elapsed, detail.to_s.empty? ? "" : " #{detail}")
+      warn "[Faith Coder Edit] #{log_line}"
+      faith_coder_log("automatic_fix", "#{log_line} mode=#{automatic_fix ? 'automatic_fix' : (review_only ? 'review' : 'manual_edit')} filename=#{state[:filename].to_s.inspect}")
+    end
     emit = lambda { |event| out.write("data: #{JSON.generate(event)}\n\n") }
     begin
-      research_context = ""
-      if automatic_fix
-        emit.call({ type: "status", phase: "searching", message: "Searching for relevant fixes online…" })
-        # Keep this stage strictly to a bounded web search. Do NOT call
-        # search_troubleshooting_web here: that helper also calls Faith's normal
-        # chat model to synthesize a diagnosis, which can stall the edit relay
-        # before the coding model on :8090 is ever reached.
-        begin
-          request_terms = question.gsub(/\s+/, " ")[0, 260]
-          code_clues = state[:code].to_s.lines.select { |line| line.match?(/\b(?:error|exception|traceback|undefined|cannot find symbol|not found|failed|failure|TODO|FIXME|HACK)\b/i) }.first(5).join(" ").gsub(/\s+/, " ")
-          diagnosis_clues = state[:diagnosis].to_s.gsub(/\s+/, " ")[0, 700]
-          terms = [request_terms, state[:filename], code_clues, diagnosis_clues].reject(&:empty?).join(" ")[0, 900]
-          search_connection = Faraday.new(url: "https://html.duckduckgo.com") do |f|
-            f.headers["User-Agent"] = "Mozilla/5.0 (compatible; FaithTroubleshooter/1.0)"
-            f.options.timeout = 8
-            f.options.open_timeout = 4
-          end
-          search_response = search_connection.get("/html/", { "q" => "#{terms} programming error fix Stack Overflow GitHub" })
-          if search_response.success?
-            results = []
-            search_response.body.to_s.scan(/<a[^>]+class="result__a"[^>]+href="([^"]+)"[^>]*>(.*?)<\/a>/im).first(6).each do |href, title|
-              url = href.to_s.gsub(/&amp;/, "&")
-              label = title.to_s.gsub(/<[^>]+>/, "").gsub(/&amp;/, "&").gsub(/&quot;/, '"').strip
-              results << "- #{label[0, 180]}: #{url[0, 500]}" if url.start_with?("http") && !label.empty?
-            end
-            research_context = results.join("\n")
-          end
-          research_context = "No useful web results were returned; inspect the source directly and make only a safe, well-supported repair." if research_context.empty?
-        rescue StandardError => research_error
-          warn "Faith automatic-fix research failed: #{research_error.class}: #{research_error.message}"
-          research_context = "Web research was unavailable; inspect the supplied source directly and apply a safe, well-supported repair."
-        end
+      # The diagnosis stage has already done the investigation. Repeating a
+      # synchronous web search here delayed the actual code edit and could leave
+      # the user waiting before the coding model was even contacted. Reuse the
+      # working diagnosis as the repair lead and let the coder verify it against
+      # the full source. Keep a short research-context field for prompt stability.
+      research_context = if automatic_fix
+        "No second web search was run. Use the completed troubleshooting diagnosis as the lead, verify it against the source, and make only source-supported repairs."
+      else
+        ""
       end
 
       ensure_faith_coder_server!(on_status: lambda { |message| emit.call({ type: "status", phase: "waiting-coder", message: message }) })
-      emit.call({ type: "status", phase: "connecting", message: "The coding server on :8090 is ready. Sending the request now…" })
+      emit.call({ type: "status", phase: "connecting", message: "The coding server on :8090 is ready. Sending the troubleshooting request now…" })
       if review_only
         action = <<~ACTION
           Review the supplied source file without modifying it. Return a concise,
@@ -4105,55 +4177,144 @@ server.mount_proc "/api/coder-edit" do |req, res|
         #{state[:code][0, 120000]}
       PROMPT
       uri = URI.parse(ENV.fetch("FAITH_CODER_AI_URL", "http://127.0.0.1:8090/v1/chat/completions"))
-      model_id = ENV.fetch("FAITH_CODER_AI_MODEL", "coding-local")
+      model_id, model_id_source = faith_coder_resolve_model(uri)
+      # Hard-cap Automatic Fix output at 1024 even if an inherited environment
+      # variable requests a larger budget. This is not the GGUF context.
+      configured_edit_tokens = begin
+        Integer(ENV.fetch("FAITH_TROUBLESHOOT_EDIT_MAX_TOKENS", "1024"))
+      rescue ArgumentError, TypeError
+        1024
+      end
+      edit_max_tokens = [[configured_edit_tokens, 1024].min, 1].max
+      # Do not prepend Faith's entire general-chat system prompt to a code-edit
+      # request. A compact task-specific system message reduces input processing
+      # and makes more of the 4096-token context available for source and output.
+      coder_system_prompt = "You are Faith's local code editor. Preserve existing behavior and unrelated code. For edits, return the complete revised source file only, without Markdown fences or commentary. Never use placeholders or omit sections. Do not claim tests were run."
       body = { model: model_id, messages: [
-        { role: "system", content: SYSTEM_PROMPT + "\nReturn complete source code only. You are editing an existing file, not creating a replacement project from scratch." },
+        { role: "system", content: coder_system_prompt },
         { role: "user", content: prompt }
-      ], stream: true, max_tokens: Integer(ENV.fetch("FAITH_TROUBLESHOOT_EDIT_MAX_TOKENS", "8192")), temperature: 0.15 }
+      ], stream: true, max_tokens: edit_max_tokens, temperature: 0.15 }
       http = Net::HTTP.new(uri.host, uri.port)
-      http.open_timeout = 5
-      http.read_timeout = Integer(ENV.fetch("FAITH_CODER_READ_TIMEOUT", "900"))
-      http.write_timeout = 30 if http.respond_to?(:write_timeout=)
+      # Do not impose connection, idle-read, or write timeouts on model requests.
+      # The caller explicitly prefers waiting for the local GGUF rather than
+      # aborting a slow diagnosis or code generation request.
+      http.open_timeout = nil
+      http.read_timeout = nil
+      http.write_timeout = nil if http.respond_to?(:write_timeout=)
       request = Net::HTTP::Post.new(uri.request_uri)
       request["Content-Type"] = "application/json"
       request["Accept"] = "text/event-stream"
+      request["Connection"] = "close"
       request.body = JSON.generate(body)
 
       buffer = +""
       parts = []
       got_token = false
+      edit_stage = "request-ready"
+      log_edit_stage.call("request_ready", "model_source=#{model_id_source} model=#{model_id.inspect} url=#{uri} request_bytes=#{request.body.bytesize} prompt_chars=#{prompt.length} source_chars=#{state[:code].to_s.length} system_prompt_chars=#{coder_system_prompt.length} configured_max_tokens=#{configured_edit_tokens} effective_max_tokens=#{body[:max_tokens]} hard_cap=1024 open_timeout=disabled read_timeout=disabled write_timeout=disabled")
+      edit_stage = "waiting-http-headers"
+      log_edit_stage.call("request_dispatched", "awaiting_http_headers=true")
+      emit.call({ type: "status", phase: "generating", message: "The coding model received the request. Waiting for the first generated code…" })
       http.request(request) do |response|
+        edit_stage = "reading-stream"
+        log_edit_stage.call("http_headers_received", "status=#{response.code} content_type=#{response['content-type'].to_s.inspect}")
         unless response.is_a?(Net::HTTPSuccess)
           detail = response.body.to_s
           raise "Coding model returned HTTP #{response.code}: #{detail[0, 500]}"
         end
+        edit_stage = "waiting-first-token"
+        first_body_chunk = false
+        raw_response_body = +""
+        extract_content = lambda do |value|
+          case value
+          when String
+            value
+          when Array
+            value.map do |part|
+              if part.is_a?(Hash)
+                (part["text"] || part.dig("text", "value") || "").to_s
+              else
+                part.to_s
+              end
+            end.join
+          when Hash
+            (value["text"] || value["content"] || "").to_s
+          else
+            ""
+          end
+        end
+        process_packet = lambda do |data|
+          next if data.to_s.strip.empty? || data.to_s.strip == "[DONE]"
+          begin
+            packet = JSON.parse(data)
+            choice = packet.dig("choices", 0) || {}
+            delta_obj = choice["delta"] || {}
+            delta = extract_content.call(delta_obj["content"])
+            # Some OpenAI-compatible servers return one complete JSON response
+            # despite stream=true, or put the final text in message.content.
+            delta = extract_content.call(choice.dig("message", "content")) if delta.empty?
+            delta = extract_content.call(choice["text"]) if delta.empty?
+            # Ignore reasoning-only packets: they are not the requested source.
+            next if delta.empty?
+            unless got_token
+              got_token = true
+              edit_stage = "generating"
+              log_edit_stage.call("first_token", "first_delta_chars=#{delta.length}")
+              emit.call({ type: "status", phase: "coding", message: "Code is arriving from Qwen — displaying it as it is received…" })
+            end
+            parts << delta
+            emit.call({ type: "delta", text: delta })
+          rescue JSON::ParserError
+            # A few compatible servers emit a plain-text completion body.
+            # Preserve it rather than silently swallowing every non-JSON line.
+            unless data.to_s.strip.empty? || data.to_s.strip.start_with?("{", "[")
+              got_token = true
+              parts << data.to_s
+              emit.call({ type: "delta", text: data.to_s })
+            end
+          end
+        end
         response.read_body do |chunk|
+          unless first_body_chunk
+            first_body_chunk = true
+            edit_stage = "reading-first-token"
+            log_edit_stage.call("first_body_chunk", "chunk_bytes=#{chunk.to_s.bytesize}")
+          end
+          raw_response_body << chunk.to_s
           buffer << chunk.to_s
           while (newline = buffer.index("\n"))
             line = buffer.slice!(0, newline + 1).strip
             next unless line.start_with?("data:")
-            data = line.sub(/\Adata:\s*/, "")
-            next if data == "[DONE]"
-            begin
-              packet = JSON.parse(data)
-              delta = packet.dig("choices", 0, "delta", "content").to_s
-              delta = packet.dig("choices", 0, "message", "content").to_s if delta.empty?
-              next if delta.empty?
-              unless got_token
-                got_token = true
-                emit.call({ type: "status", phase: "coding", message: "Applying your requested changes…" })
-              end
-              parts << delta
-              emit.call({ type: "delta", text: delta })
-            rescue JSON::ParserError
-              next
+            process_packet.call(line.sub(/\Adata:\s*/, ""))
+          end
+        end
+        # Flush a final SSE data line that did not end in a newline.
+        tail = buffer.to_s.strip
+        process_packet.call(tail.sub(/\Adata:\s*/, "")) if tail.start_with?("data:")
+        # Fallback for servers that ignore stream=true and return a single JSON
+        # response body rather than SSE. Do not leave Faith waiting forever with
+        # a successful HTTP response but no deltas to relay.
+        if !got_token && !raw_response_body.strip.empty?
+          begin
+            packet = JSON.parse(raw_response_body)
+            choice = packet.dig("choices", 0) || {}
+            whole = extract_content.call(choice.dig("message", "content"))
+            whole = extract_content.call(choice["text"]) if whole.empty?
+            unless whole.empty?
+              got_token = true
+              parts << whole
+              emit.call({ type: "status", phase: "coding", message: "Code received from Qwen — displaying the completed response…" })
+              emit.call({ type: "delta", text: whole })
             end
+          rescue JSON::ParserError
+            nil
           end
         end
       end
       raise "The coding model returned no source text. Confirm Qwen's coding server is running on port 8090." unless got_token
 
       revised_code = parts.join
+      log_edit_stage.call("generation_complete", "output_chars=#{revised_code.length}")
       if review_only
         raise "The coding model returned an empty code review." if revised_code.strip.empty?
         emit.call({ type: "done", expression: "troubleshooting", session_mode: "troubleshooting", review_only: true })
@@ -4163,15 +4324,34 @@ server.mount_proc "/api/coder-edit" do |req, res|
       raise "The coding model returned an empty source file." if revised_code.strip.empty?
 
       ext = File.extname(state[:filename])
-      stem = ext.empty? ? state[:filename] : state[:filename][0...-ext.length]
-      suffix = automatic_fix ? "_fixed" : "_updated"
-      output_filename = "#{stem}#{suffix}#{ext}"
-      safe_name = output_filename.gsub(/[^0-9A-Za-z._-]/, "_")
-      stored_name = "#{SecureRandom.hex(8)}-#{safe_name}"
-      stored_path = File.join(UPLOAD_DIR, stored_name)
-      File.binwrite(stored_path, revised_code)
+      if !state[:stored_name].to_s.empty?
+        # Files opened from the Files tab are edited in place so the user can
+        # continue developing the same artifact rather than accumulating copies.
+        stored_name = File.basename(state[:stored_name].to_s)
+        stored_path = File.join(UPLOAD_DIR, stored_name)
+        unless stored_name == state[:stored_name].to_s && File.file?(stored_path) && FAITH_CODE_FILE_EXTENSIONS.include?(File.extname(stored_name.sub(/\A[0-9a-f]{16}-/i, "")).downcase)
+          raise "The original coding file is no longer available to update."
+        end
+        output_filename = File.basename(state[:filename].to_s)
+      else
+        stem = ext.empty? ? state[:filename] : state[:filename][0...-ext.length]
+        suffix = automatic_fix ? "_fixed" : "_updated"
+        output_filename = "#{stem}#{suffix}#{ext}"
+        safe_name = output_filename.gsub(/[^0-9A-Za-z._-]/, "_")
+        stored_name = "#{SecureRandom.hex(8)}-#{safe_name}"
+        stored_path = File.join(UPLOAD_DIR, stored_name)
+      end
+      temp_path = stored_path + ".edit-tmp"
+      begin
+        File.write(temp_path, revised_code, mode: "w:utf-8")
+        FileUtils.mv(temp_path, stored_path, force: true)
+      ensure
+        FileUtils.rm_f(temp_path)
+      end
+      faith_write_code_file_metadata(stored_path, output_filename)
       mutex.synchronize do
         latest_code_filename = output_filename
+        latest_code_stored_name = stored_name
         latest_code_text = revised_code
         latest_code_context = "Uploaded file: #{output_filename}\n#{revised_code}"[0, 16000]
         latest_troubleshooting_response = nil
@@ -4179,10 +4359,14 @@ server.mount_proc "/api/coder-edit" do |req, res|
         troubleshooting_diagnosis_ready = false
         coding_active = false
       end
+      artifact_type = %w[.html .htm].include?(ext.downcase) ? "text/html" : "text/plain"
       emit.call({ type: "done", expression: "coding", session_mode: "troubleshooting",
-                  attachment: { name: output_filename, url: "/uploads/#{stored_name}", type: "text/plain", size: revised_code.bytesize } })
+                  attachment: { name: output_filename, url: "/uploads/#{URI.encode_www_form_component(stored_name)}", type: artifact_type, size: revised_code.bytesize, stored_name: stored_name } })
+      log_edit_stage.call("complete", "output_bytes=#{revised_code.bytesize}")
     rescue StandardError => error
+      log_edit_stage.call("error", "last_stage=#{edit_stage} error=#{error.class}: #{error.message}")
       warn "[Faith Coder Edit] #{error.class}: #{error.message}"
+      faith_coder_log("edit_error", "stage=#{edit_stage} error_class=#{error.class} timeout=#{error.is_a?(Timeout::Error) || error.class.name.to_s.include?('Timeout')} message=#{error.message.to_s.gsub(/[\r\n]+/, ' ')[0, 1000].inspect}")
       emit.call({ type: "error", error: "Faith could not finish editing the file: #{error.message}" })
     end
   end
@@ -4195,6 +4379,7 @@ server.mount_proc "/api/coder-troubleshoot" do |req, res|
   end
   payload = JSON.parse(req.body.to_s) rescue {}
   question = payload["question"].to_s.strip
+  faith_coder_log("diagnosis_request_received", "request_bytes=#{req.body.to_s.bytesize} question_chars=#{question.length}")
   code_text, filename = mutex.synchronize { [latest_code_text.to_s, latest_code_filename.to_s] }
   if code_text.strip.empty?
     json_response.call(res, 400, { error: "Upload a source-code file before starting Troubleshooting." })
@@ -4212,36 +4397,55 @@ server.mount_proc "/api/coder-troubleshoot" do |req, res|
       emit.call({ type: "status", phase: "file-confirmed", filename: filename, source_chars: code_text.length,
                   message: "Faith received #{filename} (#{code_text.length} characters). Sending the source and your request to Qwen on :8090…" })
       ensure_faith_coder_server!(on_status: lambda { |message| emit.call({ type: "status", phase: "waiting-coder", message: message }) })
-      emit.call({ type: "status", phase: "connecting", message: "The coding server on :8090 is ready. Sending the request now…" })
+      emit.call({ type: "status", phase: "connecting", message: "The coding server on :8090 is ready. Sending the troubleshooting request now…" })
       uri = URI.parse(ENV.fetch("FAITH_CODER_AI_URL", "http://127.0.0.1:8090/v1/chat/completions"))
-      model_id = ENV.fetch("FAITH_CODER_AI_MODEL", "coding-local")
+      model_id, model_id_source = faith_coder_resolve_model(uri)
       prompt = <<~PROMPT
-        You are Faith's code troubleshooting specialist. Analyze the actual source file and the user's request. Explain the concrete issue and practical fix. If the user asks to fix/debug code, provide a useful diagnosis first; do not fabricate test results. Keep the response focused and readable.
+        You are Faith's code troubleshooting specialist. Analyze the supplied source excerpt and the user's request. Identify the most likely concrete issue and practical next step. Keep the response concise (roughly 3-6 bullets); do not rewrite the file or fabricate test results. The Automatic Fix step can inspect the complete source separately.
 
         FILE: #{filename}
         USER REQUEST: #{question.empty? ? "Please troubleshoot this source file." : question}
 
-        SOURCE CODE (the exact uploaded file content received by Faith):
-        #{code_text[0, 120000]}
+        SOURCE CODE EXCERPT (the full uploaded source remains available to the later edit step):
+        #{code_text[0, 12000]}
+
+        #{code_text.length > 12000 ? "NOTE: This is a short excerpt to keep diagnosis responsive. Do not assume omitted sections are absent; the Automatic Fix step receives a much larger source range." : ""}
       PROMPT
-      body = { model: model_id, messages: [{ role: "user", content: prompt }], stream: true, max_tokens: 2048, temperature: 0.2 }
+      body = { model: model_id, messages: [{ role: "user", content: prompt }], stream: true, max_tokens: Integer(ENV.fetch("FAITH_TROUBLESHOOT_DIAGNOSIS_MAX_TOKENS", "512")), temperature: 0.2 }
       http = Net::HTTP.new(uri.host, uri.port)
-      http.open_timeout = 5
-      http.read_timeout = 600
+      # Disable all HTTP timeouts for the local coding model request. A slow
+      # diagnosis must not be aborted by a fixed connect/read/write deadline.
+      http.open_timeout = nil
+      http.read_timeout = nil
+      http.write_timeout = nil if http.respond_to?(:write_timeout=)
       request = Net::HTTP::Post.new(uri.request_uri)
       request["Content-Type"] = "application/json"
       request["Accept"] = "text/event-stream"
+      request["Connection"] = "close"
       request.body = JSON.generate(body)
+      diagnosis_started = Process.clock_gettime(Process::CLOCK_MONOTONIC)
+      faith_coder_log("diagnosis_request_ready", "model_source=#{model_id_source} model=#{model_id.inspect} url=#{uri} request_bytes=#{request.body.bytesize} prompt_chars=#{prompt.length} source_chars=#{code_text.length} max_tokens=#{body[:max_tokens]} open_timeout=disabled read_timeout=disabled write_timeout=disabled")
+      faith_coder_log("diagnosis_request_dispatched", "model=#{model_id.inspect} url=#{uri} request_bytes=#{request.body.bytesize} prompt_chars=#{prompt.length} source_chars=#{code_text.length} max_tokens=#{body[:max_tokens]} timeouts=disabled")
+      warn "[Faith Coder Troubleshooting] request_dispatched=true model=#{model_id.inspect} url=#{uri} request_bytes=#{request.body.bytesize} prompt_chars=#{prompt.length} source_chars=#{code_text.length} max_tokens=#{body[:max_tokens]} timeouts=disabled"
       emit.call({ type: "status", phase: "processing", message: "Processing source with the coding GGUF..." })
       buffer = +""
       answer_parts = []
       got_token = false
       http.request(request) do |response|
+        headers_elapsed = Process.clock_gettime(Process::CLOCK_MONOTONIC) - diagnosis_started
+        faith_coder_log("diagnosis_http_headers", "elapsed=%.3fs status=#{response.code} content_type=#{response['content-type'].to_s.inspect}" % headers_elapsed)
+        warn "[Faith Coder Troubleshooting] http_response elapsed=%.3fs status=#{response.code} content_type=#{response['content-type'].to_s.inspect}" % headers_elapsed
         unless response.is_a?(Net::HTTPSuccess)
           detail = response.body.to_s
           raise "Coding model returned HTTP #{response.code}: #{detail[0, 500]}"
         end
+        first_body_chunk = false
         response.read_body do |chunk|
+          unless first_body_chunk
+            first_body_chunk = true
+            elapsed = Process.clock_gettime(Process::CLOCK_MONOTONIC) - diagnosis_started
+            faith_coder_log("diagnosis_first_body_chunk", "elapsed=%.3fs chunk_bytes=#{chunk.to_s.bytesize}" % elapsed)
+          end
           buffer << chunk
           while (idx = buffer.index("\n"))
             line = buffer.slice!(0, idx + 1).strip
@@ -4255,6 +4459,8 @@ server.mount_proc "/api/coder-troubleshoot" do |req, res|
               next if delta.empty?
               unless got_token
                 got_token = true
+                elapsed = Process.clock_gettime(Process::CLOCK_MONOTONIC) - diagnosis_started
+                faith_coder_log("diagnosis_first_token", "elapsed=%.3fs first_delta_chars=#{delta.length}" % elapsed)
                 emit.call({ type: "status", phase: "coding", message: "Qwen on :8090 received the source and is returning its troubleshooting reply…" })
               end
               answer_parts << delta
@@ -4268,6 +4474,9 @@ server.mount_proc "/api/coder-troubleshoot" do |req, res|
       raise "The coding model returned no text. Check that the GGUF server is running on port 8090." unless got_token
       diagnosis = answer_parts.join.strip
       raise "Qwen on :8090 returned an empty troubleshooting reply." if diagnosis.empty?
+      warn "[Faith Coder Troubleshooting] generation_complete output_chars=#{diagnosis.length} max_tokens=#{body[:max_tokens]}"
+      diagnosis_elapsed = Process.clock_gettime(Process::CLOCK_MONOTONIC) - diagnosis_started
+      faith_coder_log("diagnosis_complete", "elapsed=%.3fs output_chars=#{diagnosis.length} max_tokens=#{body[:max_tokens]}" % diagnosis_elapsed)
       mutex.synchronize do
         latest_troubleshooting_response = diagnosis
         troubleshooting_active = true
@@ -4276,7 +4485,8 @@ server.mount_proc "/api/coder-troubleshoot" do |req, res|
       end
       emit.call({ type: "done", answer: diagnosis, filename: filename, expression: "troubleshooting", session_mode: "troubleshooting" })
     rescue StandardError => error
-      warn "[Faith Coder Troubleshooting] #{error.class}: #{error.message}"
+      warn "[Faith Coder Troubleshooting] failed stage=diagnosis #{error.class}: #{error.message}"
+      faith_coder_log("diagnosis_error", "stage=diagnosis error_class=#{error.class} timeout=#{error.is_a?(Timeout::Error) || error.class.name.to_s.include?('Timeout')} message=#{error.message.to_s.gsub(/[\r\n]+/, ' ')[0, 1000].inspect}")
       emit.call({ type: "error", error: error.message })
     end
   end
@@ -4377,6 +4587,132 @@ faith_gallery_set_favorite = lambda do |payload|
     break if found
   end
   found ? [200, { ok: true, entry: found }] : [404, { error: "Gallery image not found for id: #{id}" }]
+end
+
+# Coding artifact sidecar metadata. The actual source file remains the primary artifact;
+# the JSON sidecar is optional metadata and must never be required for deletion.
+def faith_write_code_file_metadata(stored_path, original_filename)
+  stat = File.stat(stored_path)
+  meta = {
+    "kind" => "faith_code_file",
+    "filename" => File.basename(original_filename.to_s),
+    "stored_name" => File.basename(stored_path),
+    "size" => stat.size,
+    "updated_at" => (stat.mtime.to_f * 1000).to_i
+  }
+  File.write(stored_path + ".json", JSON.pretty_generate(meta), mode: "w:utf-8")
+rescue StandardError => error
+  # Metadata failure must not make a successfully written code artifact unusable.
+  warn "[Faith Code Files] Could not write metadata for #{File.basename(stored_path)}: #{error.class}: #{error.message}"
+  false
+end
+
+# Coding artifact library: fixed/built source files are already stored in uploads.
+FAITH_CODE_FILE_EXTENSIONS = %w[.html .htm .css .js .mjs .cjs .jsx .ts .tsx .py .php .java .rb .c .h .cc .cpp .hpp .cs .go .rs .kt .kts .swift .sql .sh .bat .ps1 .json .xml .yaml .yml .toml .md .txt .svg .vue .svelte].freeze
+server.mount_proc "/api/code-files" do |req, res|
+  if req.request_method == "GET"
+    files = Dir.children(UPLOAD_DIR).filter_map do |stored_name|
+      path = File.join(UPLOAD_DIR, stored_name)
+      next unless File.file?(path)
+      # Sidecars are named <stored source name>.json. Hide them from the coding
+      # file list while still allowing real uploaded .json source files.
+      if stored_name.downcase.end_with?(".json")
+        possible_source = File.join(UPLOAD_DIR, stored_name.sub(/\.json\z/i, ""))
+        next if File.file?(possible_source)
+      end
+      original = stored_name.sub(/\A[0-9a-f]{16}-/i, "")
+      next unless FAITH_CODE_FILE_EXTENSIONS.include?(File.extname(original).downcase)
+      stat = File.stat(path)
+      meta_path = path + ".json"
+      meta = File.file?(meta_path) ? (JSON.parse(File.read(meta_path, encoding: "UTF-8")) rescue {}) : {}
+      # Metadata is advisory: filenames and sizes always fall back to the real file.
+      display_name = meta["filename"].to_s
+      display_name = original if display_name.empty?
+      { name: display_name, stored_name: stored_name, url: "/uploads/#{URI.encode_www_form_component(stored_name)}", size: stat.size, updated_at: (stat.mtime.to_f * 1000).to_i }
+    rescue StandardError
+      nil
+    end
+    files.sort_by! { |item| -item[:updated_at] }
+    json_response.call(res, 200, { files: files, count: files.length, bytes: files.sum { |item| item[:size] } })
+  elsif req.request_method == "PUT" || req.request_method == "POST" || req.request_method == "DELETE"
+    raw = req.body.to_s
+    begin
+      payload = JSON.parse(raw)
+    rescue JSON::ParserError
+      payload = {}
+    end
+    action = payload["action"].to_s
+    requested_name = payload["stored_name"] || payload["filename"] || payload["id"]
+    stored_name = File.basename(requested_name.to_s)
+    if stored_name.empty? || stored_name != requested_name.to_s || stored_name.include?("..")
+      json_response.call(res, 400, { error: "Invalid coding file name. Send the stored_name returned by GET /api/code-files." })
+    else
+      path = File.join(UPLOAD_DIR, stored_name)
+      original = stored_name.sub(/\A[0-9a-f]{16}-/i, "")
+      valid_source = File.file?(path) && FAITH_CODE_FILE_EXTENSIONS.include?(File.extname(original).downcase)
+      if !valid_source
+        json_response.call(res, 404, { error: "Coding file not found. It may already have been deleted." })
+      elsif req.request_method == "PUT"
+        code = payload["code"]
+        if !code.is_a?(String)
+          json_response.call(res, 400, { error: "The updated source code must be a string." })
+        elsif code.bytesize > 12 * 1024 * 1024
+          json_response.call(res, 413, { error: "This source file exceeds the 12 MB editing limit." })
+        else
+          # Write atomically so a failed edit cannot leave a partially-written source file.
+          temp_path = path + ".edit-tmp"
+          begin
+            File.write(temp_path, code, mode: "w:utf-8")
+            FileUtils.mv(temp_path, path, force: true)
+            meta_path = path + ".json"
+            meta = File.file?(meta_path) ? (JSON.parse(File.read(meta_path, encoding: "UTF-8")) rescue {}) : {}
+            display_name = meta["filename"].to_s
+            display_name = original if display_name.empty?
+            faith_write_code_file_metadata(path, display_name)
+            json_response.call(res, 200, { ok: true, stored_name: stored_name, filename: display_name, size: File.size(path), updated_at: (File.mtime(path).to_f * 1000).to_i })
+          ensure
+            FileUtils.rm_f(temp_path)
+          end
+        end
+      elsif req.request_method == "POST" && action == "delete"
+        # Use POST for deletion so browsers/proxies that reject DELETE requests
+        # can still remove coding artifacts. The requested name is basename-validated above.
+        File.delete(path)
+        FileUtils.rm_f(path + ".json")
+        json_response.call(res, 200, { ok: true, deleted: stored_name, metadata_removed: true })
+      elsif req.request_method == "POST" && action == "activate"
+        source = File.read(path, encoding: "UTF-8")
+        meta_path = path + ".json"
+        meta = File.file?(meta_path) ? (JSON.parse(File.read(meta_path, encoding: "UTF-8")) rescue {}) : {}
+        display_name = meta["filename"].to_s
+        display_name = original if display_name.empty?
+        mutex.synchronize do
+          latest_code_filename = display_name
+          latest_code_stored_name = stored_name
+          latest_code_text = source
+          latest_code_context = source
+          latest_troubleshooting_response = nil
+          troubleshooting_active = true
+          troubleshooting_diagnosis_ready = false
+          coding_active = false
+        end
+        json_response.call(res, 200, { ok: true, filename: display_name, size: source.bytesize, activated: true })
+      elsif req.request_method == "DELETE"
+        # Remove the source and its sidecar if present. Missing sidecars are normal
+        # for files created before metadata tracking and never cause deletion to fail.
+        File.delete(path)
+        FileUtils.rm_f(path + ".json")
+        json_response.call(res, 200, { ok: true, deleted: stored_name, metadata_removed: true })
+      else
+        json_response.call(res, 400, { error: "Unsupported coding-file action." })
+      end
+    end
+  else
+    json_response.call(res, 405, { error: "GET, PUT, POST, or DELETE required." })
+  end
+rescue StandardError => error
+  warn "[Faith Code Files] #{error.class}: #{error.message}"
+  json_response.call(res, 500, { error: "Coding file library error: #{error.message}" })
 end
 
 server.mount_proc "/api/gallery" do |req, res|
@@ -4549,6 +4885,7 @@ server.mount_proc "/api/clear" do |req, res|
     latest_code_context = nil
     latest_code_filename = nil
     latest_code_text = nil
+    latest_code_stored_name = nil
     latest_troubleshooting_response = nil
     troubleshooting_active = false
     troubleshooting_diagnosis_ready = false
