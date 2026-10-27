@@ -60,21 +60,24 @@ Preview of the fire breathing dragon animation:
 
 
 # Coding: Build Mode
-- Faith handles code requests in 2 different forms: Build and Troubleshooting
+- Faith handles code requests in 3 different forms: Build, Troubleshooting, and Direct.
 - Build represents code that the user directly asked Faith to "build" for them from the ground up.
-<img src="https://i.imgur.com/Iy8dYEu.png" alt="Descriptive Text">
+<img src="https://i.imgur.com/s1HQVDx.png" alt="Descriptive Text">
 
-<img src="https://i.imgur.com/sDZgCbW.png" alt="Descriptive Text">
-
-<img src="https://i.imgur.com/gmZaZsQ.png" alt="Descriptive Text">
+<img src="https://i.imgur.com/6ifJnqu.png" alt="Descriptive Text">
 
 
 # Coding: Troubleshooting Mode
 - Troubleshooting represents already existing code that was sent to Faith for analysis and automatic fixing.
 - Code generation works very similarly to images in that retrospect, that they can either be created from the ground up: or re-worked from existing items.
-<img src="https://i.imgur.com/mXS1gI5.png" alt="Descriptive Text">
+- Troubleshooting is a pipeline designed exclusively for bugfixing and automatic troubleshooting, which means that it is not designated for direct file modification like the next section is.
+<img src="https://i.imgur.com/WlrlYnD.png" alt="Descriptive Text">
 
-<img src="https://i.imgur.com/C8gzAsW.png" alt="Descriptive Text">
+<img src="https://i.imgur.com/XSO5UlM.png" alt="Descriptive Text">
+
+# Coding: Direct Mode
+- Direct editing will directly edit the selected file with the desired request, prompted by editing the raw code file and requesting an automatic change.
+<img src="https://i.imgur.com/AJUhhoS.png" alt="Descriptive Text">
 
 
 # Files tab: managing code within Faith
