@@ -55,7 +55,7 @@ WIKIMEDIA_API_URL = "https://commons.wikimedia.org/w/api.php"
 PERCHANCE_IMAGE_EMBED_ORIGIN = "https://image-generation.perchance.org"
 MODEL = "auto"
 PORT = Integer(ENV.fetch("PORT", "4567"))
-FAITH_SERVER_VERSION = "99-tabbridge"
+FAITH_SERVER_VERSION = "100-direct-code-relay"
 # Emotion diagnostics are written beside this server.rb by default. Override with
 # FAITH_EMOTION_DIAGNOSTIC_LOG if you want the log somewhere else.
 FAITH_EMOTION_DIAGNOSTIC_LOG = File.expand_path(
@@ -4065,19 +4065,36 @@ end
 # enters this mode, uploads source plus requested changes, and receives streamed
 # code plus a downloadable completed file. Troubleshooting diagnosis is a separate direct :8090 request.
 # -----------------------------------------------------------------------------
-server.mount_proc "/api/coder-edit" do |req, res|
+coder_edit_handler = proc do |req, res|
   unless req.request_method == "POST"
     json_response.call(res, 405, { error: "POST required." })
     next
   end
 
+  direct_code_request = req.path.to_s.split("?").first == "/api/direct-code-edit"
   payload = JSON.parse(req.body.to_s) rescue {}
   question = payload["question"].to_s.strip
-  faith_coder_log("edit_request_received", "request_bytes=#{req.body.to_s.bytesize} question_chars=#{question.length} automatic_fix_flag=#{payload["automatic_fix"] == true}")
+  faith_coder_log("edit_request_received", "request_bytes=#{req.body.to_s.bytesize} question_chars=#{question.length} direct_code=#{direct_code_request} filename=#{File.basename(payload["filename"].to_s).inspect} source_chars=#{payload["source_code"].to_s.length} stored_name_present=#{!payload["stored_name"].to_s.empty?} automatic_fix_flag=#{payload["automatic_fix"] == true}")
   automatic_fix = payload["automatic_fix"] == true || question.match?(/\b(?:automatic\s+fix|auto(?:matic)?ally\s+fix|search\s+(?:the\s+)?web\s+for\s+(?:a\s+)?fix|find\s+(?:a\s+)?fix\s+online)\b/i)
   review_only = !automatic_fix && question.match?(/\b(?:review|check|inspect|analy[sz]e)\b/i) &&
     !question.match?(/\b(?:change|modify|edit|update|fix|repair|correct|patch|refactor|add|remove|replace|implement)\b/i)
-  state = mutex.synchronize { { filename: latest_code_filename.to_s, code: latest_code_text.to_s, stored_name: latest_code_stored_name.to_s, diagnosis: latest_troubleshooting_response.to_s } }
+  # Direct Files-tab edits carry their source explicitly in the request. They
+  # must not depend on the normal upload/observation pipeline having populated
+  # the global active-source state first.
+  state = if direct_code_request && payload["source_code"].is_a?(String) && !payload["source_code"].empty?
+    direct_filename = File.basename(payload["filename"].to_s.strip)
+    direct_stored_name = File.basename(payload["stored_name"].to_s.strip)
+    raise "The direct code request is missing its source filename." if direct_filename.empty?
+    raise "The direct code request is missing its stored file reference." if direct_stored_name.empty?
+    direct_path = File.join(UPLOAD_DIR, direct_stored_name)
+    unless direct_path == File.join(UPLOAD_DIR, direct_stored_name) && File.file?(direct_path) &&
+           FAITH_CODE_FILE_EXTENSIONS.include?(File.extname(direct_stored_name.sub(/\A[0-9a-f]{16}-/i, "")).downcase)
+      raise "The original Files-tab code file could not be found. Save it again and retry."
+    end
+    { filename: direct_filename, code: payload["source_code"], stored_name: direct_stored_name, diagnosis: "" }
+  else
+    mutex.synchronize { { filename: latest_code_filename.to_s, code: latest_code_text.to_s, stored_name: latest_code_stored_name.to_s, diagnosis: latest_troubleshooting_response.to_s } }
+  end
   if state[:filename].empty? || state[:code].strip.empty?
     json_response.call(res, 400, { error: "Upload an existing source-code file first, then describe the changes you want." })
     next
@@ -4232,46 +4249,69 @@ server.mount_proc "/api/coder-edit" do |req, res|
           when Array
             value.map do |part|
               if part.is_a?(Hash)
-                (part["text"] || part.dig("text", "value") || "").to_s
+                text_value = part["text"]
+                text_value = text_value["value"] if text_value.is_a?(Hash)
+                text_value = part["content"] if text_value.nil?
+                text_value.to_s
               else
                 part.to_s
               end
             end.join
           when Hash
-            (value["text"] || value["content"] || "").to_s
+            text_value = value["text"]
+            text_value = value["value"] if text_value.is_a?(Hash)
+            text_value = value["content"] if text_value.nil?
+            text_value.to_s
           else
             ""
           end
         end
+        extract_packet_text = lambda do |packet|
+          next "" unless packet.is_a?(Hash)
+          choices = packet["choices"]
+          choice = choices.is_a?(Array) ? (choices[0] || {}) : (choices.is_a?(Hash) ? choices : {})
+          delta_obj = choice["delta"]
+          delta_obj = {} unless delta_obj.is_a?(Hash)
+          content = extract_content.call(delta_obj["content"])
+          content = extract_content.call(choice.dig("message", "content")) if content.empty? && choice["message"].is_a?(Hash)
+          content = extract_content.call(choice["text"]) if content.empty?
+          content = extract_content.call(packet["output_text"]) if content.empty?
+          content = extract_content.call(packet.dig("response", "output_text")) if content.empty? && packet["response"].is_a?(Hash)
+          content = extract_content.call(packet["content"]) if content.empty?
+          content
+        end
+        relay_text = lambda do |text, source_kind|
+          next if text.to_s.empty?
+          unless got_token
+            got_token = true
+            edit_stage = "generating"
+            log_edit_stage.call("first_token", "source=#{source_kind} first_delta_chars=#{text.length}")
+            emit.call({ type: "status", phase: "coding", message: "Code is arriving from Qwen — displaying it as it is received…" })
+          end
+          parts << text
+          emit.call({ type: "delta", text: text })
+        end
         process_packet = lambda do |data|
-          next if data.to_s.strip.empty? || data.to_s.strip == "[DONE]"
+          raw = data.to_s.strip
+          next if raw.empty? || raw == "[DONE]" || raw.start_with?(":")
+          raw = raw.sub(/\Adata:\s*/, "") if raw.start_with?("data:")
+          next if raw.empty? || raw == "[DONE]"
           begin
-            packet = JSON.parse(data)
-            choice = packet.dig("choices", 0) || {}
-            delta_obj = choice["delta"] || {}
-            delta = extract_content.call(delta_obj["content"])
-            # Some OpenAI-compatible servers return one complete JSON response
-            # despite stream=true, or put the final text in message.content.
-            delta = extract_content.call(choice.dig("message", "content")) if delta.empty?
-            delta = extract_content.call(choice["text"]) if delta.empty?
-            # Ignore reasoning-only packets: they are not the requested source.
-            next if delta.empty?
-            unless got_token
-              got_token = true
-              edit_stage = "generating"
-              log_edit_stage.call("first_token", "first_delta_chars=#{delta.length}")
-              emit.call({ type: "status", phase: "coding", message: "Code is arriving from Qwen — displaying it as it is received…" })
+            packet = JSON.parse(raw)
+            text_value = extract_packet_text.call(packet)
+            relay_text.call(text_value, "json") unless text_value.empty?
+            # Some local OpenAI-compatible servers wrap one or more completions
+            # in an array, or return a plain text response under a custom key.
+            if text_value.empty? && packet.is_a?(Array)
+              packet.each do |item|
+                nested = extract_packet_text.call(item)
+                relay_text.call(nested, "json-array") unless nested.empty?
+              end
             end
-            parts << delta
-            emit.call({ type: "delta", text: delta })
           rescue JSON::ParserError
-            # A few compatible servers emit a plain-text completion body.
-            # Preserve it rather than silently swallowing every non-JSON line.
-            unless data.to_s.strip.empty? || data.to_s.strip.start_with?("{", "[")
-              got_token = true
-              parts << data.to_s
-              emit.call({ type: "delta", text: data.to_s })
-            end
+            # A raw text completion (not JSON/SSE) is valid output too. Never
+            # silently discard a non-JSON body line from a direct edit request.
+            relay_text.call(raw, "plain-text") unless raw.start_with?("{", "[")
           end
         end
         response.read_body do |chunk|
@@ -4284,32 +4324,30 @@ server.mount_proc "/api/coder-edit" do |req, res|
           buffer << chunk.to_s
           while (newline = buffer.index("\n"))
             line = buffer.slice!(0, newline + 1).strip
-            next unless line.start_with?("data:")
-            process_packet.call(line.sub(/\Adata:\s*/, ""))
+            next if line.empty? || line.start_with?("event:", "id:", "retry:", ":")
+            process_packet.call(line) if line.start_with?("data:") || line.start_with?("{") || line.start_with?("[")
           end
         end
-        # Flush a final SSE data line that did not end in a newline.
+        # Flush the final SSE/NDJSON line even when the server omits its newline.
         tail = buffer.to_s.strip
-        process_packet.call(tail.sub(/\Adata:\s*/, "")) if tail.start_with?("data:")
-        # Fallback for servers that ignore stream=true and return a single JSON
-        # response body rather than SSE. Do not leave Faith waiting forever with
-        # a successful HTTP response but no deltas to relay.
+        process_packet.call(tail) unless tail.empty?
+        # If the server sent a single JSON response without SSE framing, parse
+        # the whole response as a final fallback. This also handles JSON split
+        # over multiple lines, which cannot be parsed line by line.
         if !got_token && !raw_response_body.strip.empty?
           begin
             packet = JSON.parse(raw_response_body)
-            choice = packet.dig("choices", 0) || {}
-            whole = extract_content.call(choice.dig("message", "content"))
-            whole = extract_content.call(choice["text"]) if whole.empty?
-            unless whole.empty?
-              got_token = true
-              parts << whole
-              emit.call({ type: "status", phase: "coding", message: "Code received from Qwen — displaying the completed response…" })
-              emit.call({ type: "delta", text: whole })
+            whole = extract_packet_text.call(packet)
+            if whole.empty? && packet.is_a?(Array)
+              whole = packet.map { |item| extract_packet_text.call(item) }.join
             end
+            relay_text.call(whole, "whole-response-json") unless whole.empty?
           rescue JSON::ParserError
-            nil
+            # Last-resort fallback for a non-SSE plain-text response.
+            relay_text.call(raw_response_body, "whole-response-text") unless raw_response_body.strip.empty?
           end
         end
+        faith_coder_log("response_parse_summary", "mode=#{direct_code_request ? 'direct' : 'troubleshooting'} http_status=#{response.code} content_type=#{response['content-type'].to_s.inspect} body_bytes=#{raw_response_body.bytesize} output_chars=#{parts.join.length} got_text=#{got_token}")
       end
       raise "The coding model returned no source text. Confirm Qwen's coding server is running on port 8090." unless got_token
 
@@ -4317,7 +4355,7 @@ server.mount_proc "/api/coder-edit" do |req, res|
       log_edit_stage.call("generation_complete", "output_chars=#{revised_code.length}")
       if review_only
         raise "The coding model returned an empty code review." if revised_code.strip.empty?
-        emit.call({ type: "done", expression: "troubleshooting", session_mode: "troubleshooting", review_only: true })
+        emit.call({ type: "done", expression: direct_code_request ? "coding" : "troubleshooting", session_mode: direct_code_request ? "coding" : "troubleshooting", review_only: true })
         next
       end
       revised_code = revised_code.sub(/\A\s*```[^\n]*\n/, "").sub(/\n?```\s*\z/, "")
@@ -4355,12 +4393,12 @@ server.mount_proc "/api/coder-edit" do |req, res|
         latest_code_text = revised_code
         latest_code_context = "Uploaded file: #{output_filename}\n#{revised_code}"[0, 16000]
         latest_troubleshooting_response = nil
-        troubleshooting_active = true
+        troubleshooting_active = !direct_code_request
         troubleshooting_diagnosis_ready = false
-        coding_active = false
+        coding_active = direct_code_request
       end
       artifact_type = %w[.html .htm].include?(ext.downcase) ? "text/html" : "text/plain"
-      emit.call({ type: "done", expression: "coding", session_mode: "troubleshooting",
+      emit.call({ type: "done", expression: "coding", session_mode: direct_code_request ? "coding" : "troubleshooting",
                   attachment: { name: output_filename, url: "/uploads/#{URI.encode_www_form_component(stored_name)}", type: artifact_type, size: revised_code.bytesize, stored_name: stored_name } })
       log_edit_stage.call("complete", "output_bytes=#{revised_code.bytesize}")
     rescue StandardError => error
@@ -4371,6 +4409,12 @@ server.mount_proc "/api/coder-edit" do |req, res|
     end
   end
 end
+
+# Dedicated direct-edit endpoint for source files sent from the Files tab or
+# other explicit direct-code handoffs. It shares the same proven streaming
+# implementation as coder-edit, but does not require a troubleshooting diagnosis.
+server.mount_proc "/api/coder-edit", coder_edit_handler
+server.mount_proc "/api/direct-code-edit", coder_edit_handler
 
 server.mount_proc "/api/coder-troubleshoot" do |req, res|
   unless req.request_method == "POST"
@@ -4673,6 +4717,21 @@ server.mount_proc "/api/code-files" do |req, res|
           ensure
             FileUtils.rm_f(temp_path)
           end
+        end
+      elsif req.request_method == "POST" && action == "rename"
+        # Rename the visible filename in metadata while preserving the internal
+        # stored_name and file path. This keeps the single-file identity intact.
+        new_filename = payload["filename"].to_s.strip
+        if new_filename.empty? || new_filename == "." || new_filename == ".." || new_filename.match?(/[\\\/:*?"<>|\x00-\x1f]/)
+          json_response.call(res, 400, { error: "Enter a valid filename without path separators or reserved characters." })
+        elsif File.extname(new_filename).downcase != File.extname(original).downcase
+          json_response.call(res, 400, { error: "Keep the original file extension when renaming this file." })
+        else
+          meta_path = path + ".json"
+          meta = File.file?(meta_path) ? (JSON.parse(File.read(meta_path, encoding: "UTF-8")) rescue {}) : {}
+          meta["filename"] = new_filename
+          File.write(meta_path, JSON.pretty_generate(meta), mode: "w:utf-8")
+          json_response.call(res, 200, { ok: true, stored_name: stored_name, filename: new_filename, size: File.size(path), updated_at: (File.mtime(path).to_f * 1000).to_i })
         end
       elsif req.request_method == "POST" && action == "delete"
         # Use POST for deletion so browsers/proxies that reject DELETE requests
