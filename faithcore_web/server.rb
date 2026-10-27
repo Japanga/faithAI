@@ -55,7 +55,7 @@ WIKIMEDIA_API_URL = "https://commons.wikimedia.org/w/api.php"
 PERCHANCE_IMAGE_EMBED_ORIGIN = "https://image-generation.perchance.org"
 MODEL = "auto"
 PORT = Integer(ENV.fetch("PORT", "4567"))
-FAITH_SERVER_VERSION = "100-direct-code-relay"
+FAITH_SERVER_VERSION = "102-direct-code-source-and-chat-separation"
 # Emotion diagnostics are written beside this server.rb by default. Override with
 # FAITH_EMOTION_DIAGNOSTIC_LOG if you want the log somewhere else.
 FAITH_EMOTION_DIAGNOSTIC_LOG = File.expand_path(
@@ -4170,7 +4170,9 @@ coder_edit_handler = proc do |req, res|
         - For a review-only request, output a concise review report with findings
           and suggested changes, not the source file. For an edit request, output
           the complete final source file only: no preface, Markdown fences, diff,
-          omission markers, or commentary.
+          omission markers, or commentary. Never insert a message to the user,
+          a summary of the changes, or the user's instruction into the source file.
+          The source must remain valid content for its original file format.
         - For edits, preserve the file's language, filename-compatible format,
           imports, public APIs, unrelated features, and existing behavior unless
           the user's requested change requires otherwise.
@@ -4206,11 +4208,17 @@ coder_edit_handler = proc do |req, res|
       # Do not prepend Faith's entire general-chat system prompt to a code-edit
       # request. A compact task-specific system message reduces input processing
       # and makes more of the 4096-token context available for source and output.
-      coder_system_prompt = "You are Faith's local code editor. Preserve existing behavior and unrelated code. For edits, return the complete revised source file only, without Markdown fences or commentary. Never use placeholders or omit sections. Do not claim tests were run."
+      coder_system_prompt = "You are Faith's local code editor. Preserve existing behavior and unrelated code. For edits, return only the complete revised source file, with no user-facing message, explanation, summary, Markdown fences, or commentary embedded in the source. The result must be valid content for the original file format. Never use placeholders or omit sections. Do not claim tests were run."
+      # The direct Files-tab endpoint uses a complete JSON response rather than
+      # SSE streaming. Build and Troubleshooting keep their existing streaming
+      # behavior. Some local OpenAI-compatible servers return a nonstandard SSE
+      # shape for this prompt, which previously caused direct edits to reach the
+      # model but yield no frontend delta events. The common response parser below
+      # extracts choices[0].message.content and relays it as one delta.
       body = { model: model_id, messages: [
         { role: "system", content: coder_system_prompt },
         { role: "user", content: prompt }
-      ], stream: true, max_tokens: edit_max_tokens, temperature: 0.15 }
+      ], stream: !direct_code_request, max_tokens: edit_max_tokens, temperature: 0.15 }
       http = Net::HTTP.new(uri.host, uri.port)
       # Do not impose connection, idle-read, or write timeouts on model requests.
       # The caller explicitly prefers waiting for the local GGUF rather than
@@ -4228,7 +4236,7 @@ coder_edit_handler = proc do |req, res|
       parts = []
       got_token = false
       edit_stage = "request-ready"
-      log_edit_stage.call("request_ready", "model_source=#{model_id_source} model=#{model_id.inspect} url=#{uri} request_bytes=#{request.body.bytesize} prompt_chars=#{prompt.length} source_chars=#{state[:code].to_s.length} system_prompt_chars=#{coder_system_prompt.length} configured_max_tokens=#{configured_edit_tokens} effective_max_tokens=#{body[:max_tokens]} hard_cap=1024 open_timeout=disabled read_timeout=disabled write_timeout=disabled")
+      log_edit_stage.call("request_ready", "mode=#{direct_code_request ? 'direct' : 'troubleshooting'} stream=#{body[:stream]} model_source=#{model_id_source} model=#{model_id.inspect} url=#{uri} request_bytes=#{request.body.bytesize} prompt_chars=#{prompt.length} source_chars=#{state[:code].to_s.length} system_prompt_chars=#{coder_system_prompt.length} configured_max_tokens=#{configured_edit_tokens} effective_max_tokens=#{body[:max_tokens]} hard_cap=1024 open_timeout=disabled read_timeout=disabled write_timeout=disabled")
       edit_stage = "waiting-http-headers"
       log_edit_stage.call("request_dispatched", "awaiting_http_headers=true")
       emit.call({ type: "status", phase: "generating", message: "The coding model received the request. Waiting for the first generated code…" })
@@ -4270,15 +4278,115 @@ coder_edit_handler = proc do |req, res|
           next "" unless packet.is_a?(Hash)
           choices = packet["choices"]
           choice = choices.is_a?(Array) ? (choices[0] || {}) : (choices.is_a?(Hash) ? choices : {})
+          choice = {} unless choice.is_a?(Hash)
           delta_obj = choice["delta"]
           delta_obj = {} unless delta_obj.is_a?(Hash)
+          message_obj = choice["message"]
+          message_obj = {} unless message_obj.is_a?(Hash)
           content = extract_content.call(delta_obj["content"])
-          content = extract_content.call(choice.dig("message", "content")) if content.empty? && choice["message"].is_a?(Hash)
+          content = extract_content.call(message_obj["content"]) if content.empty?
           content = extract_content.call(choice["text"]) if content.empty?
           content = extract_content.call(packet["output_text"]) if content.empty?
           content = extract_content.call(packet.dig("response", "output_text")) if content.empty? && packet["response"].is_a?(Hash)
           content = extract_content.call(packet["content"]) if content.empty?
+          # Some local GGUF servers put the generated answer in a reasoning or
+          # analysis field rather than message.content. Only use these fields
+          # after the normal answer fields have been checked.
+          content = extract_content.call(message_obj["reasoning_content"]) if content.empty?
+          content = extract_content.call(delta_obj["reasoning_content"]) if content.empty?
+          content = extract_content.call(choice["reasoning_content"]) if content.empty?
+          content = extract_content.call(message_obj["reasoning"]) if content.empty?
+          content = extract_content.call(choice["reasoning"]) if content.empty?
+          content = extract_content.call(packet["generated_text"]) if content.empty?
+          # Additional OpenAI-compatible wrappers sometimes return the assistant
+          # payload under answer/result/completion or nest it several levels deep.
+          %w[answer result completion response_text generated_content].each do |key|
+            break unless content.empty?
+            content = extract_content.call(packet[key])
+          end
+          if content.empty? && message_obj.is_a?(Hash)
+            %w[answer result text output].each do |key|
+              break unless content.empty?
+              content = extract_content.call(message_obj[key])
+            end
+          end
+          # Responses-style APIs return output as an array of message/content
+          # items rather than Chat Completions choices.
+          if content.empty? && packet["output"].is_a?(Array)
+            content = packet["output"].map do |item|
+              next "" unless item.is_a?(Hash)
+              direct = extract_content.call(item["text"])
+              if direct.empty? && item["content"].is_a?(Array)
+                direct = item["content"].map do |part|
+                  part.is_a?(Hash) ? extract_content.call(part["text"] || part["content"]) : part.to_s
+                end.join
+              end
+              direct
+            end.join
+          end
           content
+        end
+        extract_direct_response = lambda do |raw_body|
+          # Last-resort extraction for local servers that use a nonstandard JSON
+          # envelope. Prefer known assistant-output keys; only then recurse through
+          # nested objects/arrays. This avoids dropping a valid answer just because
+          # the provider doesn't use choices[0].message.content.
+          recursive_text = lambda do |value, depth = 0|
+            next "" if depth > 8
+            case value
+            when String
+              value
+            when Array
+              value.map { |item| recursive_text.call(item, depth + 1) }.join
+            when Hash
+              preferred = %w[content text output_text generated_text answer completion response_text generated_content reasoning_content]
+              preferred.each do |key|
+                candidate = value[key]
+                next if candidate.nil? || candidate.is_a?(Numeric) || candidate == true || candidate == false
+                extracted = recursive_text.call(candidate, depth + 1)
+                return extracted unless extracted.to_s.empty?
+              end
+              value.each do |key, candidate|
+                next if %w[id object created_at model usage prompt_tokens completion_tokens total_tokens finish_reason index].include?(key.to_s)
+                next if candidate.nil? || candidate.is_a?(Numeric) || candidate == true || candidate == false
+                extracted = recursive_text.call(candidate, depth + 1)
+                return extracted unless extracted.to_s.empty?
+              end
+              ""
+            else
+              ""
+            end
+          end
+          begin
+            packet = JSON.parse(raw_body)
+            if packet.is_a?(Array)
+              text = packet.map { |item| extract_packet_text.call(item) }.join
+              text = recursive_text.call(packet) if text.empty?
+              text
+            else
+              text = extract_packet_text.call(packet)
+              text = recursive_text.call(packet) if text.empty?
+              text
+            end
+          rescue JSON::ParserError
+            # If the local server wraps JSON in SSE despite stream=false, parse
+            # each frame. Also handle NDJSON and a final frame without a newline.
+            extracted_frames = raw_body.to_s.lines.filter_map do |line|
+              stripped = line.strip
+              next if stripped.empty? || stripped.start_with?("event:", "id:", "retry:", ":")
+              data = stripped.sub(/\Adata:\s*/, "")
+              next if data.empty? || data == "[DONE]"
+              begin
+                packet = JSON.parse(data)
+                text = extract_packet_text.call(packet)
+                text = recursive_text.call(packet) if text.empty?
+                text
+              rescue JSON::ParserError
+                data unless data.start_with?("{", "[")
+              end
+            end.join
+            extracted_frames.empty? ? raw_body.to_s : extracted_frames
+          end
         end
         relay_text = lambda do |text, source_kind|
           next if text.to_s.empty?
@@ -4321,38 +4429,85 @@ coder_edit_handler = proc do |req, res|
             log_edit_stage.call("first_body_chunk", "chunk_bytes=#{chunk.to_s.bytesize}")
           end
           raw_response_body << chunk.to_s
-          buffer << chunk.to_s
-          while (newline = buffer.index("\n"))
-            line = buffer.slice!(0, newline + 1).strip
-            next if line.empty? || line.start_with?("event:", "id:", "retry:", ":")
-            process_packet.call(line) if line.start_with?("data:") || line.start_with?("{") || line.start_with?("[")
-          end
-        end
-        # Flush the final SSE/NDJSON line even when the server omits its newline.
-        tail = buffer.to_s.strip
-        process_packet.call(tail) unless tail.empty?
-        # If the server sent a single JSON response without SSE framing, parse
-        # the whole response as a final fallback. This also handles JSON split
-        # over multiple lines, which cannot be parsed line by line.
-        if !got_token && !raw_response_body.strip.empty?
-          begin
-            packet = JSON.parse(raw_response_body)
-            whole = extract_packet_text.call(packet)
-            if whole.empty? && packet.is_a?(Array)
-              whole = packet.map { |item| extract_packet_text.call(item) }.join
+          unless direct_code_request
+            buffer << chunk.to_s
+            while (newline = buffer.index("\n"))
+              line = buffer.slice!(0, newline + 1).strip
+              next if line.empty? || line.start_with?("event:", "id:", "retry:", ":")
+              process_packet.call(line) if line.start_with?("data:") || line.start_with?("{") || line.start_with?("[")
             end
-            relay_text.call(whole, "whole-response-json") unless whole.empty?
-          rescue JSON::ParserError
-            # Last-resort fallback for a non-SSE plain-text response.
-            relay_text.call(raw_response_body, "whole-response-text") unless raw_response_body.strip.empty?
           end
         end
-        faith_coder_log("response_parse_summary", "mode=#{direct_code_request ? 'direct' : 'troubleshooting'} http_status=#{response.code} content_type=#{response['content-type'].to_s.inspect} body_bytes=#{raw_response_body.bytesize} output_chars=#{parts.join.length} got_text=#{got_token}")
+        if direct_code_request
+          # Direct edits deliberately parse the complete HTTP body as one unit.
+          # This avoids mistaking pretty-printed JSON lines for individual model
+          # events and supports local servers that ignore stream=false or wrap
+          # content in a Responses-style/SSE envelope.
+          whole = extract_direct_response.call(raw_response_body)
+          if whole.empty? && !raw_response_body.strip.empty? && !raw_response_body.lstrip.start_with?("{", "[", "data:")
+            whole = raw_response_body
+          end
+          relay_text.call(whole, "direct-complete-response") unless whole.empty?
+        else
+          # Flush the final SSE/NDJSON line even when the server omits its newline.
+          tail = buffer.to_s.strip
+          process_packet.call(tail) unless tail.empty?
+          # Parse a complete JSON body if no incremental content was received.
+          if !got_token && !raw_response_body.strip.empty?
+            begin
+              packet = JSON.parse(raw_response_body)
+              whole = extract_packet_text.call(packet)
+              if whole.empty? && packet.is_a?(Array)
+                whole = packet.map { |item| extract_packet_text.call(item) }.join
+              end
+              relay_text.call(whole, "whole-response-json") unless whole.empty?
+            rescue JSON::ParserError
+              relay_text.call(raw_response_body, "whole-response-text") unless raw_response_body.strip.empty?
+            end
+          end
+        end
+        faith_coder_log("response_parse_summary", "mode=#{direct_code_request ? 'direct' : 'troubleshooting'} http_status=#{response.code} content_type=#{response['content-type'].to_s.inspect} body_bytes=#{raw_response_body.bytesize} body_prefix=#{raw_response_body.to_s[0, 120].gsub(/[\r\n]+/, ' ' ).inspect} output_chars=#{parts.join.length} got_text=#{got_token}")
       end
       raise "The coding model returned no source text. Confirm Qwen's coding server is running on port 8090." unless got_token
 
       revised_code = parts.join
+      direct_display_text = nil
       log_edit_stage.call("generation_complete", "output_chars=#{revised_code.length}")
+      if direct_code_request && !review_only
+        # Direct-code models sometimes put commentary and the requested change
+        # around a fenced source block. Never write that wrapper into the file:
+        # save the actual fenced source, while separately returning a readable
+        # chat message that includes one properly fenced code block.
+        original_answer = revised_code.to_s
+        fenced_blocks = original_answer.to_enum(:scan, /```([^`\n]*)\n([\s\S]*?)```/).map { Regexp.last_match }
+        unless fenced_blocks.empty?
+          preferred = fenced_blocks.max_by { |match| match[2].to_s.length }
+          language = preferred[1].to_s.strip
+          source_only = preferred[2].to_s.sub(/\A\n+/, "").sub(/\n+\z/, "")
+          unless source_only.empty?
+            before = original_answer[0...preferred.begin(0)].to_s.strip
+            after = original_answer[preferred.end(0)..].to_s.strip
+            commentary = [before, after].reject(&:empty?).join("\n\n")
+            ext_language = {
+              ".rb" => "ruby", ".py" => "python", ".js" => "javascript",
+              ".mjs" => "javascript", ".ts" => "typescript", ".html" => "html",
+              ".htm" => "html", ".css" => "css", ".json" => "json",
+              ".java" => "java", ".cs" => "csharp", ".cpp" => "cpp",
+              ".c" => "c", ".sh" => "bash", ".bat" => "bat", ".ps1" => "powershell"
+            }
+            language = ext_language.fetch(File.extname(state[:filename]).downcase, language)
+            revised_code = source_only
+            direct_display_text = [commentary, "```#{language}\n#{source_only}\n```"].reject(&:empty?).join("\n\n")
+            log_edit_stage.call("direct_source_extracted", "source_chars=#{revised_code.length} commentary_chars=#{commentary.length} fenced_blocks=#{fenced_blocks.length}")
+          end
+        else
+          # If the model returns raw source without fences, display it as one
+          # code block and keep it intact rather than guessing at prose boundaries.
+          ext_language = { ".rb" => "ruby", ".py" => "python", ".js" => "javascript", ".html" => "html", ".css" => "css", ".json" => "json", ".java" => "java", ".cs" => "csharp" }
+          lang = ext_language.fetch(File.extname(state[:filename]).downcase, "")
+          direct_display_text = "```#{lang}\n#{original_answer.strip}\n```"
+        end
+      end
       if review_only
         raise "The coding model returned an empty code review." if revised_code.strip.empty?
         emit.call({ type: "done", expression: direct_code_request ? "coding" : "troubleshooting", session_mode: direct_code_request ? "coding" : "troubleshooting", review_only: true })
@@ -4399,6 +4554,7 @@ coder_edit_handler = proc do |req, res|
       end
       artifact_type = %w[.html .htm].include?(ext.downcase) ? "text/html" : "text/plain"
       emit.call({ type: "done", expression: "coding", session_mode: direct_code_request ? "coding" : "troubleshooting",
+                  display_text: direct_display_text,
                   attachment: { name: output_filename, url: "/uploads/#{URI.encode_www_form_component(stored_name)}", type: artifact_type, size: revised_code.bytesize, stored_name: stored_name } })
       log_edit_stage.call("complete", "output_bytes=#{revised_code.bytesize}")
     rescue StandardError => error
