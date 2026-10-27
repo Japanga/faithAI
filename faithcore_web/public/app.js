@@ -4670,6 +4670,17 @@ async function runCoderTroubleshooting(question, options = {}) {
     } else if (event.type === "done") {
       completed = true;
       sessionMode = directCode ? "coding" : "troubleshooting";
+      // The server returns a clean chat presentation separately from the exact
+      // source written to disk. Render that final message explicitly so direct
+      // edits remain visible even if the local model returned its answer all at once.
+      if (directCode && typeof event.display_text === "string" && event.display_text.trim()) {
+        answer = event.display_text;
+        answerHasStarted = true;
+        paint();
+      } else if (directCode && answer.trim()) {
+        // Older server responses still get a final paint on the done event.
+        paint();
+      }
       if (reviewOnly) {
         faithItem.classList.remove("troubleshooting-pending");
         const node = faithItem.querySelector(".message-text");
