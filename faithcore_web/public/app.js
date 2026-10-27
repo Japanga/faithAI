@@ -2498,6 +2498,7 @@ function faithRenderSidebar() {
           faithShowContextMenu(event.clientX, event.clientY, [
             { label: "View image", action: () => { const win = window.open(entry.url, "_blank", "noopener,noreferrer"); if (win) win.opener = null; } },
             { label: "Download image", action: () => { const a = document.createElement("a"); a.href = entry.url; a.download = entry.filename || faithSafeFilename(entry.title); a.click(); } },
+            { label: "Copy prompt", action: () => faithCopyGalleryPrompt(entry) },
             { label: entry.favorite ? "Remove favorite" : "Favorite image ★", action: () => faithSetGalleryFavorite(entry.id, !entry.favorite) },
             { label: "Delete image", danger: true, action: () => { if (confirm(`Permanently delete “${entry.title || "this image"}” from gallery storage and remove its chat message?`)) faithDeleteGalleryImage(entry.id); } }
           ]);
@@ -2506,6 +2507,7 @@ function faithRenderSidebar() {
       } else {
         const missing = document.createElement("div"); missing.className = "faith-gallery-missing"; missing.textContent = "Image preview unavailable after storage limit"; card.appendChild(missing);
         card.addEventListener("contextmenu", (event) => { event.preventDefault(); faithShowContextMenu(event.clientX, event.clientY, [
+          { label: "Copy prompt", action: () => faithCopyGalleryPrompt(entry) },
           { label: entry.favorite ? "Remove favorite" : "Favorite image ★", action: () => faithSetGalleryFavorite(entry.id, !entry.favorite) },
           { label: "Delete image record", danger: true, action: () => { if (confirm(`Permanently delete “${entry.title || "this image"}”?`)) faithDeleteGalleryImage(entry.id); } }
         ]); });
@@ -2564,6 +2566,40 @@ function faithFormatBytes(value) {
   if (bytes < 1024 * 1024 * 1024) return `${(bytes / (1024 * 1024)).toFixed(2)} MB`;
   return `${(bytes / (1024 * 1024 * 1024)).toFixed(2)} GB`;
 }
+async function faithCopyGalleryPrompt(entry) {
+  // The gallery sidecar stores the original image-generation prompt separately
+  // from the generated image's randomized storage filename.
+  const prompt = String(entry && (entry.prompt || entry.paintPrompt || entry.title) || "").trim();
+  if (!prompt) {
+    alert("No saved prompt is available for this image.");
+    return;
+  }
+  try {
+    if (navigator.clipboard && navigator.clipboard.writeText) {
+      await navigator.clipboard.writeText(prompt);
+    } else {
+      const area = document.createElement("textarea");
+      area.value = prompt;
+      area.setAttribute("readonly", "");
+      area.style.cssText = "position:fixed;left:-9999px;top:0;opacity:0";
+      document.body.appendChild(area);
+      area.select();
+      const copied = document.execCommand("copy");
+      area.remove();
+      if (!copied) throw new Error("Clipboard access is unavailable in this browser.");
+    }
+    // Brief unobtrusive confirmation; the prompt itself stays untouched.
+    const notice = document.createElement("div");
+    notice.className = "faith-gallery-copy-notice";
+    notice.textContent = "Prompt copied to clipboard";
+    notice.style.cssText = "position:fixed;right:18px;bottom:18px;z-index:100000;padding:10px 14px;border:1px solid #6f5bb5;border-radius:10px;background:#201a32;color:#fff;box-shadow:0 6px 24px #0005";
+    document.body.appendChild(notice);
+    setTimeout(() => notice.remove(), 1800);
+  } catch (error) {
+    alert(`Could not copy prompt: ${error && error.message ? error.message : error}`);
+  }
+}
+
 async function faithSetGalleryFavorite(id, favorite) {
   const entry = faithWorkspace.gallery.find(g => g.id === id);
   const oldUrl = entry && entry.url ? String(entry.url) : "";
@@ -2883,6 +2919,21 @@ function faithInitSidebar() {
             { label: "Download file", action: () => { const a = document.createElement("a"); a.href = file.url; a.download = file.name; document.body.appendChild(a); a.click(); a.remove(); } }
           ];
           if (/\.html?$/i.test(file.name)) items.splice(1, 0, { label: "Preview HTML", action: () => faithPreviewCodeHtml(file.url, file.name) });
+          items.push({ label: "Rename file", action: async () => {
+            const proposed = prompt("Enter a new name for this file (keep the correct file extension):", file.name);
+            if (proposed === null) return;
+            const newName = proposed.trim();
+            if (!newName) { alert("The filename cannot be empty."); return; }
+            if (/[\\/\\:*?"<>|]/.test(newName) || newName === "." || newName === "..") { alert("Please use a valid filename without path separators or reserved characters."); return; }
+            if (newName.toLowerCase() === file.name.toLowerCase()) return;
+            try {
+              const r = await fetch("/api/code-files", { method:"POST", headers:{"Content-Type":"application/json", "Accept":"application/json"}, body:JSON.stringify({action:"rename", stored_name:file.stored_name, filename:newName}) });
+              const raw = await r.text(); let result = {};
+              try { result = raw ? JSON.parse(raw) : {}; } catch (_) { throw new Error(`Server returned a non-JSON response (HTTP ${r.status}).`); }
+              if (!r.ok) throw new Error(result.error || `Rename failed (HTTP ${r.status})`);
+              await faithRefreshCodeFiles();
+            } catch (error) { alert(`Could not rename file: ${error.message}`); }
+          }});
           items.push({ label: "Delete file", danger: true, action: async () => {
             if (!confirm(`Permanently delete ${file.name}?`)) return;
             try {
@@ -2984,7 +3035,7 @@ function faithInitSidebar() {
     request.style.cssText = "width:100%;box-sizing:border-box;resize:vertical;min-height:54px;max-height:140px;padding:10px;border:1px solid #34445d;border-radius:8px;background:#0a101c;color:#fff;font:14px/1.4 system-ui,sans-serif;";
     const actions = document.createElement("div"); actions.style.cssText = "display:flex;gap:8px;justify-content:flex-end;flex-wrap:wrap;";
     const buttonStyle = "border:0;border-radius:8px;padding:10px 14px;font-weight:600;cursor:pointer;";
-    const save = document.createElement("button"); save.type = "button"; save.textContent = "Save changes"; save.style.cssText = buttonStyle + "background:#34435d;color:#fff;";
+    const save = document.createElement("button"); save.type = "button"; save.textContent = "Save changes to file"; save.style.cssText = buttonStyle + "background:#34435d;color:#fff;";
     const chatButton = document.createElement("button"); chatButton.type = "button"; chatButton.textContent = "Save & chat about changes"; chatButton.style.cssText = buttonStyle + "background:#6336a6;color:#fff;";
     actions.append(save, chatButton); panel.append(header, editorWrap, requestLabel, request, actions); overlay.appendChild(panel);
     let originalCode = "", loaded = false, saving = false;
@@ -3012,13 +3063,6 @@ function faithInitSidebar() {
         // before the troubleshooting upload/session state has been initialized.
         await saveCode();
         status.textContent = "Preparing file attachment…";
-        const sourceResponse = await fetch(file.url, { cache: "no-store" });
-        if (!sourceResponse.ok) throw new Error(`Could not prepare the saved file attachment (HTTP ${sourceResponse.status}).`);
-        const sourceBlob = await sourceResponse.blob();
-        const mimeByExtension = { js:"text/javascript", mjs:"text/javascript", cjs:"text/javascript", ts:"text/typescript", py:"text/x-python", rb:"text/x-ruby", html:"text/html", htm:"text/html", css:"text/css", json:"application/json", xml:"application/xml", svg:"image/svg+xml", md:"text/markdown", sql:"text/plain", java:"text/plain", c:"text/plain", cpp:"text/plain", cs:"text/plain", go:"text/plain", rs:"text/plain", php:"text/plain", sh:"text/plain", ps1:"text/plain" };
-        const ext = (String(file.name).split(".").pop() || "").toLowerCase();
-        const sourceFile = new File([sourceBlob], file.name, { type: sourceBlob.type && sourceBlob.type !== "application/octet-stream" ? sourceBlob.type : (mimeByExtension[ext] || "text/plain"), lastModified: Date.now() });
-
         // Each Edit & Chat action starts a fresh, dedicated conversation. The
         // source is represented as a real attachment in that chat, just like a
         // file selected from the normal composer, and therefore enters the same
@@ -3027,30 +3071,34 @@ function faithInitSidebar() {
         const thread = faithWorkspace.threads.find(item => item.id === faithWorkspace.activeId);
         if (thread) {
           thread.title = `Edit: ${file.name}`;
-          thread.mode = "troubleshooting";
-          thread.behaviorState = "troubleshooting";
-          thread.expression = "troubleshooting";
-          thread.detail = `Working on ${file.name}`;
+          thread.mode = "coding";
+          thread.behaviorState = "coding";
+          thread.expression = "coding";
+          thread.detail = `Editing ${file.name}`;
         }
-        sessionMode = "troubleshooting";
+        sessionMode = "coding";
         troubleshootingDiagnosisReady = false;
-        setExpression("troubleshooting", `Preparing ${file.name} for troubleshooting…`);
+        setExpression("coding", `Preparing ${file.name} for direct code editing…`);
         faithSaveWorkspace();
         showSidebarTab("chats");
         overlay.remove(); selectionStyle.remove();
         await faithRefreshCodeFiles();
-        // Keep the user’s request verbatim. The attachment itself supplies the
-        // filename and source; avoid adding boilerplate that can distract the
-        // coding model from the actual requested changes.
+        // Do not send this source through uploadFileToFaith: that route invokes
+        // the normal file-observation/chat pipeline before deciding what to do.
+        // Call the dedicated code-edit endpoint directly with the exact source,
+        // filename and stored artifact identity. The server starts/checks the
+        // coding BAT and waits for :8090 readiness before submitting the edit.
         const prompt = instructions;
-        // This handoff is a user-initiated operation; if another action left the
-        // global busy flag set, clear it before calling the upload function (which
-        // otherwise intentionally returns early without doing anything).
         setBusy(false);
-        await uploadFileToFaith(sourceFile, prompt, "file");
+        await runCoderTroubleshooting(prompt, {
+          directCode: true,
+          sourceCode: editor.value,
+          filename: file.name,
+          storedName: file.stored_name
+        });
       } catch (error) {
         status.textContent = "Could not start chat";
-        alert(`Could not start a troubleshooting conversation for ${file.name}: ${error.message}`);
+        alert(`Could not start a direct code-editing conversation for ${file.name}: ${error.message}`);
       }
     });
     document.body.appendChild(overlay);
@@ -4238,8 +4286,13 @@ async function uploadFileToFaith(file, suppliedQuestion = null, uploadKind = nul
       // Direct attached-file edits are allowed in a fresh conversation. The
       // upload endpoint has already stored this file as the active coder source.
       // Use the existing edit pipeline without inventing a diagnosis step.
-      sessionMode = "troubleshooting";
-      await runCoderTroubleshooting(question, { automaticFix: false });
+      const fromDirectCodeHandoff = sessionMode === "coding";
+      if (fromDirectCodeHandoff) {
+        await runCoderTroubleshooting(question, { automaticFix: false, directCode: true });
+      } else {
+        sessionMode = "troubleshooting";
+        await runCoderTroubleshooting(question, { automaticFix: false });
+      }
       return;
     }
 
@@ -4514,16 +4567,21 @@ async function runCoderTroubleshooting(question, options = {}) {
   const automaticFix = !!options.automaticFix || isAutomaticFixRequest(question);
   const reviewOnly = !automaticFix && /\b(?:review|check|inspect|analy[sz]e)\b/i.test(question) &&
     !/\b(?:change|modify|edit|update|fix|repair|correct|patch|refactor|add|remove|replace|implement)\b/i.test(question);
-  sessionMode = "troubleshooting";
-  setExpression("troubleshooting", automaticFix ? "Using the completed diagnosis and applying the repair…" : "Getting your requested code changes from Qwen on :8090…");
+  const directCode = !!options.directCode;
+  sessionMode = directCode ? "coding" : "troubleshooting";
+  setExpression(directCode ? "coding" : "troubleshooting", directCode
+    ? "Sending your file and instructions directly to the code editor…"
+    : (automaticFix ? "Using the completed diagnosis and applying the repair…" : "Getting your requested code changes from Qwen on :8090…"));
 
   let faithItem = appendMessage(
     "Faith",
-    automaticFix
+    directCode
+      ? `I’m sending ${question ? "your requested changes" : "the file"} and the attached source directly to the code editor on :8090. No diagnosis step is needed.`
+      : (automaticFix
       ? "The diagnosis is complete. I’m sending the source and diagnosis directly to Qwen on :8090 so it can apply and return the repaired file."
       : (reviewOnly
         ? "Getting response from Qwen code port on :8090… I’m reviewing your file against your instructions."
-        : `Getting response from Qwen code port on :8090… I’m applying your requested changes: ${question}`),
+        : `Getting response from Qwen code port on :8090… I’m applying your requested changes: ${question}`)),
     "ai"
   );
   faithItem.classList.add("troubleshooting-pending");
@@ -4535,11 +4593,20 @@ async function runCoderTroubleshooting(question, options = {}) {
   };
   let answerHasStarted = false;
 
-  const response = await fetch(`/api/coder-edit?ts=${Date.now()}`, {
+  const editEndpoint = directCode ? "/api/direct-code-edit" : "/api/coder-edit";
+  const response = await fetch(`${editEndpoint}?ts=${Date.now()}`, {
     method: "POST",
     headers: { "Content-Type": "application/json", "Accept": "text/event-stream", "Cache-Control": "no-cache" },
     cache: "no-store",
-    body: JSON.stringify({ question, automatic_fix: automaticFix })
+    body: JSON.stringify({
+      question,
+      automatic_fix: automaticFix,
+      ...(directCode ? {
+        source_code: String(options.sourceCode || ""),
+        filename: String(options.filename || ""),
+        stored_name: String(options.storedName || "")
+      } : {})
+    })
   });
   if (!response.ok) {
     let data = {};
@@ -4556,7 +4623,14 @@ async function runCoderTroubleshooting(question, options = {}) {
   const paint = () => {
     faithItem.classList.remove("troubleshooting-pending");
     const node = faithItem.querySelector(".message-text");
-    if (node) { node.innerHTML = formatFaithMessage(reviewOnly ? answer : "```\n" + answer + "\n```"); scheduleCodeHighlight(node); }
+    if (node) {
+      // All coding-related modes use the same Markdown-aware formatter.
+      // Never synthesize a fence around an entire answer: Build, Troubleshooting,
+      // review, and direct-code replies can mix prose with one or more code excerpts.
+      // Only explicit fences or code runs detected by the formatter become code blocks.
+      node.innerHTML = formatFaithMessage(answer);
+      scheduleCodeHighlight(node);
+    }
     chat.scrollTop = chat.scrollHeight;
   };
   const consume = (raw) => {
@@ -4566,21 +4640,21 @@ async function runCoderTroubleshooting(question, options = {}) {
     try { event = JSON.parse(line.slice(5).trim()); } catch (_) { return; }
     if (event.type === "status") {
       if (event.phase === "searching") {
-        setExpression("troubleshooting", event.message || "Preparing the repair request…");
+        setExpression(directCode ? "coding" : "troubleshooting", event.message || "Preparing the repair request…");
         updateProgressMessage(event.message || "Preparing the repair request…");
       } else if (event.phase === "generating") {
         const message = event.message || "The coding model received the request. Waiting for the first generated code…";
-        setExpression("troubleshooting", message);
+        setExpression(directCode ? "coding" : "troubleshooting", message);
         updateProgressMessage(message);
       } else if (event.phase === "waiting-coder") {
         // Show server/model startup progress instead of leaving the user on
         // the previous searching message while the coder process is prepared.
         const message = event.message || "Preparing the coding model on :8090…";
-        setExpression("troubleshooting", message);
+        setExpression(directCode ? "coding" : "troubleshooting", message);
         updateProgressMessage(message);
       } else if (event.phase === "connecting") {
         const message = event.message || "Search step finished. Getting response from Qwen code port on :8090…";
-        setExpression("troubleshooting", message);
+        setExpression(directCode ? "coding" : "troubleshooting", message);
         updateProgressMessage(message);
       } else if (event.phase === "coding") {
         // Keep the Troubleshooting expression active while code is still being
@@ -4595,12 +4669,12 @@ async function runCoderTroubleshooting(question, options = {}) {
       paint();
     } else if (event.type === "done") {
       completed = true;
-      sessionMode = "troubleshooting";
+      sessionMode = directCode ? "coding" : "troubleshooting";
       if (reviewOnly) {
         faithItem.classList.remove("troubleshooting-pending");
         const node = faithItem.querySelector(".message-text");
         if (node) { node.innerHTML = formatFaithMessage(answer); scheduleCodeHighlight(node); }
-        setExpression("troubleshooting", "Code review complete");
+        setExpression(directCode ? "coding" : "troubleshooting", "Code review complete");
         return;
       }
       if (event.attachment && event.attachment.url) {
@@ -4640,7 +4714,11 @@ async function runCoderTroubleshooting(question, options = {}) {
   // switching threads or reloading Faith, along with its syntax-highlighted DOM.
   try { faithSaveWorkspace(); } catch (_) {}
   if (!reviewOnly) {
-    setExpression("coding", automaticFix ? "Automatic fix complete — updated code fully received" : "Code changes complete — updated code fully received");
+    // Troubleshooting must never borrow the Coding face: coding.png is reserved
+    // for explicit direct-code endpoint requests only.
+    setExpression(directCode ? "coding" : "troubleshooting", directCode
+      ? "Direct code edit complete — updated code fully received"
+      : (automaticFix ? "Automatic fix complete — updated code fully received" : "Code changes complete — updated code fully received"));
   }
   return answer;
 }
