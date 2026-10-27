@@ -79,6 +79,8 @@ Preview of the fire breathing dragon animation:
 - Direct editing will directly edit the selected file with the desired request, prompted by editing the raw code file and requesting an automatic change.
 <img src="https://i.imgur.com/AJUhhoS.png" alt="Descriptive Text">
 
+<img src="https://i.imgur.com/hWyziLc.png" alt="Descriptive Text">
+
 
 # Files tab: managing code within Faith
 - Faith keeps a separate, dedicated tab for managing code files and assisting with direct vibe coding through right-click Editing the code and asking for direct assistance with the code files.
