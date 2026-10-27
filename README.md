@@ -66,10 +66,20 @@ Preview of the fire breathing dragon animation:
 
 <img src="https://i.imgur.com/sDZgCbW.png" alt="Descriptive Text">
 
+<img src="https://i.imgur.com/gmZaZsQ.png" alt="Descriptive Text">
+
 
 # Coding: Troubleshooting Mode
 - Troubleshooting represents already existing code that was sent to Faith for analysis and automatic fixing.
 - Code generation works very similarly to images in that retrospect, that they can either be created from the ground up: or re-worked from existing items.
 <img src="https://i.imgur.com/mXS1gI5.png" alt="Descriptive Text">
 
-<img src="https://i.imgur.com/xURl3RL.png" alt="Descriptive Text">
+<img src="https://i.imgur.com/C8gzAsW.png" alt="Descriptive Text">
+
+
+# Files tab: managing code within Faith
+- Faith keeps a separate, dedicated tab for managing code files and assisting with direct vibe coding through right-click Editing the code and asking for direct assistance with the code files.
+- Files can be directly edited, or sent straight back to the chat for further developments.
+<img src="https://i.imgur.com/yv8XB7L.png" alt="Descriptive Text">
+
+<img src="https://i.imgur.com/PwfNIzp.png" alt="Descriptive Text">
