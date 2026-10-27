@@ -17,7 +17,30 @@
       color: #eef3ff; display: flex; flex-direction: column; gap: 12px;
     }
     .faith-sidebar-brand { font-size: 1.05rem; letter-spacing: .14em; font-weight: 800; padding: 4px 8px; }
-    .faith-sidebar-tabs { display: flex; gap: 6px; }
+    .faith-sidebar-tabs { display: flex; gap: 6px; flex-wrap: wrap; }
+    .faith-files-list { display:flex; flex-direction:column; gap:7px; margin-top:8px; }
+    /* Keep the Coding/Files menu scrollable without displaying a mismatched
+       native scrollbar beside its compact panel. */
+    .faith-sidebar, #faith-files-panel, #faith-files-list {
+      scrollbar-width: none !important;
+      -ms-overflow-style: none !important;
+    }
+    .faith-sidebar::-webkit-scrollbar,
+    #faith-files-panel::-webkit-scrollbar,
+    #faith-files-list::-webkit-scrollbar {
+      width: 0 !important;
+      height: 0 !important;
+      display: none !important;
+    }
+    .faith-file-card { display:flex; align-items:center; gap:9px; padding:9px; border:1px solid rgba(255,255,255,.1); border-radius:9px; background:rgba(255,255,255,.025); min-width:0; cursor:grab; }
+    .faith-file-card:active { cursor:grabbing; }
+    .faith-file-card.faith-file-dragging { opacity:.55; }
+    .faith-code-drop-target { outline:2px dashed #a879ff !important; outline-offset:-3px; background:rgba(99,54,166,.12) !important; }
+    .faith-file-icon { width:30px; height:30px; flex:0 0 30px; color:#9ddcff; }
+    .faith-file-icon svg { width:100%; height:100%; display:block; overflow:visible; }
+    .faith-file-meta { min-width:0; flex:1; }
+    .faith-file-name { overflow-wrap:anywhere; font-size:.84rem; }
+    .faith-file-sub { color:#98a6bc; font-size:.72rem; margin-top:3px; }
     .faith-sidebar button { font: inherit; cursor: pointer; color: #dbe5f7; background: transparent; border: 1px solid transparent; border-radius: 9px; padding: 9px 10px; text-align: left; }
     .faith-sidebar button:hover { background: rgba(255,255,255,.06); }
     .faith-sidebar button.active { background: rgba(98,132,210,.18); border-color: rgba(119,157,255,.24); }
@@ -622,6 +645,7 @@
     <div class="faith-sidebar-tabs">
       <button id="faith-sidebar-chats" class="active" type="button">Chats</button>
       <button id="faith-sidebar-gallery" type="button">Gallery</button>
+      <button id="faith-sidebar-files" type="button">Files</button>
       <button id="faith-sidebar-studio" type="button">Studio</button>
     </div>
     <div id="faith-chats-panel">
@@ -636,6 +660,13 @@
       <div id="faith-gallery-storage" class="faith-gallery-storage" aria-live="polite">Checking gallery storage…</div>
       <button id="faith-gallery-favorites-filter" type="button" aria-pressed="false">☆ Favorites only</button>
       <div id="faith-gallery-list"></div>
+    </div>
+    <div id="faith-files-panel" hidden aria-label="Coding files">
+      <div class="faith-sidebar-heading">Coding files</div>
+      <p class="hintEl" style="margin:0 0 8px">Fixed and built source files are saved here automatically. Right-click a file for actions.</p>
+      <button id="faith-files-refresh" type="button">↻ Refresh files</button>
+      <div id="faith-files-storage" class="faith-gallery-storage" aria-live="polite">Loading coding files…</div>
+      <div id="faith-files-list" class="faith-files-list"></div>
     </div>
     <div id="faith-studio-panel" hidden aria-label="Studio">
       <div class="faith-sidebar-heading">Studio</div>

@@ -1,4 +1,4 @@
-const FAITH_CLIENT_VERSION = "107-mic-organic-cyan-pink-gradient-editing";
+const FAITH_CLIENT_VERSION = "108-code-block-rendering-repair";
 
 // Transport rule (hard-won, 2026-10-22, proven by the v6 tab test): the image
 // backend (image-generation.perchance.org) sends
@@ -1702,10 +1702,123 @@ function formatInlineMarkdown(value) {
   return html;
 }
 
+// Some local coding models occasionally omit Markdown fences and return source as
+// ordinary text. Recover clearly code-like multiline runs before formatting so
+// they use the same <pre><code> + Highlight.js pipeline as the editor.
+function recoverUnfencedCodeRuns(source) {
+  const lines = String(source ?? "").split("\n");
+  const strongCodeLine = (line) => {
+    const s = line.trim();
+    if (!s) return false;
+    return /^(?:#!|<\/?[A-Za-z][^>]*>|(?:export\s+)?(?:async\s+)?function\b|(?:export\s+)?class\s+|(?:const|let|var)\s+[\w$]+\s*=|(?:def|class|module)\s+\w+|(?:public|private|protected|static|void|int|string|bool|async|await)\b|import\s+|from\s+\S+\s+import\b|require\s*\(|using\s+|package\s+|#include\s+|@(?:app|route|Override|staticmethod)|if\s*\(|for\s*\(|while\s*\(|return\b|[{}\[\]];?$)/.test(s) ||
+      /(?:=>|===?|!==?|&&|\|\||\+=|-=|::|->|\bconsole\.(?:log|error|warn)\s*\(|\bprint\s*\(|\bputs\s+|\bSELECT\s+.+\bFROM\b)/i.test(s) ||
+      /[;{}]\s*$/.test(s);
+  };
+  const likelyCodeLine = (line) => {
+    const s = line.trim();
+    if (!s) return true;
+    if (strongCodeLine(s)) return true;
+    return /^(?:\/\/|#|\*|\*\/|--|\.\w+[\s:{.#]|[\w.$()[\]<>]+\s*(?:=|:|\(|\{|\.|\[)|end\b|else\b|catch\b|finally\b|\}\s*[,;]?$)/.test(s);
+  };
+
+  // If the entire response is clearly source code, fence it as one block.
+  const nonblank = lines.filter(line => line.trim());
+  const strongCount = nonblank.filter(strongCodeLine).length;
+  const hasCodeSignals = nonblank.some(line => /[{};]|=>|\b(function|class|def|import|return|const|let|var|SELECT|<html|<script)\b/i.test(line));
+  if (nonblank.length >= 3 && hasCodeSignals && strongCount / nonblank.length >= 0.45 &&
+      nonblank.filter(line => /[.!?]$/.test(line.trim()) && !/[;{}]$/.test(line.trim())).length < nonblank.length * 0.45) {
+    return "```\n" + source + "\n```";
+  }
+
+  // In mixed prose/code replies, wrap only contiguous code-like runs. Keep
+  // blank lines within a run, but don't turn ordinary prose paragraphs into code.
+  const out = [];
+  let i = 0;
+  while (i < lines.length) {
+    if (!strongCodeLine(lines[i])) { out.push(lines[i++]); continue; }
+    const start = i;
+    let end = i + 1;
+    let strong = 1;
+    while (end < lines.length) {
+      if (likelyCodeLine(lines[end])) {
+        if (lines[end].trim() && strongCodeLine(lines[end])) strong++;
+        end++;
+      } else break;
+    }
+    const run = lines.slice(start, end);
+    const runNonblank = run.filter(line => line.trim()).length;
+    if (runNonblank >= 3 && strong / runNonblank >= 0.5) {
+      out.push("```", ...run, "```");
+      i = end;
+    } else {
+      out.push(lines[i++]);
+    }
+  }
+  return out.join("\n");
+}
+
+function recoverUnfencedCodeRunsOutsideFences(source) {
+  const lines = String(source ?? "").split("\n");
+  const output = [];
+  let prose = [];
+  let fenceChar = null;
+  let fenceLength = 0;
+  let inHtmlCode = false;
+
+  const flushProse = () => {
+    if (prose.length) output.push(recoverUnfencedCodeRuns(prose.join("\n")));
+    prose = [];
+  };
+
+  for (const line of lines) {
+    const trimmed = line.trim();
+    const fence = trimmed.match(/^(`{3,}|~{3,})/);
+    if (!inHtmlCode && fence) {
+      if (fenceChar === null) {
+        flushProse();
+        fenceChar = fence[1][0];
+        fenceLength = fence[1].length;
+      } else if (fence[1][0] === fenceChar && fence[1].length >= fenceLength &&
+                 new RegExp("^" + fenceChar.replace(/[.*+?^${}()|[\]\\]/g, "\\$&") + "{" + fenceLength + ",}\\s*$").test(trimmed)) {
+        fenceChar = null;
+        fenceLength = 0;
+      }
+      output.push(line);
+      continue;
+    }
+
+    if (fenceChar !== null) {
+      output.push(line);
+      continue;
+    }
+
+    if (/^<pre\b[^>]*>\s*<code\b/i.test(trimmed) || /^<code\b/i.test(trimmed)) {
+      flushProse();
+      inHtmlCode = true;
+      output.push(line);
+      if (/<\/code>\s*(?:<\/pre>)?\s*$/i.test(trimmed)) inHtmlCode = false;
+      continue;
+    }
+    if (inHtmlCode) {
+      output.push(line);
+      if (/<\/code>\s*(?:<\/pre>)?\s*$/i.test(trimmed)) inHtmlCode = false;
+      continue;
+    }
+    prose.push(line);
+  }
+  flushProse();
+  return output.join("\n");
+}
+
 function formatFaithMessage(text) {
-  const source = stripImageMarkdown(String(text ?? ""))
+  let source = stripImageMarkdown(String(text ?? ""))
     .replace(/\r\n?/g, "\n")
     .trim();
+
+  // Recover code-like runs even when the same answer already contains a fenced
+  // block. Previously, the presence of any ``` disabled recovery for the whole
+  // message, leaving additional unfenced source snippets as ordinary prose.
+  if (source) source = recoverUnfencedCodeRunsOutsideFences(source);
 
   if (!source) return "";
 
@@ -2685,21 +2798,334 @@ function faithInitSidebar() {
 
   const tabChat = document.getElementById("faith-sidebar-chats");
   const tabGallery = document.getElementById("faith-sidebar-gallery");
+  const tabFiles = document.getElementById("faith-sidebar-files");
   const tabStudio = document.getElementById("faith-sidebar-studio");
   const chatsPanel = document.getElementById("faith-chats-panel");
   const galleryPanel = document.getElementById("faith-gallery-panel");
+  const filesPanel = document.getElementById("faith-files-panel");
   const studioPanel = document.getElementById("faith-studio-panel");
+
+  // Small, self-contained language marks inspired by each language's familiar logo.
+  // Keep these inline (no external icon font/CDN) so the Files tab works offline.
+  const faithCodeIcon = (filename) => {
+    const ext = (String(filename).split(".").pop() || "file").toLowerCase();
+    const logos = {
+      html: ['#e34f26', '<path fill="#e34f26" d="M5 2h22l-2 25-9 3-9-3z"/><path fill="#fff" d="M10 8h13l-.3 3H13l.2 3h9.2l-.8 8-5.6 2-5.6-2-.4-4h3l.2 2 2.8.8 2.8-.8.3-3H9.7z"/>'],
+      htm: ['#e34f26', '<path fill="#e34f26" d="M5 2h22l-2 25-9 3-9-3z"/><path fill="#fff" d="M10 8h13l-.3 3H13l.2 3h9.2l-.8 8-5.6 2-5.6-2-.4-4h3l.2 2 2.8.8 2.8-.8.3-3H9.7z"/>'],
+      css: ['#1572b6', '<path fill="#1572b6" d="M5 2h22l-2 25-9 3-9-3z"/><path fill="#fff" d="M10 8h13l-.3 3H13l.2 3h9.2l-.8 8-5.6 2-5.6-2-.4-4h3l.2 2 2.8.8 2.8-.8.3-3H9.7z"/>'],
+      js: ['#f7df1e', '<rect x="2" y="2" width="28" height="28" rx="2" fill="#f7df1e"/><path fill="#222" d="M15 24.5c.6 1 1.3 1.6 2.5 1.6 1 0 1.6-.5 1.6-1.2 0-.8-.6-1.1-1.8-1.7l-.7-.3c-2- .9-3.3-2-3.3-4.3 0-2.1 1.6-3.7 4.1-3.7 1.8 0 3.1.6 4 2.3l-2.2 1.4c-.5-.9-1-1.2-1.8-1.2-.7 0-1.2.5-1.2 1.1 0 .8.5 1.1 1.6 1.6l.7.3c2.4 1 3.7 2.1 3.7 4.4 0 2.5-2 3.9-4.6 3.9-2.6 0-4.2-1.2-5-2.9zM6 24.7l2.3-1.4c.4.8.8 1.5 1.7 1.5.8 0 1.3-.3 1.3-1.6v-8h2.8v8c0 2.9-1.7 4.2-4 4.2-2.1 0-3.4-1.1-4.1-2.7z"/>'],
+      mjs: ['#f7df1e', '<rect x="2" y="2" width="28" height="28" rx="2" fill="#f7df1e"/><text x="16" y="21" font-size="12" font-weight="800" text-anchor="middle" fill="#222">JS</text>'],
+      cjs: ['#f7df1e', '<rect x="2" y="2" width="28" height="28" rx="2" fill="#f7df1e"/><text x="16" y="21" font-size="12" font-weight="800" text-anchor="middle" fill="#222">JS</text>'],
+      ts: ['#3178c6', '<path fill="#3178c6" d="M2 2h28v28H2z"/><path fill="#fff" d="M7 14h10v3h-3.5v9h-3v-9H7zm11 8.7 2.6-1.5c.6 1 1.3 1.5 2.4 1.5.9 0 1.5-.4 1.5-1 0-.8-.7-1.1-1.9-1.7l-.7-.3c-2- .9-3.3-1.9-3.3-4.1 0-2 1.6-3.5 4-3.5 1.7 0 3 .6 3.9 2.2l-2.5 1.6c-.5-.9-.9-1.2-1.7-1.2-.7 0-1.1.4-1.1 1 0 .7.4 1 1.5 1.5l.7.3c2.4 1 3.7 2.1 3.7 4.3 0 2.5-2 3.8-4.7 3.8-2.6 0-4.3-1.2-5.1-2.9z"/>'],
+      tsx: ['#3178c6', '<path fill="#3178c6" d="M2 2h28v28H2z"/><text x="16" y="20" font-size="11" font-weight="800" text-anchor="middle" fill="#fff">TSX</text>'],
+      jsx: ['#61dafb', '<circle cx="16" cy="16" r="2.5" fill="#61dafb"/><g fill="none" stroke="#61dafb" stroke-width="1.8"><ellipse cx="16" cy="16" rx="13" ry="5.5"/><ellipse cx="16" cy="16" rx="13" ry="5.5" transform="rotate(60 16 16)"/><ellipse cx="16" cy="16" rx="13" ry="5.5" transform="rotate(120 16 16)"/></g>'],
+      py: ['#3776ab', '<path fill="#3776ab" d="M16 2c-7 0-7 3-7 6v4h8v2H6c-4 0-5 4-5 8s2 7 6 7h4v-5c0-4 3-6 7-6h7c3 0 5-2 5-5V8c0-4-4-6-14-6z"/><path fill="#ffd343" d="M16 30c7 0 7-3 7-6v-4h-8v-2h11c4 0 5-4 5-8s-2-7-6-7h-4v5c0 4-3 6-7 6H7c-3 0-5 2-5 5v5c0 4 4 6 14 6z"/><circle cx="12" cy="7" r="1.4" fill="#fff"/><circle cx="20" cy="25" r="1.4" fill="#fff"/>'],
+      rb: ['#cc342d', '<path fill="#cc342d" d="M16 2 28 9v14l-12 7L4 23V9z"/><text x="16" y="21" font-size="13" font-weight="800" text-anchor="middle" fill="#fff">Rb</text>'],
+      php: ['#777bb4', '<ellipse cx="16" cy="16" rx="14" ry="9" fill="#777bb4"/><text x="16" y="20" font-size="10" font-weight="800" text-anchor="middle" fill="#fff">php</text>'],
+      java: ['#f89820', '<path fill="#f89820" d="M12 3c-4 4 6 4 1 9 8-4 1-6-1-9zm7 1c-5 5 6 6-2 11 11-5 1-8 2-11z"/><path fill="#5382a1" d="M5 18c5 2 17 2 22 0v3c-5 4-17 4-22 0zm3 6c4 2 12 2 16 0l-2 4H10z"/>'],
+      go: ['#00add8', '<path fill="#00add8" d="M4 10h11l-2 3H3zm-2 5h12l-2 3H1zm4 5h8l-2 3H4z"/><text x="18" y="21" font-size="12" font-weight="800" fill="#00add8">Go</text>'],
+      rs: ['#dea584', '<path fill="#dea584" d="M16 2 28 9v14l-12 7L4 23V9z"/><text x="16" y="21" font-size="12" font-weight="800" text-anchor="middle" fill="#20242b">R</text>'],
+      kt: ['#7f52ff', '<path fill="#7f52ff" d="M3 3h12L3 16V3zm0 15 13-13v24H3zm15-15h11L18 15z"/><path fill="#e44857" d="M18 17 29 29H18z"/>'],
+      swift: ['#f05138', '<path fill="#f05138" d="M3 7c6 5 10 7 15 8-4-3-7-6-9-9 6 5 12 8 18 9-2-4-5-7-8-10 8 5 12 11 10 17-2 6-10 8-17 4 5 1 9 0 11-3C15 24 7 18 3 7z"/>'],
+      cs: ['#68217a', '<path fill="#68217a" d="M16 2 28 9v14l-12 7L4 23V9z"/><text x="16" y="21" font-size="11" font-weight="800" text-anchor="middle" fill="#fff">C#</text>'],
+      cpp: ['#00599c', '<path fill="#00599c" d="M16 2 28 9v14l-12 7L4 23V9z"/><text x="16" y="21" font-size="10" font-weight="800" text-anchor="middle" fill="#fff">C++</text>'],
+      c: ['#555', '<path fill="#555" d="M16 2 28 9v14l-12 7L4 23V9z"/><text x="16" y="21" font-size="14" font-weight="800" text-anchor="middle" fill="#fff">C</text>'],
+      sql: ['#e38c00', '<ellipse cx="16" cy="7" rx="11" ry="4" fill="#f3b23d"/><path fill="#e38c00" d="M5 7v17c0 5 22 5 22 0V7c0 5-22 5-22 0z"/><path fill="none" stroke="#fff" stroke-width="1.5" d="M5 13c0 5 22 5 22 0M5 19c0 5 22 5 22 0"/>'],
+      json: ['#e5c07b', '<path fill="#e5c07b" d="M7 4C2 4 5 12 2 16c3 4 0 12 5 12h3v-4H8c-2 0-1-6-3-8 2-2 1-8 3-8h2V4zm18 0c5 0 2 8 5 12-3 4 0 12-5 12h-3v-4h2c2 0 1-6 3-8-2-2-1-8-3-8h-2V4z"/><circle cx="16" cy="12" r="2" fill="#e5c07b"/><circle cx="16" cy="20" r="2" fill="#e5c07b"/>'],
+      sh: ['#4eaa25', '<rect x="2" y="4" width="28" height="24" rx="3" fill="#252525"/><path d="m8 11 5 4-5 4m8 0h8" fill="none" stroke="#4eaa25" stroke-width="2.5"/>'],
+      bat: ['#4eaa25', '<rect x="2" y="4" width="28" height="24" rx="3" fill="#252525"/><path d="m8 11 5 4-5 4m8 0h8" fill="none" stroke="#4eaa25" stroke-width="2.5"/>'],
+      ps1: ['#2671be', '<path fill="#2671be" d="M3 4h26v24H3z"/><path d="m7 10 9 5-9 5m10 0h8" fill="none" stroke="#fff" stroke-width="2.3"/>'],
+      md: ['#083fa6', '<rect x="2" y="5" width="28" height="22" rx="3" fill="#083fa6"/><path d="M6 21V11l5 6 5-6v10m3-10h5m-2-3 3 3-3 3" fill="none" stroke="#fff" stroke-width="2"/>'],
+      svg: ['#ffb13b', '<path fill="#ffb13b" d="M16 2 30 16 16 30 2 16z"/><text x="16" y="20" font-size="9" font-weight="800" text-anchor="middle" fill="#292929">SVG</text>'],
+      xml: ['#e37933', '<path fill="#e37933" d="m11 7-8 9 8 9 2-3-6-6 6-6zm10 0-2 3 6 6-6 6 2 3 8-9z"/><path fill="#e37933" d="m17 4 3 1-5 22-3-1z"/>'],
+      default: ['#9aa9bf', '<path fill="#9aa9bf" d="M7 2h12l6 6v22H7z"/><path fill="#e9eef7" d="M19 2v7h6"/><path fill="none" stroke="#e9eef7" stroke-width="1.6" d="M11 16h10M11 20h10M11 24h7"/>']
+    };
+    const key = ({htm:'html', mjs:'js', cjs:'js', jsx:'jsx', tsx:'tsx', py:'py', rb:'rb', java:'java', cc:'cpp', hpp:'cpp', h:'c', cs:'cs', kt:'kt', kts:'kt', swift:'swift', sql:'sql', bash:'sh', cmd:'bat', ps1:'ps1', json:'json', xml:'xml', yml:'json', yaml:'json', md:'md', svg:'svg'})[ext] || (logos[ext] ? ext : 'default');
+    const [color, artwork] = logos[key] || logos.default;
+    const title = ext.toUpperCase().replace(/[^A-Z0-9.+#_-]/g, '').slice(0, 12) || 'FILE';
+    return `<svg viewBox="0 0 32 32" role="img" aria-label="${title} language logo" style="color:${color}" xmlns="http://www.w3.org/2000/svg">${artwork}</svg>`;
+  };
+  const faithRefreshCodeFiles = async () => {
+    const list = document.getElementById("faith-files-list");
+    const stats = document.getElementById("faith-files-storage");
+    if (!list) return;
+    list.innerHTML = "";
+    if (stats) stats.textContent = "Loading coding files…";
+    try {
+      const response = await fetch("/api/code-files", { cache: "no-store" });
+      const data = await response.json();
+      if (!response.ok) throw new Error(data.error || "Could not load files");
+      if (stats) stats.textContent = `${data.count || 0} files · ${faithFormatBytes(data.bytes || 0)} used`;
+      (data.files || []).forEach(file => {
+        const card = document.createElement("div"); card.className = "faith-file-card";
+        card.draggable = true;
+        card.title = "Drag into the current conversation to attach this code file; click to open; right-click for file actions";
+        card.addEventListener("dragstart", event => {
+          try {
+            event.dataTransfer.effectAllowed = "copy";
+            event.dataTransfer.setData("application/x-faith-code-file", JSON.stringify({ name: file.name, url: file.url, stored_name: file.stored_name }));
+            event.dataTransfer.setData("text/plain", `faith-code-file:${file.stored_name}`);
+          } catch (_) {}
+          card.classList.add("faith-file-dragging");
+        });
+        card.addEventListener("dragend", () => card.classList.remove("faith-file-dragging"));
+        const icon = document.createElement("div"); icon.className = "faith-file-icon"; icon.innerHTML = faithCodeIcon(file.name); icon.setAttribute("aria-hidden", "true");
+        const meta = document.createElement("div"); meta.className = "faith-file-meta";
+        const name = document.createElement("div"); name.className = "faith-file-name"; name.textContent = file.name;
+        const sub = document.createElement("div"); sub.className = "faith-file-sub"; sub.textContent = `${faithFormatBytes(file.size)} · ${new Date(file.updated_at).toLocaleString()}`;
+        meta.append(name, sub); card.append(icon, meta);
+        card.addEventListener("click", () => window.open(file.url, "_blank", "noopener"));
+        card.addEventListener("contextmenu", event => {
+          event.preventDefault();
+          const items = [
+            { label: "Edit file", action: () => faithOpenCodeEditor(file) },
+            { label: "View / open file", action: () => window.open(file.url, "_blank", "noopener") },
+            { label: "Download file", action: () => { const a = document.createElement("a"); a.href = file.url; a.download = file.name; document.body.appendChild(a); a.click(); a.remove(); } }
+          ];
+          if (/\.html?$/i.test(file.name)) items.splice(1, 0, { label: "Preview HTML", action: () => faithPreviewCodeHtml(file.url, file.name) });
+          items.push({ label: "Delete file", danger: true, action: async () => {
+            if (!confirm(`Permanently delete ${file.name}?`)) return;
+            try {
+              const r = await fetch("/api/code-files", { method:"POST", headers:{"Content-Type":"application/json", "Accept":"application/json"}, body:JSON.stringify({action:"delete", stored_name:file.stored_name, filename:file.name}) });
+              const responseText = await r.text();
+              let result = {};
+              try { result = responseText ? JSON.parse(responseText) : {}; }
+              catch (_) { throw new Error(`Server returned a non-JSON response (HTTP ${r.status}). Restart Faith's Ruby server and try again.`); }
+              if (!r.ok) throw new Error(result.error || `Delete failed (HTTP ${r.status})`);
+              await faithRefreshCodeFiles();
+            } catch (error) { alert(`Could not delete file: ${error.message}`); }
+          }});
+          faithShowContextMenu(event.clientX, event.clientY, items);
+        });
+        list.appendChild(card);
+      });
+      if (!(data.files || []).length) { const empty = document.createElement("div"); empty.className = "faith-file-sub"; empty.textContent = "No coding files yet. Fixed and built source files will appear here automatically."; list.appendChild(empty); }
+    } catch (error) { if (stats) stats.textContent = `Could not load coding files: ${error.message}`; }
+  };
+  const faithOpenCodeEditor = async (file) => {
+    const overlay = document.createElement("div");
+    overlay.className = "faith-code-editor-overlay";
+    overlay.style.cssText = "position:fixed;inset:0;z-index:100020;background:rgba(4,8,18,.86);display:flex;align-items:center;justify-content:center;padding:2vh 2vw;";
+    const panel = document.createElement("section");
+    panel.style.cssText = "width:min(1240px,98vw);height:96vh;display:flex;flex-direction:column;gap:10px;padding:16px;background:#101725;color:#edf3ff;border:1px solid #394760;border-radius:14px;box-shadow:0 24px 90px #0009;min-height:0;";
+    const header = document.createElement("div");
+    header.style.cssText = "display:flex;align-items:center;gap:10px;flex-wrap:wrap;";
+    const title = document.createElement("strong"); title.textContent = `Edit ${file.name}`; title.style.cssText = "flex:1;overflow-wrap:anywhere;font-size:1.05rem;";
+    const status = document.createElement("span"); status.textContent = "Loading file…"; status.style.cssText = "font-size:.82rem;color:#a8b8d3;";
+    const close = document.createElement("button"); close.type = "button"; close.textContent = "Close";
+    close.style.cssText = "background:#273349;color:#fff;border:1px solid #4b5b76;border-radius:7px;padding:8px 12px;";
+    header.append(title, status, close);
+    // Overlay a syntax-highlighted Highlight.js layer beneath the editable textarea.
+    // The textarea remains the source of truth, preserving normal editing, selection,
+    // undo/redo, keyboard navigation, and exact file contents.
+    const editorWrap = document.createElement("div");
+    editorWrap.style.cssText = "position:relative;flex:1 1 0;min-height:0;height:0;width:100%;overflow:hidden;border:1px solid #34445d;border-radius:9px;background:#080d16;";
+    const highlighted = document.createElement("pre");
+    highlighted.className = "faith-editor-highlight-pre";
+    highlighted.setAttribute("aria-hidden", "true");
+    highlighted.style.cssText = "position:absolute!important;inset:0!important;width:100%!important;height:100%!important;max-height:none!important;min-height:0!important;margin:0!important;padding:0!important;overflow:hidden!important;box-sizing:border-box!important;background:#080d16!important;font:13px/1.55 ui-monospace,SFMono-Regular,Consolas,monospace!important;letter-spacing:normal!important;tab-size:2!important;white-space:pre!important;word-break:normal!important;overflow-wrap:normal!important;pointer-events:none!important;";
+    const highlightedCode = document.createElement("code");
+    highlightedCode.className = "faith-editor-highlight-code";
+    highlightedCode.style.cssText = "display:block;min-height:100%;width:max-content;min-width:100%;padding:14px;margin:0;border:0;background:transparent;font:13px/1.55 ui-monospace,SFMono-Regular,Consolas,monospace;letter-spacing:normal;font-weight:400;font-style:normal;white-space:pre;tab-size:2;word-break:normal;overflow-wrap:normal;transform:translate(0,0);will-change:transform;";
+    highlighted.appendChild(highlightedCode);
+    const editor = document.createElement("textarea");
+    editor.className = "faith-code-editor-input";
+    editor.spellcheck = false; editor.autocapitalize = "off"; editor.autocomplete = "off"; editor.wrap = "off";
+    editor.setAttribute("aria-label", `Source code for ${file.name}`);
+    // Reliability-first editor: use one native textarea as both the visible code
+    // surface and the scrolling surface. The previous transparent-text + <pre>
+    // overlay required two independently laid-out layers and repeatedly drifted.
+    // A single native control guarantees caret, selection, scroll, and text share
+    // the same geometry; message code blocks elsewhere keep their highlighting.
+    editor.style.cssText = "position:relative;display:block;flex:1 1 auto;min-height:0;width:100%;height:100%;resize:none;box-sizing:border-box;padding:14px;border:0;outline:none;border-radius:9px;background:transparent;color:transparent;-webkit-text-fill-color:transparent;caret-color:#f5f8ff;font:13px/1.55 ui-monospace,SFMono-Regular,Consolas,monospace;letter-spacing:normal;font-weight:400;font-style:normal;tab-size:2;white-space:pre;overflow:auto;overflow-wrap:normal;scrollbar-width:auto;scrollbar-color:#536784 #111a29;-ms-overflow-style:auto;z-index:1;";
+    const selectionStyle = document.createElement("style");
+    selectionStyle.textContent = ".faith-code-editor-input::-webkit-scrollbar{width:12px!important;height:12px!important;display:block!important}.faith-code-editor-input::-webkit-scrollbar-thumb{background:#536784!important;border-radius:8px!important;border:2px solid #111a29!important}.faith-code-editor-input::-webkit-scrollbar-track{background:#111a29!important}.faith-code-editor-input::selection{background:rgba(89,145,255,.42)}.faith-code-editor-input::-moz-selection{background:rgba(89,145,255,.42)}";
+    document.head.appendChild(selectionStyle);
+    const extension = (String(file.name).split(".").pop() || "").toLowerCase();
+    const languageByExtension = {js:"javascript",mjs:"javascript",cjs:"javascript",jsx:"javascript",ts:"typescript",tsx:"typescript",py:"python",rb:"ruby",html:"xml",htm:"xml",xhtml:"xml",svg:"xml",xml:"xml",css:"css",scss:"scss",sass:"scss",json:"json",jsonc:"json",yml:"yaml",yaml:"yaml",sh:"bash",bash:"bash",zsh:"bash",bat:"dos",cmd:"dos",ps1:"powershell",java:"java",kt:"kotlin",kts:"kotlin",swift:"swift",c:"c",h:"c",cc:"cpp",cpp:"cpp",cxx:"cpp",hpp:"cpp",cs:"csharp",go:"go",rs:"rust",php:"php",sql:"sql",md:"markdown",markdown:"markdown",toml:"ini",ini:"ini",r:"r",lua:"lua",dart:"dart",ex:"elixir",exs:"elixir",erl:"erlang",hs:"haskell",pl:"perl",pm:"perl",vue:"xml",svelte:"xml"};
+    const highlightLanguage = languageByExtension[extension] || "";
+    const renderEditorHighlight = () => {
+      const source = editor.value || " ";
+      const hljs = window.hljs;
+      if (hljs) {
+        try {
+          const language = highlightLanguage && typeof hljs.getLanguage === "function" && hljs.getLanguage(highlightLanguage) ? highlightLanguage : "";
+          highlightedCode.innerHTML = language ? hljs.highlight(source, { language, ignoreIllegals: true }).value : hljs.highlightAuto(source).value;
+          highlightedCode.className = language ? `hljs language-${language}` : "hljs";
+        } catch (_) { highlightedCode.textContent = source; }
+      } else {
+        highlightedCode.textContent = source;
+        editor.style.color = "transparent";
+        editor.style.webkitTextFillColor = "transparent";
+      }
+    };
+    let highlightFrame = 0;
+    const scheduleEditorHighlight = () => {
+      if (highlightFrame) return;
+      highlightFrame = requestAnimationFrame(() => { highlightFrame = 0; renderEditorHighlight(); });
+    };
+    editor.addEventListener("input", scheduleEditorHighlight);
+    const syncEditorViewport = () => { highlightedCode.style.transform = `translate(${-editor.scrollLeft}px, ${-editor.scrollTop}px)`; highlighted.style.width = `${editor.clientWidth}px`; highlighted.style.height = `${editor.clientHeight}px`; };
+    editor.addEventListener("scroll", syncEditorViewport, { passive: true });
+    window.addEventListener("resize", syncEditorViewport);
+    editor.addEventListener("keydown", event => {
+      if (event.key === "Tab" && !event.ctrlKey && !event.altKey && !event.metaKey) {
+        event.preventDefault();
+        const start = editor.selectionStart, end = editor.selectionEnd;
+        editor.setRangeText("\t", start, end, "end");
+        scheduleEditorHighlight();
+      }
+    });
+    // Do not stack a second independently scrolling <pre> beneath the textarea.
+    // That overlay was the source of the mismatched viewport and unreachable lines.
+    editorWrap.append(highlighted, editor);
+    const requestLabel = document.createElement("label"); requestLabel.textContent = "What would you like Faith to change? (optional)"; requestLabel.style.cssText = "font-size:.88rem;color:#c7d5ec;";
+    const request = document.createElement("textarea"); request.rows = 2; request.placeholder = "Example: Add input validation, preserve existing behavior, and update the error handling…";
+    request.style.cssText = "width:100%;box-sizing:border-box;resize:vertical;min-height:54px;max-height:140px;padding:10px;border:1px solid #34445d;border-radius:8px;background:#0a101c;color:#fff;font:14px/1.4 system-ui,sans-serif;";
+    const actions = document.createElement("div"); actions.style.cssText = "display:flex;gap:8px;justify-content:flex-end;flex-wrap:wrap;";
+    const buttonStyle = "border:0;border-radius:8px;padding:10px 14px;font-weight:600;cursor:pointer;";
+    const save = document.createElement("button"); save.type = "button"; save.textContent = "Save changes"; save.style.cssText = buttonStyle + "background:#34435d;color:#fff;";
+    const chatButton = document.createElement("button"); chatButton.type = "button"; chatButton.textContent = "Save & chat about changes"; chatButton.style.cssText = buttonStyle + "background:#6336a6;color:#fff;";
+    actions.append(save, chatButton); panel.append(header, editorWrap, requestLabel, request, actions); overlay.appendChild(panel);
+    let originalCode = "", loaded = false, saving = false;
+    const closeEditor = () => { if (editor.value !== originalCode && !confirm("You have unsaved code changes. Close without saving?")) return; overlay.remove(); selectionStyle.remove(); window.removeEventListener("resize", syncEditorViewport); };
+    close.addEventListener("click", closeEditor);
+    overlay.addEventListener("click", e => { if (e.target === overlay) closeEditor(); });
+    const saveCode = async () => {
+      if (saving) throw new Error("A save is already in progress.");
+      saving = true; save.disabled = chatButton.disabled = true; status.textContent = "Saving…";
+      try {
+        const r = await fetch("/api/code-files", { method: "PUT", headers: { "Content-Type": "application/json", "Accept": "application/json" }, body: JSON.stringify({ stored_name: file.stored_name, code: editor.value }) });
+        const raw = await r.text(); let data = {};
+        try { data = raw ? JSON.parse(raw) : {}; } catch (_) { throw new Error(`Server returned a non-JSON response (HTTP ${r.status}).`); }
+        if (!r.ok) throw new Error(data.error || `Save failed (HTTP ${r.status})`);
+        originalCode = editor.value; status.textContent = "Saved"; return data;
+      } finally { saving = false; save.disabled = chatButton.disabled = false; }
+    };
+    save.addEventListener("click", async () => { try { await saveCode(); await faithRefreshCodeFiles(); status.textContent = "Saved successfully"; } catch (error) { status.textContent = "Save failed"; alert(`Could not save ${file.name}: ${error.message}`); } });
+    chatButton.addEventListener("click", async () => {
+      const instructions = request.value.trim();
+      if (!instructions) { alert("Describe the changes you want Faith to make before starting the troubleshooting conversation."); request.focus(); return; }
+      try {
+        // Save the editor contents first, then send those exact bytes through
+        // Faith's normal file-attachment flow. This avoids calling /api/coder-edit
+        // before the troubleshooting upload/session state has been initialized.
+        await saveCode();
+        status.textContent = "Preparing file attachment…";
+        const sourceResponse = await fetch(file.url, { cache: "no-store" });
+        if (!sourceResponse.ok) throw new Error(`Could not prepare the saved file attachment (HTTP ${sourceResponse.status}).`);
+        const sourceBlob = await sourceResponse.blob();
+        const mimeByExtension = { js:"text/javascript", mjs:"text/javascript", cjs:"text/javascript", ts:"text/typescript", py:"text/x-python", rb:"text/x-ruby", html:"text/html", htm:"text/html", css:"text/css", json:"application/json", xml:"application/xml", svg:"image/svg+xml", md:"text/markdown", sql:"text/plain", java:"text/plain", c:"text/plain", cpp:"text/plain", cs:"text/plain", go:"text/plain", rs:"text/plain", php:"text/plain", sh:"text/plain", ps1:"text/plain" };
+        const ext = (String(file.name).split(".").pop() || "").toLowerCase();
+        const sourceFile = new File([sourceBlob], file.name, { type: sourceBlob.type && sourceBlob.type !== "application/octet-stream" ? sourceBlob.type : (mimeByExtension[ext] || "text/plain"), lastModified: Date.now() });
+
+        // Each Edit & Chat action starts a fresh, dedicated conversation. The
+        // source is represented as a real attachment in that chat, just like a
+        // file selected from the normal composer, and therefore enters the same
+        // Troubleshooting diagnosis/fix pipeline users already know.
+        faithNewThread();
+        const thread = faithWorkspace.threads.find(item => item.id === faithWorkspace.activeId);
+        if (thread) {
+          thread.title = `Edit: ${file.name}`;
+          thread.mode = "troubleshooting";
+          thread.behaviorState = "troubleshooting";
+          thread.expression = "troubleshooting";
+          thread.detail = `Working on ${file.name}`;
+        }
+        sessionMode = "troubleshooting";
+        troubleshootingDiagnosisReady = false;
+        setExpression("troubleshooting", `Preparing ${file.name} for troubleshooting…`);
+        faithSaveWorkspace();
+        showSidebarTab("chats");
+        overlay.remove(); selectionStyle.remove();
+        await faithRefreshCodeFiles();
+        // Keep the user’s request verbatim. The attachment itself supplies the
+        // filename and source; avoid adding boilerplate that can distract the
+        // coding model from the actual requested changes.
+        const prompt = instructions;
+        // This handoff is a user-initiated operation; if another action left the
+        // global busy flag set, clear it before calling the upload function (which
+        // otherwise intentionally returns early without doing anything).
+        setBusy(false);
+        await uploadFileToFaith(sourceFile, prompt, "file");
+      } catch (error) {
+        status.textContent = "Could not start chat";
+        alert(`Could not start a troubleshooting conversation for ${file.name}: ${error.message}`);
+      }
+    });
+    document.body.appendChild(overlay);
+    try {
+      const response = await fetch(file.url, { cache: "no-store" });
+      if (!response.ok) throw new Error(`Could not read file (HTTP ${response.status})`);
+      originalCode = await response.text(); editor.value = originalCode; renderEditorHighlight(); loaded = true; status.textContent = `${faithFormatBytes(new Blob([originalCode]).size)} · ${file.name}`; editor.focus();
+    } catch (error) { status.textContent = "Could not load file"; editor.value = `// Could not load ${file.name}: ${error.message}`; renderEditorHighlight(); save.disabled = chatButton.disabled = true; }
+  };
+
+  const faithPreviewCodeHtml = (url, filename) => {
+    const overlay = document.createElement("div"); overlay.style.cssText = "position:fixed;inset:0;z-index:100001;background:rgba(0,0,0,.78);display:flex;align-items:center;justify-content:center;padding:3vh 3vw";
+    const frame = document.createElement("div"); frame.style.cssText = "width:min(1100px,96vw);height:94vh;background:#111827;border:1px solid #536176;border-radius:12px;overflow:hidden;display:flex;flex-direction:column";
+    const bar = document.createElement("div"); bar.style.cssText = "display:flex;align-items:center;gap:12px;padding:10px 14px;color:#eaf2ff";
+    const label = document.createElement("strong"); label.textContent = filename; label.style.cssText = "flex:1;overflow-wrap:anywhere";
+    const close = document.createElement("button"); close.textContent = "Close preview"; close.type = "button"; close.addEventListener("click", () => overlay.remove());
+    const iframe = document.createElement("iframe"); iframe.src = url; iframe.title = `Preview ${filename}`; iframe.sandbox = "allow-scripts allow-forms"; iframe.style.cssText = "border:0;flex:1;width:100%;background:white";
+    bar.append(label, close); frame.append(bar, iframe); overlay.appendChild(frame); overlay.addEventListener("click", e => { if (e.target === overlay) overlay.remove(); }); document.body.appendChild(overlay);
+  };
+  // Files-tab cards can be dropped onto the active conversation or composer.
+  // Dropping stages the file just like the Upload menu; it never sends or edits
+  // anything until the user types a request and presses Send.
+  const faithDropTargets = [chat, document.getElementById("chat-form"), input].filter(Boolean);
+  faithDropTargets.forEach(target => {
+    target.addEventListener("dragover", event => {
+      const types = event.dataTransfer && Array.from(event.dataTransfer.types || []);
+      if (types && (types.includes("application/x-faith-code-file") || types.includes("text/plain"))) {
+        event.preventDefault();
+        if (event.dataTransfer) event.dataTransfer.dropEffect = "copy";
+        target.classList.add("faith-code-drop-target");
+      }
+    });
+    target.addEventListener("dragleave", event => {
+      if (!target.contains(event.relatedTarget)) target.classList.remove("faith-code-drop-target");
+    });
+    target.addEventListener("drop", async event => {
+      const raw = event.dataTransfer && event.dataTransfer.getData("application/x-faith-code-file");
+      if (!raw) return;
+      event.preventDefault();
+      target.classList.remove("faith-code-drop-target");
+      let fileInfo;
+      try { fileInfo = JSON.parse(raw); } catch (_) { return; }
+      if (!fileInfo || !fileInfo.url || !fileInfo.name) return;
+      try {
+        setUploadStatus(`Loading ${fileInfo.name} from Files…`, false);
+        const response = await fetch(fileInfo.url, { cache: "no-store" });
+        if (!response.ok) throw new Error(`Could not read file (HTTP ${response.status})`);
+        const blob = await response.blob();
+        const sourceFile = new File([blob], fileInfo.name, { type: blob.type && blob.type !== "application/octet-stream" ? blob.type : "text/plain", lastModified: Date.now() });
+        pendingCodeFile = sourceFile;
+        setUploadStatus(`Attached: ${fileInfo.name} — write your request and press Send`, false);
+        setExpression(sessionMode === "troubleshooting" ? "troubleshooting" : "thinking", `Ready to revise ${fileInfo.name}`);
+        input.focus();
+      } catch (error) {
+        setUploadStatus(`Could not attach ${fileInfo.name}`, false);
+        appendMessage("Error", `Could not attach ${fileInfo.name} from Files: ${error.message}`, "error");
+      }
+    });
+  });
+  const refreshFilesButton = document.getElementById("faith-files-refresh");
+  if (refreshFilesButton) refreshFilesButton.addEventListener("click", faithRefreshCodeFiles);
   const showSidebarTab = (which) => {
     if (!tabChat || !tabGallery || !tabStudio || !chatsPanel || !galleryPanel || !studioPanel) return;
     chatsPanel.hidden = which !== "chats";
     galleryPanel.hidden = which !== "gallery";
+    if (filesPanel) filesPanel.hidden = which !== "files";
     studioPanel.hidden = which !== "studio";
     // Studio is its own blank workspace, not a view layered over the current
     // conversation. The chat and composer return when another sidebar tab opens.
     document.body.classList.toggle("faith-studio-mode", which === "studio");
     tabChat.classList.toggle("active", which === "chats");
     tabGallery.classList.toggle("active", which === "gallery");
+    if (tabFiles) tabFiles.classList.toggle("active", which === "files");
     tabStudio.classList.toggle("active", which === "studio");
+    if (which === "files") faithRefreshCodeFiles();
     if (which === "studio") {
       // Studio owns a private, non-visible system conversation. Its only job is
       // to activate the Video Mode expression while Studio is open; it never
@@ -2730,6 +3156,7 @@ function faithInitSidebar() {
   if (tabChat && tabGallery && tabStudio && chatsPanel && galleryPanel && studioPanel) {
     tabChat.addEventListener("click", () => showSidebarTab("chats"));
     tabGallery.addEventListener("click", () => showSidebarTab("gallery"));
+    if (tabFiles) tabFiles.addEventListener("click", () => showSidebarTab("files"));
     tabStudio.addEventListener("click", () => {
       // Enter Studio's separate internal expression context without changing
       // the active conversation's saved expression or behavior.
@@ -3275,6 +3702,16 @@ async function consumeQwenStream(response, qwenRelayLoading) {
       ensureFaithItem();
       updateStreamingText();
 
+      // Critical: streamed text is intentionally shown as textContent while
+      // tokens arrive, but it must be converted to the normal Markdown/code
+      // renderer when the stream finishes. Without this final render, streamed
+      // replies stay plain text forever and never create <pre><code> blocks.
+      const completedTextNode = faithItem && faithItem.querySelector(".message-text");
+      if (completedTextNode) {
+        completedTextNode.innerHTML = formatFaithMessage(answer);
+        scheduleCodeHighlight(completedTextNode);
+      }
+
       // Only now, after the complete answer has been delivered, attach the
       // buffered Wikimedia results. Prefer the final event payload if it has
       // them; otherwise use the earlier async images event.
@@ -3448,7 +3885,11 @@ function readFileAsText(file) {
 }
 
 function addFixCodeButton(messageItem) {
-  if (!messageItem || messageItem.querySelector(".fix-code-action")) return;
+  // Fix Code belongs on a diagnosis, never on a completed edit/fix result.
+  // The server may retain a previous diagnosis-ready flag across turns, so
+  // explicitly tagged edit results must not inherit a stale Automatic Fix button.
+  if (!messageItem || messageItem.classList.contains("faith-code-edit-result") ||
+      messageItem.querySelector(".faith-troubleshooting-artifact-actions, .fix-code-action")) return;
   const wrap = document.createElement("div");
   wrap.className = "fix-code-action";
   wrap.style.marginTop = "12px";
@@ -3774,11 +4215,31 @@ async function uploadFileToFaith(file, suppliedQuestion = null, uploadKind = nul
       setExpression("observing", "Examining your file...");
     }
 
-    // Troubleshooting is a two-stage flow: upload -> diagnosis from the coding
-    // GGUF -> Automatic Fix button. Do not skip diagnosis and edit immediately.
-    if (!isImageUpload && (sessionMode === "troubleshooting" || /\b(?:troubleshoot|troubleshooting|debug|debugging|fix|repair|modify|change|edit)\b/i.test(question))) {
+    // Routing distinction:
+    // - A user who deliberately entered Troubleshooting (or explicitly asks to
+    //   troubleshoot/debug) gets the established diagnosis-first workflow.
+    // - A concrete edit request with an attached file in an ordinary/new chat is
+    //   a direct coder-chat request. It must NOT require a prior diagnosis or a
+    //   previous troubleshooting conversation (e.g. Files-tab handoff).
+    // - Explicit Automatic Fix keeps its dedicated automatic-fix path.
+    const explicitTroubleshootingRequest = /\b(?:troubleshoot|troubleshooting|debug|debugging|diagnos(?:e|is|tic))\b/i.test(question);
+    if (!isImageUpload && isAutomaticFixRequest(question)) {
       sessionMode = "troubleshooting";
-      await runCoderDiagnosis(question);
+      await runCoderTroubleshooting(question, { automaticFix: true });
+      return;
+    }
+    if (!isImageUpload && (sessionMode === "troubleshooting" || explicitTroubleshootingRequest)) {
+      sessionMode = "troubleshooting";
+      troubleshootingDiagnosisReady = false;
+      await runCoderDiagnosis(question || "Please diagnose this uploaded source file and explain the most likely issue and repair.");
+      return;
+    }
+    if (!isImageUpload && isDirectCodeFixRequest(question)) {
+      // Direct attached-file edits are allowed in a fresh conversation. The
+      // upload endpoint has already stored this file as the active coder source.
+      // Use the existing edit pipeline without inventing a diagnosis step.
+      sessionMode = "troubleshooting";
+      await runCoderTroubleshooting(question, { automaticFix: false });
       return;
     }
 
@@ -3996,23 +4457,77 @@ async function runQwenPostEnrichment(messageItem, question, answer, wikimediaPro
   void Promise.allSettled([wikimediaTask, sourcesTask]);
 }
 
+function addTroubleshootingArtifactControls(messageItem, attachment) {
+  if (!messageItem || !attachment || !attachment.url) return;
+  if (messageItem.querySelector(".faith-troubleshooting-artifact-actions")) return;
+
+  const wrap = document.createElement("div");
+  wrap.className = "faith-troubleshooting-artifact-actions";
+  wrap.style.cssText = "display:flex;flex-wrap:wrap;gap:8px;margin-top:12px;align-items:center";
+
+  const button = (label, handler) => {
+    const el = document.createElement("button");
+    el.type = "button";
+    el.textContent = label;
+    el.style.cssText = "border:1px solid #65718a;border-radius:8px;padding:7px 11px;background:#252b3b;color:#f4f6ff;cursor:pointer";
+    el.addEventListener("click", handler);
+    return el;
+  };
+
+  const filename = String(attachment.name || "updated-source.txt");
+  const download = document.createElement("a");
+  download.href = attachment.url;
+  download.download = filename;
+  download.textContent = `Download ${filename}`;
+  download.style.cssText = "border:1px solid #65718a;border-radius:8px;padding:7px 11px;color:inherit;text-decoration:none";
+  wrap.appendChild(download);
+
+  wrap.appendChild(button("Copy code", async (event) => {
+    const control = event.currentTarget;
+    try {
+      const response = await fetch(attachment.url, { cache: "no-store" });
+      if (!response.ok) throw new Error(`HTTP ${response.status}`);
+      const source = await response.text();
+      if (navigator.clipboard && navigator.clipboard.writeText) {
+        await navigator.clipboard.writeText(source);
+      } else {
+        const area = document.createElement("textarea");
+        area.value = source;
+        area.style.cssText = "position:fixed;left:-9999px;top:0";
+        document.body.appendChild(area);
+        area.select();
+        const copied = document.execCommand("copy");
+        area.remove();
+        if (!copied) throw new Error("Clipboard access is unavailable in this browser.");
+      }
+      const previous = control.textContent;
+      control.textContent = "Copied!";
+      setTimeout(() => { if (control.isConnected) control.textContent = previous; }, 1600);
+    } catch (error) {
+      alert(`Could not copy code: ${error.message}`);
+    }
+  }));
+  messageItem.appendChild(wrap);
+}
+
 async function runCoderTroubleshooting(question, options = {}) {
   const automaticFix = !!options.automaticFix || isAutomaticFixRequest(question);
   const reviewOnly = !automaticFix && /\b(?:review|check|inspect|analy[sz]e)\b/i.test(question) &&
     !/\b(?:change|modify|edit|update|fix|repair|correct|patch|refactor|add|remove|replace|implement)\b/i.test(question);
   sessionMode = "troubleshooting";
-  setExpression("troubleshooting", automaticFix ? "Searching for known fixes, then applying them…" : "Getting your requested code changes from Qwen on :8090…");
+  setExpression("troubleshooting", automaticFix ? "Using the completed diagnosis and applying the repair…" : "Getting your requested code changes from Qwen on :8090…");
 
   let faithItem = appendMessage(
     "Faith",
     automaticFix
-      ? "Searching for relevant fixes online, then I’ll send your file to Qwen on :8090 to apply the best fit."
+      ? "The diagnosis is complete. I’m sending the source and diagnosis directly to Qwen on :8090 so it can apply and return the repaired file."
       : (reviewOnly
         ? "Getting response from Qwen code port on :8090… I’m reviewing your file against your instructions."
         : `Getting response from Qwen code port on :8090… I’m applying your requested changes: ${question}`),
     "ai"
   );
   faithItem.classList.add("troubleshooting-pending");
+  if (!reviewOnly) faithItem.classList.add("faith-code-edit-result");
   const updateProgressMessage = (message) => {
     if (answerHasStarted) return;
     const node = faithItem.querySelector(".message-text");
@@ -4051,11 +4566,22 @@ async function runCoderTroubleshooting(question, options = {}) {
     try { event = JSON.parse(line.slice(5).trim()); } catch (_) { return; }
     if (event.type === "status") {
       if (event.phase === "searching") {
-        setExpression("troubleshooting", event.message || "Searching for relevant fixes online…");
-        updateProgressMessage("Searching for relevant fixes online… I’ll move on to Qwen on :8090 as soon as the search finishes.");
+        setExpression("troubleshooting", event.message || "Preparing the repair request…");
+        updateProgressMessage(event.message || "Preparing the repair request…");
+      } else if (event.phase === "generating") {
+        const message = event.message || "The coding model received the request. Waiting for the first generated code…";
+        setExpression("troubleshooting", message);
+        updateProgressMessage(message);
+      } else if (event.phase === "waiting-coder") {
+        // Show server/model startup progress instead of leaving the user on
+        // the previous searching message while the coder process is prepared.
+        const message = event.message || "Preparing the coding model on :8090…";
+        setExpression("troubleshooting", message);
+        updateProgressMessage(message);
       } else if (event.phase === "connecting") {
-        setExpression("troubleshooting", "Getting response from Qwen code port on :8090…");
-        updateProgressMessage("Search step finished. Getting response from Qwen code port on :8090…");
+        const message = event.message || "Search step finished. Getting response from Qwen code port on :8090…";
+        setExpression("troubleshooting", message);
+        updateProgressMessage(message);
       } else if (event.phase === "coding") {
         // Keep the Troubleshooting expression active while code is still being
         // relayed. Restore the original Coding expression only after the full
@@ -4078,14 +4604,18 @@ async function runCoderTroubleshooting(question, options = {}) {
         return;
       }
       if (event.attachment && event.attachment.url) {
-        const link = document.createElement("a");
-        link.href = event.attachment.url;
-        link.target = "_blank";
-        link.rel = "noopener noreferrer";
-        link.textContent = `Open updated file: ${event.attachment.name || "updated source"}`;
-        link.style.display = "inline-block";
-        link.style.marginTop = "8px";
-        faithItem.appendChild(link);
+        // The completed source is already delivered in the chat and the Coding
+        // expression confirms completion. Keep artifact actions/HTML preview,
+        // but omit the redundant “Open updated file” hyperlink.
+        addTroubleshootingArtifactControls(faithItem, event.attachment);
+        if (/\.html?$/i.test(event.attachment.name || "")) {
+          const preview = document.createElement("iframe");
+          preview.src = event.attachment.url;
+          preview.title = `Preview of ${event.attachment.name}`;
+          preview.sandbox = "allow-scripts allow-forms";
+          preview.style.cssText = "display:block;width:100%;height:360px;margin-top:10px;border:1px solid rgba(255,255,255,.18);border-radius:9px;background:white";
+          faithItem.appendChild(preview);
+        }
       }
       // The final Coding expression is set after the entire HTTP stream has
       // been received, not merely when the server emits its done event.
@@ -4106,10 +4636,74 @@ async function runCoderTroubleshooting(question, options = {}) {
   }
   if (buffer.trim()) buffer.split("\n").forEach(consume);
   if (!completed || !answer.trim()) throw new Error("The coding server ended before it returned the updated source file.");
+  // Save the finished message HTML so the source block remains in the chat after
+  // switching threads or reloading Faith, along with its syntax-highlighted DOM.
+  try { faithSaveWorkspace(); } catch (_) {}
   if (!reviewOnly) {
     setExpression("coding", automaticFix ? "Automatic fix complete — updated code fully received" : "Code changes complete — updated code fully received");
   }
   return answer;
+}
+
+function faithIsCodeDownloadPlaceholder(value) {
+  const text = String(value || "").trim();
+  return /^(?:\[[^\]]*(?:\.html?|downloaded|download)[^\]]*\]|(?:the\s+)?(?:\.html?|html)\s+(?:file\s+)?(?:was\s+)?downloaded\.?|download(?:ed)?\s+(?:the\s+)?(?:html|code)\s+file\.?)[.! ]*$/i.test(text);
+}
+
+function faithHasRealCodeBlock(value) {
+  return /```[^\n]*\n[\s\S]+?```/.test(String(value || "")) || /<\/?(?:html|script|style|body|div|main|section|canvas)\b/i.test(String(value || ""));
+}
+
+function addBuildArtifactControls(messageItem, attachment) {
+  if (!messageItem || !attachment || !attachment.url || !/\.html?$/i.test(attachment.name || "")) return;
+  if (messageItem.querySelector(".faith-build-artifact-actions")) return;
+  const wrap = document.createElement("div");
+  wrap.className = "faith-build-artifact-actions";
+  wrap.style.cssText = "display:flex;flex-wrap:wrap;gap:8px;margin-top:12px;align-items:center";
+  const makeButton = (label, action) => {
+    const button = document.createElement("button");
+    button.type = "button";
+    button.textContent = label;
+    button.style.cssText = "border:1px solid #65718a;border-radius:8px;padding:7px 11px;background:#252b3b;color:#f4f6ff;cursor:pointer";
+    button.addEventListener("click", action);
+    return button;
+  };
+  const download = document.createElement("a");
+  download.href = attachment.url;
+  download.download = attachment.name;
+  download.textContent = `Download ${attachment.name}`;
+  download.style.cssText = "border:1px solid #65718a;border-radius:8px;padding:7px 11px;color:inherit;text-decoration:none";
+  wrap.appendChild(download);
+  wrap.appendChild(makeButton("Copy HTML code", async () => {
+    try {
+      const response = await fetch(attachment.url, { cache: "no-store" });
+      if (!response.ok) throw new Error(`HTTP ${response.status}`);
+      const source = await response.text();
+      if (navigator.clipboard && navigator.clipboard.writeText) await navigator.clipboard.writeText(source);
+      else {
+        const area = document.createElement("textarea"); area.value = source; area.style.position = "fixed"; area.style.opacity = "0";
+        document.body.appendChild(area); area.select();
+        const ok = document.execCommand("copy"); area.remove();
+        if (!ok) throw new Error("Clipboard access is unavailable in this browser.");
+      }
+      const button = wrap.querySelector("button");
+      if (button) { const old = button.textContent; button.textContent = "Copied!"; setTimeout(() => { button.textContent = old; }, 1600); }
+    } catch (error) { alert(`Could not copy HTML: ${error.message}`); }
+  }));
+  const previewButton = makeButton("Embed preview", () => {
+    let frame = messageItem.querySelector(".faith-build-html-embed");
+    if (frame) { frame.remove(); previewButton.textContent = "Embed preview"; return; }
+    frame = document.createElement("iframe");
+    frame.className = "faith-build-html-embed";
+    frame.src = attachment.url;
+    frame.title = `Embedded preview of ${attachment.name}`;
+    frame.sandbox = "allow-scripts allow-forms";
+    frame.style.cssText = "display:block;width:100%;height:420px;margin-top:12px;border:1px solid #65718a;border-radius:10px;background:white";
+    messageItem.appendChild(frame);
+    previewButton.textContent = "Hide preview";
+  });
+  wrap.appendChild(previewButton);
+  messageItem.appendChild(wrap);
 }
 
 async function runCoderBuild(question) {
@@ -4166,6 +4760,7 @@ async function runCoderBuild(question) {
   const decoder = new TextDecoder();
   let buffer = "";
   let answer = "";
+  let lastMeaningfulAnswer = "";
   let finished = false;
 
   const paintAnswer = () => {
@@ -4180,6 +4775,7 @@ async function runCoderBuild(question) {
       // The first attempt may already have streamed a generic deflection.
       // The retry starts a fresh answer; never concatenate both attempts.
       answer = "";
+      lastMeaningfulAnswer = "";
       faithItem.classList.add("build-pending");
       const node = faithItem.querySelector(".message-text");
       if (node) node.textContent = event.message || "Retrying with a fresh implementation request…";
@@ -4196,21 +4792,38 @@ async function runCoderBuild(question) {
       const delta = String(event.text || "");
       if (!delta) return;
       answer += delta;
+      if (answer.trim() && !faithIsCodeDownloadPlaceholder(answer) && (!faithIsCodeDownloadPlaceholder(lastMeaningfulAnswer) || answer.length >= lastMeaningfulAnswer.length)) lastMeaningfulAnswer = answer;
       setExpression("build", "Qwen is writing your code…");
       paintAnswer();
       return;
     }
     if (event.type === "text_complete") {
-      if (typeof event.answer === "string") answer = event.answer;
+      if (typeof event.answer === "string" && event.answer.trim()) {
+        const finalAnswer = event.answer;
+        // Some server paths return an artifact/download notice at completion
+        // after streaming the actual source. Never replace that source with a placeholder.
+        const streamedHasCode = faithHasRealCodeBlock(lastMeaningfulAnswer || answer);
+        if (streamedHasCode && (faithIsCodeDownloadPlaceholder(finalAnswer) || !faithHasRealCodeBlock(finalAnswer))) answer = lastMeaningfulAnswer || answer;
+        else answer = finalAnswer;
+      }
       sessionMode = event.session_mode === "idle" ? "idle" : "build";
       paintAnswer();
+      addBuildArtifactControls(faithItem, event.attachment);
+      try { faithSaveWorkspace(); } catch (_) {}
       setExpression(sessionMode === "build" ? "build" : "explanation");
       return;
     }
     if (event.type === "done") {
-      if (typeof event.answer === "string") answer = event.answer;
+      if (typeof event.answer === "string" && event.answer.trim()) {
+        const finalAnswer = event.answer;
+        const streamedHasCode = faithHasRealCodeBlock(lastMeaningfulAnswer || answer);
+        if (streamedHasCode && (faithIsCodeDownloadPlaceholder(finalAnswer) || !faithHasRealCodeBlock(finalAnswer))) answer = lastMeaningfulAnswer || answer;
+        else answer = finalAnswer;
+      }
       sessionMode = event.session_mode === "idle" ? "idle" : "build";
       paintAnswer();
+      addBuildArtifactControls(faithItem, event.attachment);
+      try { faithSaveWorkspace(); } catch (_) {}
       setExpression(sessionMode === "build" ? "build" : "explanation");
       finished = true;
       return;
@@ -4330,10 +4943,12 @@ async function submitQuestion() {
     return;
   }
 
-  // A staged source attachment is sent together with this comment. If this is
-  // a concrete edit request, activate Troubleshooting before the upload returns.
+  // A staged source attachment is sent with the user's actual instructions.
+  // Preserve an explicitly active Troubleshooting session, but do not force a
+  // fresh direct-edit request through diagnosis just because it contains words
+  // like "modify", "change", or "fix". uploadFileToFaith chooses the right path.
   if (pendingCodeFile) {
-    if (isTroubleshootingEntry || sessionMode === "troubleshooting" || isDirectCodeFixRequest(question) || isAutomaticFixRequest(question)) {
+    if (isTroubleshootingEntry || sessionMode === "troubleshooting" || isAutomaticFixRequest(question)) {
       sessionMode = "troubleshooting";
       troubleshootingDiagnosisReady = false;
       setExpression("troubleshooting", "Preparing your source for diagnosis");
