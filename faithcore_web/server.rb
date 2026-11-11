@@ -18,6 +18,9 @@ require "time"
 FAITH_AI_PROVIDER = ENV.fetch("FAITH_AI_PROVIDER", "local").downcase
 FAITH_LOCAL_AI_URL = ENV.fetch("FAITH_LOCAL_AI_URL", "http://127.0.0.1:8080/v1/chat/completions")
 FAITH_LOCAL_AI_MODEL = ENV.fetch("FAITH_LOCAL_AI_MODEL", "local")
+# Dedicated Qwen3 Short Story GGUF server (kept separate from the emotion backend).
+FAITH_STORY_AI_URL = ENV.fetch("FAITH_STORY_AI_URL", "http://127.0.0.1:8072/v1/chat/completions")
+FAITH_STORY_AI_MODEL = ENV.fetch("FAITH_STORY_AI_MODEL", "local-model")
 # Dedicated fine-tuned emotion model; only Psychotic, Sad, and Anger turns use it.
 FAITH_EMOTION_AI_URL = ENV.fetch("FAITH_EMOTION_AI_URL", "http://127.0.0.1:8070/v1/chat/completions")
 FAITH_EMOTION_BRIDGE_URL = ENV.fetch("FAITH_EMOTION_BRIDGE_URL", "http://127.0.0.1:8071")
@@ -87,6 +90,26 @@ $faith_coder_start_mutex = Mutex.new
 FAITH_CHAT_START_BAT = File.join(ROOT, "Test_Qwen2-0_5B-Instruct_Q4_K_M_Win7.bat")
 FAITH_CHAT_STARTUP_TIMEOUT = Integer(ENV.fetch("FAITH_CHAT_STARTUP_TIMEOUT", "240"))
 $faith_chat_start_mutex = Mutex.new
+
+# Qwen3 Story is opt-in: Settings can launch its tested BAT on demand, and
+# writing requests fail quickly with a clear Settings instruction while it is offline.
+FAITH_STORY_START_BAT = File.join(ROOT, "Launch_Qwen3_Story_8072_Logged_1024_GPU_Optimized.bat")
+$faith_story_start_mutex = Mutex.new
+
+def faith_endpoint_health(uri, timeout_seconds: 1)
+  health_uri = URI::HTTP.build(host: uri.host, port: uri.port, path: "/health")
+  http = Net::HTTP.new(health_uri.host, health_uri.port)
+  http.open_timeout = timeout_seconds
+  http.read_timeout = timeout_seconds
+  response = http.get(health_uri.request_uri)
+  response.is_a?(Net::HTTPSuccess)
+rescue StandardError
+  false
+end
+
+def faith_story_health_ready?
+  faith_endpoint_health(URI.parse(FAITH_STORY_AI_URL), timeout_seconds: 1)
+end
 
 def faith_local_health_ready?(uri)
   health_uri = URI::HTTP.build(host: uri.host, port: uri.port, path: "/health")
@@ -449,6 +472,11 @@ emotion_state = lambda do |question|
 
   robotic_terms = /\b(?:ai|a\.i\.|artificial intelligence|machine learning|neural network|neural networks|large language model|language model|llm|robot|robots|robotics|android|automation|algorithm|algorithms|training data|inference|how does .*\b(?:ai|artificial intelligence|robot|machine learning)|how do .*\b(?:robots|ai|artificial intelligence)|what is .*\b(?:ai|artificial intelligence|robot|machine learning))\b/i
   return :robotic if normalized.match?(robotic_terms)
+
+  # Explicit storytelling requests use the dedicated Qwen3 Story server.
+  story_terms = /\b(?:story|short story|tale|fiction|fictional|fairy tale|bedtime story|narrative|chapter|novella|plot twist|plot|character arc|screenplay|script|scene|fanfiction|fan fiction|fantasy adventure|mystery|thriller|horror story|romance story)\b/i
+  story_intent = normalized.match?(/\b(?:write|tell|create|continue|finish|compose|draft|invent|narrate|turn this into|make up)\b/i)
+  return :writing if story_terms.match?(normalized) && story_intent
 
   nil
 end
@@ -2036,7 +2064,7 @@ fix_code_from_active_session = lambda do |user_request|
     stored_name = "#{SecureRandom.hex(8)}-#{safe_name}"
     stored_path = File.join(UPLOAD_DIR, stored_name)
     File.binwrite(stored_path, fixed_code)
-    faith_write_code_file_metadata(stored_path, fixed_filename)
+    faith_write_code_file_metadata(stored_path, fixed_filename, direct_edit: true)
 
     # The fix response is intentionally code-only.  The browser adds the
     # clickable "Open fixed file" link separately, so Faith does not repeat
@@ -2321,6 +2349,167 @@ server = WEBrick::HTTPServer.new(
   Logger: WEBrick::Log.new($stderr, WEBrick::Log::WARN)
 )
 
+# Serve the existing app.js with chat-image actions patched in memory. This keeps
+# Boneless deployments independent of on-disk app.js/index.html edits.
+faith_image_controls_js = lambda do
+  candidates = [File.join(ROOT, "public", "app.js"), File.join(ROOT, "app.js")]
+  asset_path = candidates.find { |path| File.file?(path) }
+  raise "Faith app.js was not found" unless asset_path
+  source = File.read(asset_path, encoding: "UTF-8")
+  download_line = '      figure.appendChild(download);'
+  controls = <<~'JS'
+        figure.appendChild(download);
+        const actions = document.createElement("div"); actions.className = "faith-image-actions";
+        const favorite = document.createElement("button"); favorite.type = "button"; favorite.textContent = "☆ Favorite image"; favorite.title = "Favorite this image";
+        favorite.addEventListener("click", async () => {
+          const entry = faithFindGalleryEntryForImage(stableImageKey, image.original_url || image.url);
+          if (!entry) { alert("This image is still being saved. Try again in a moment."); return; }
+          await faithSetGalleryFavorite(entry.id, !entry.favorite);
+          favorite.textContent = entry.favorite ? "★ Favorited" : "☆ Favorite image";
+        });
+        const remove = document.createElement("button"); remove.type = "button"; remove.className = "danger"; remove.textContent = "Delete image";
+        remove.addEventListener("click", async () => {
+          const entry = faithFindGalleryEntryForImage(stableImageKey, image.original_url || image.url);
+          if (!confirm("Delete only this image from the gallery and this chat? Other images from the same job will remain.")) return;
+          if (entry) await faithDeleteGalleryImage(entry.id); else figure.remove();
+        });
+        actions.append(favorite, remove); figure.appendChild(actions);
+  JS
+  unless source.include?('className = "faith-image-actions"')
+    source.sub!(download_line, controls.rstrip)
+  end
+  helper = <<~'JS'
+    function faithFindGalleryEntryForImage(imageKey, url) {
+      return faithWorkspace.gallery.find(entry => (imageKey && entry.imageKey === imageKey) || (url && (entry.url === url || String(entry.url || "").endsWith(String(url).split("/").pop()))));
+    }
+
+  JS
+  source.sub!('function faithRestoreThreadImages(thread) {', helper + 'function faithRestoreThreadImages(thread) {') unless source.include?('function faithFindGalleryEntryForImage(')
+  # Ensure deletion removes only the selected figure/image, not its whole message.
+  source.gsub!(/  const affected = new Set\(\);\n  holder\.querySelectorAll\("\.message-image, \.message-images img, figure"\)\.forEach\(node => \{.*?\n  return holder\.innerHTML;\n\}/m) do
+    <<~'JS'.rstrip
+      holder.querySelectorAll(".message-image, .message-images img, figure").forEach(node => {
+        const image = node.matches("img") ? node : node.querySelector("img");
+        if (!image) return;
+        const figure = image.closest("figure") || node.closest("figure");
+        const matchesKey = key && (image.dataset.faithImageKey === key || (figure && figure.dataset.faithImageKey === key));
+        const src = image.getAttribute("src") || "";
+        const matchesUrl = url && (src === url || src.endsWith(url) || (image.closest("a") && image.closest("a").getAttribute("href") === url));
+        if (matchesKey || matchesUrl) { if (figure) figure.remove(); else image.remove(); }
+      });
+      holder.querySelectorAll(".message-images").forEach(grid => { if (!grid.querySelector("img, figure")) grid.remove(); });
+      return holder.innerHTML;
+    }
+    JS
+  end
+  # Inject presentation styles and the hover-preview behavior once per page.
+  preview = <<~'JS'
+    ;(function faithInstallChatImageControlsStyleAndPreview(){
+      if (document.getElementById("faith-image-controls-runtime-style")) return;
+      const style=document.createElement("style"); style.id="faith-image-controls-runtime-style";
+      style.textContent='.faith-image-actions{display:flex;gap:8px;flex-wrap:wrap;align-items:center;margin-top:5px}.faith-image-actions button{border:1px solid rgba(255,255,255,.16);border-radius:6px;background:rgba(255,255,255,.055);color:#cbd8ee;padding:4px 7px;font-size:.72rem;cursor:pointer}.faith-image-actions button:hover{background:rgba(255,255,255,.12)}.faith-image-actions button.danger{color:#ffb5b5}.faith-hover-preview{position:fixed;z-index:100000;display:none;pointer-events:none;padding:7px;border:1px solid rgba(190,210,255,.3);border-radius:12px;background:rgba(8,12,22,.78);backdrop-filter:blur(12px);box-shadow:0 14px 44px rgba(0,0,0,.55);max-width:min(72vw,900px);max-height:calc(100vh - 24px)}.faith-hover-preview img{display:block;max-width:100%;max-height:calc(100vh - 40px);width:auto;height:auto;object-fit:contain;border-radius:7px}'; document.head.appendChild(style);
+      let box=null,shot=null,current=null;
+      const ensure=()=>{if(box)return;box=document.createElement("div");box.className="faith-hover-preview";shot=document.createElement("img");box.appendChild(shot);document.body.appendChild(box)};
+      const get=e=>e.target instanceof Element?e.target.closest("#faith-gallery-list img,.message-images img,figure img"):null;
+      const move=e=>{if(!box||!current)return;const r=box.getBoundingClientRect(),pad=14;let x=e.clientX+20,y=e.clientY+18;if(x+r.width>innerWidth-pad)x=e.clientX-r.width-20;if(y+r.height>innerHeight-pad)y=innerHeight-r.height-pad;box.style.left=Math.max(pad,x)+"px";box.style.top=Math.max(pad,y)+"px"};
+      document.addEventListener("mouseover",e=>{const img=get(e);if(!img||img===current||!img.src)return;current=img;ensure();shot.src=img.currentSrc||img.src;box.style.display="block";requestAnimationFrame(()=>move(e))});
+      document.addEventListener("mousemove",e=>{if(current)move(e)});
+      document.addEventListener("mouseout",e=>{if(current&&(e.target===current||(e.target instanceof Element&&e.target.contains(current)))){current=null;if(box)box.style.display="none"}});
+      document.addEventListener("scroll",()=>{current=null;if(box)box.style.display="none"},true);
+    })();
+  JS
+  source << "\n\n#{preview}"
+end
+
+server.mount_proc "/app.js" do |_req, res|
+  begin
+    res.status = 200
+    res["Content-Type"] = "application/javascript; charset=utf-8"
+    res["Cache-Control"] = "no-cache"
+    res.body = faith_image_controls_js.call
+  rescue StandardError => error
+    warn "[Faith app.js] #{error.class}: #{error.message}"
+    res.status = 500
+    res.body = "Could not serve Faith frontend script."
+  end
+end
+
+
+# Resolve the configured GGUF filenames and sizes for the Settings panel.
+# This is metadata-only: it does not load, start, or modify any model server.
+faith_model_file_metadata = lambda do
+  model_dir = File.join(ROOT, "models")
+  files = if File.directory?(model_dir)
+    Dir.glob(File.join(model_dir, "**", "*.gguf"), File::FNM_CASEFOLD).select { |path| File.file?(path) }
+  else
+    []
+  end
+  pick = lambda do |patterns|
+    path = files.find { |candidate| patterns.any? { |pattern| File.basename(candidate).match?(pattern) } }
+    if path
+      bytes = File.size(path) rescue nil
+      { name: File.basename(path), size_bytes: bytes, size: (bytes ? format("%.2f GB", bytes.to_f / (1024**3)) : "unknown"), path: path }
+    else
+      { name: "Not found in ./models", size_bytes: nil, size: "not found" }
+    end
+  end
+  {
+    chat: pick.call([/Qwen.*2.*0[._-]?5B.*Instruct/i, /Qwen.*0[._-]?5B.*Instruct/i]),
+    story: pick.call([/Qwen3.*Short.*Story.*4B/i, /Qwen.*Short.*Story/i]),
+    code: pick.call([/Qwen.*2[._-]?5.*Coder.*0[._-]?5B/i, /Qwen.*Coder.*0[._-]?5B/i]),
+    # The dedicated emotion GGUF is Faith_Emotions_v2_Q4_K_M.gguf.
+    # Resolve its actual file and disk size from ./models just like the other servers.
+    emotion: pick.call([/Faith_Emotions_v2_Q4_K_M/i, /Faith_Emotions/i, /Emotions.*Q4_K_M/i])
+  }
+end
+
+server.mount_proc "/api/model-health" do |req, res|
+  unless req.request_method == "GET"
+    json_response.call(res, 405, { error: "GET required." })
+    next
+  end
+  chat_uri = URI.parse(FAITH_LOCAL_AI_URL)
+  story_uri = URI.parse(FAITH_STORY_AI_URL)
+  emotion_uri = URI.parse(FAITH_EMOTION_BRIDGE_URL)
+  coder_uri = URI.parse(ENV.fetch("FAITH_CODER_AI_URL", "http://127.0.0.1:8090/v1/chat/completions"))
+  model_files = faith_model_file_metadata.call
+  json_response.call(res, 200, {
+    chat: { online: faith_endpoint_health(chat_uri), endpoint: "#{chat_uri.host}:#{chat_uri.port}", model: model_files[:chat] },
+    story: { online: faith_story_health_ready?, endpoint: "#{story_uri.host}:#{story_uri.port}", model: model_files[:story] },
+    emotion: { online: faith_endpoint_health(emotion_uri), endpoint: "#{emotion_uri.host}:#{emotion_uri.port}", model: model_files[:emotion] },
+    code: { online: faith_coder_health_ready?(coder_uri), endpoint: "#{coder_uri.host}:#{coder_uri.port}", model: model_files[:code] }
+  })
+end
+
+server.mount_proc "/api/model-launch/story" do |req, res|
+  unless req.request_method == "POST"
+    json_response.call(res, 405, { error: "POST required." })
+    next
+  end
+  if faith_story_health_ready?
+    json_response.call(res, 200, { ok: true, already_running: true, message: "Qwen3 Story is already online." })
+    next
+  end
+  unless Gem.win_platform?
+    json_response.call(res, 501, { error: "The optional Story launcher is a Windows .bat file and can only be started on Windows." })
+    next
+  end
+  unless File.file?(FAITH_STORY_START_BAT)
+    json_response.call(res, 500, { error: "Qwen3 Story launcher was not found: #{File.basename(FAITH_STORY_START_BAT)}" })
+    next
+  end
+  begin
+    $faith_story_start_mutex.synchronize do
+      unless faith_story_health_ready?
+        pid = Process.spawn("cmd.exe", "/c", "start", "", FAITH_STORY_START_BAT, chdir: ROOT, out: File::NULL, err: File::NULL)
+        Process.detach(pid) rescue nil
+      end
+    end
+    json_response.call(res, 202, { ok: true, message: "Qwen3 Story launcher opened. Faith will wait for the server health check before treating it as ready." })
+  rescue StandardError => error
+    json_response.call(res, 500, { error: "Could not launch Qwen3 Story: #{error.message}" })
+  end
+end
 
 server.mount_proc "/api/vision-status" do |req, res|
   unless req.request_method == "GET"
@@ -2445,7 +2634,7 @@ end
 # browser :4567 -> this Ruby process -> llama-server :8080 -> back to :4567.
 # It does NOT run image search, source research, troubleshooting search, or any
 # other post-processing before returning the answer to the browser.
-direct_qwen_chat = lambda do |question, emotion, on_delta = nil, session_id = "default"|
+direct_qwen_chat = lambda do |question, emotion, on_delta = nil, session_id = "default", on_status = nil|
   emotion_model_turn = [:psychotic, :sad, :anger].include?(emotion)
   if emotion_model_turn
     # All dedicated emotion turns use the same compact, non-streaming GGUF
@@ -2465,22 +2654,45 @@ direct_qwen_chat = lambda do |question, emotion, on_delta = nil, session_id = "d
     return answer
   end
 
-  ensure_faith_chat_server!
+  story_model_turn = emotion == :writing
+  if story_model_turn
+    # Never auto-launch the optional Story model from a writing request.
+    # Settings is the explicit opt-in path; fail fast with a helpful message.
+    unless faith_story_health_ready?
+      raise "Qwen3 Story is offline. Open Settings (gear icon) and press ‘Launch Qwen3 Story’ before sending a writing or story request."
+    end
+    warn "[Faith Story Relay] DIRECT_MODE endpoint=#{FAITH_STORY_AI_URL} startup_polling=disabled"
+    on_status.call("Story server health check passed. Preparing the compact prompt…") if on_status
+  else
+    # Keep the existing regular-chat readiness behavior exactly as it was.
+    ensure_faith_chat_server!
+  end
   # Ordinary chat uses the shortest possible path:
   # browser :4567 -> this Ruby process -> llama-server :8080 -> back to :4567.
   # The llama-server request is STREAMING, so the browser can receive Faith's
   # first tokens as soon as Qwen produces them instead of waiting for the
   # complete answer.
   started_at = Time.now
-  active_ai_url = emotion_model_turn ? FAITH_EMOTION_AI_URL : FAITH_LOCAL_AI_URL
+  active_ai_url = if story_model_turn
+                    FAITH_STORY_AI_URL
+                  elsif emotion_model_turn
+                    FAITH_EMOTION_AI_URL
+                  else
+                    FAITH_LOCAL_AI_URL
+                  end
   uri = URI.parse(active_ai_url)
   model_id = if emotion_model_turn
                ENV.fetch("FAITH_EMOTION_AI_MODEL", "local").to_s.strip
+             elsif story_model_turn
+               FAITH_STORY_AI_MODEL.to_s.strip
              else
                ENV.fetch("FAITH_LOCAL_AI_MODEL", "").to_s.strip
              end
 
-  if model_id.empty? || model_id == "local"
+  # The standalone benchmark sends the literal OpenAI-compatible model id.
+  # Keep the Story request identical and avoid an extra /v1/models lookup.
+  model_id = "local-model" if story_model_turn
+  if !story_model_turn && (model_id.empty? || model_id == "local")
     models_uri = URI.parse("http://#{uri.host}:#{uri.port}/v1/models")
     models_http = Net::HTTP.new(models_uri.host, models_uri.port)
     models_http.open_timeout = 3
@@ -2500,39 +2712,100 @@ direct_qwen_chat = lambda do |question, emotion, on_delta = nil, session_id = "d
                    else "Be helpful and natural."
                    end
 
+  # Story's upstream payload intentionally matches the successful standalone
+  # PowerShell benchmark byte-for-byte in configuration: fixed model id,
+  # compact baseline system message, one user message, streaming, 512 tokens,
+  # temperature 0.2, and no additional sampling parameters. Faith still keeps
+  # its own per-conversation history below for UI/session continuity; old turns
+  # are not sent to the benchmarked Story model request.
   session_key = session_id.to_s.gsub(/[^a-zA-Z0-9_-]/, "")[0, 100]
   session_key = "default" if session_key.empty?
-  session_system = { role: "system", content: emotion_model_turn ? "#{SYSTEM_PROMPT}\n\n#{emotional_hint}" : "You are Faith, a helpful local assistant. #{emotional_hint}" }
+  session_key = "story_#{session_key}" if story_model_turn
+  session_system = if story_model_turn
+                     { role: "system", content: "You are testing a local language model. Reply briefly and directly." }
+                   elsif emotion_model_turn
+                     { role: "system", content: "#{SYSTEM_PROMPT}\n\n#{emotional_hint}" }
+                   else
+                     { role: "system", content: "You are Faith, a helpful local assistant. #{emotional_hint}" }
+                   end
   prior_turns = faith_qwen_sessions_mutex.synchronize do
     (faith_qwen_sessions[session_key] || []).map(&:dup)
   end
+  prior_turns = [] if story_model_turn
   payload = {
     model: model_id,
     messages: [session_system] + prior_turns + [{ role: "user", content: question.to_s }],
     stream: true,
-    max_tokens: 384,
-    temperature: 0.7
+    max_tokens: (story_model_turn ? 512 : 384),
+    temperature: (story_model_turn ? 0.2 : 0.7)
   }
 
-  http = Net::HTTP.new(uri.host, uri.port)
-  http.open_timeout = 15
-  http.read_timeout = 300
-  http.write_timeout = 30 if http.respond_to?(:write_timeout=)
+  http = story_model_turn ? Net::HTTP.new(uri.host, uri.port, nil) : Net::HTTP.new(uri.host, uri.port)
+  # Story-only transport tuning: avoid automatic request retries and reduce
+  # keep-alive waiting so completed SSE streams are returned to Faith promptly.
+  # Normal Qwen chat keeps its previous transport behavior untouched.
+  if story_model_turn
+    http.max_retries = 0 if http.respond_to?(:max_retries=)
+    http.keep_alive_timeout = 1 if http.respond_to?(:keep_alive_timeout=)
+  end
+  # Mirror the successful standalone BAT test: the Story completion request
+  # has no timeout. This setting is isolated to :8072; regular chat keeps its
+  # original 15s/300s/30s limits.
+  http.open_timeout = story_model_turn ? nil : 15
+  http.read_timeout = story_model_turn ? nil : 300
+  http.write_timeout = story_model_turn ? nil : 30 if http.respond_to?(:write_timeout=)
 
   request = Net::HTTP::Post.new(uri.request_uri)
-  request["Content-Type"] = "application/json"
+  request["Content-Type"] = story_model_turn ? "application/json; charset=utf-8" : "application/json"
   request["Accept"] = "text/event-stream"
+  request["Accept-Encoding"] = "identity" if story_model_turn
   request["Connection"] = "keep-alive"
   request.body = JSON.generate(payload)
+  on_status.call("Prompt request sent to Qwen3 Story on :8072. Waiting for response headers…") if story_model_turn && on_status
 
   answer_parts = []
   parse_buffer = +""
+  story_started_mono = Process.clock_gettime(Process::CLOCK_MONOTONIC)
+  story_first_token_mono = nil
+  story_delta_count = 0
+  story_output_bytes = 0
 
-  warn "[Faith Relay] STREAM SEND :4567 -> #{active_ai_url} model=#{model_id.inspect} emotion=#{emotion.inspect} question=#{question.inspect}"
+  if story_model_turn
+    warn "[Faith Story Relay] BENCHMARK_MATCH endpoint=#{active_ai_url} model=#{model_id.inspect} prompt_chars=#{question.to_s.length} prompt_bytes=#{question.to_s.bytesize} request_bytes=#{request.body.bytesize} messages=#{payload[:messages].length} max_tokens=#{payload[:max_tokens]} temperature=#{payload[:temperature]} stream=true extra_sampling_parameters=none proxy=disabled timeout=disabled"
+  end
+  warn "[Faith Relay] STREAM SEND :4567 -> #{active_ai_url} model=#{model_id.inspect} emotion=#{emotion.inspect} story=#{story_model_turn} question=#{question.inspect}"
 
   response = nil
-  http.request(request) do |stream_response|
+  story_stream_done = false
+  story_text_value = lambda do |value|
+    case value
+    when String
+      value
+    when Array
+      value.map do |part|
+        if part.is_a?(Hash)
+          (part["text"] || part["content"] || "").to_s
+        else
+          part.to_s
+        end
+      end.join
+    when Hash
+      (value["text"] || value["content"] || "").to_s
+    else
+      ""
+    end
+  end
+  warn "[Faith Story Relay] HTTP_REQUEST_START method=POST endpoint=#{active_ai_url} request_bytes=#{request.body.bytesize}" if story_model_turn
+  # Throwing out of Net::HTTP at [DONE] closes a keep-alive stream promptly.
+  # A plain `break` from read_body returns from that block but may leave
+  # Net::HTTP waiting for the upstream connection to close.
+  catch(:faith_story_stream_done) do
+    http.request(request) do |stream_response|
     response = stream_response
+    if story_model_turn
+      warn "[Faith Story Relay] RESPONSE_HEADERS status=#{stream_response.code} endpoint=#{active_ai_url} content_type=#{stream_response['content-type'].to_s.inspect}"
+      on_status.call("Qwen3 Story accepted the prompt. Waiting for the first generated text…") if on_status
+    end
 
     unless stream_response.is_a?(Net::HTTPSuccess)
       body = +""
@@ -2551,25 +2824,113 @@ direct_qwen_chat = lambda do |question, emotion, on_delta = nil, session_id = "d
         next unless line.start_with?("data:")
 
         data_text = line.sub(/\Adata:\s*/, "")
-        break if data_text == "[DONE]"
+        if data_text == "[DONE]"
+          if story_model_turn
+            story_stream_done = true
+            parse_buffer.clear
+            break
+          end
+          break
+        end
 
         begin
           event = JSON.parse(data_text)
-          delta = event.dig("choices", 0, "delta", "content").to_s
-          delta = event.dig("choices", 0, "message", "content").to_s if delta.empty?
-          next if delta.empty?
+          delta = ""
+          if story_model_turn
+            # Match the common OpenAI-compatible stream shapes while also
+            # honoring finish_reason. Some llama-server builds emit finish_reason
+            # before [DONE], then keep the HTTP stream open briefly. Stop reading
+            # immediately after forwarding that final event instead of waiting
+            # for the optional [DONE] marker or socket close.
+            if event.is_a?(Hash)
+              choice = event.dig("choices", 0) if event["choices"].is_a?(Array)
+              if choice.is_a?(Hash)
+                delta = story_text_value.call(choice.dig("delta", "content")) if choice["delta"].is_a?(Hash)
+                delta = story_text_value.call(choice.dig("message", "content")) if delta.empty? && choice["message"].is_a?(Hash)
+                delta = story_text_value.call(choice["text"]) if delta.empty? && choice.key?("text")
+                story_stream_done = true if choice["finish_reason"] && !choice["finish_reason"].to_s.empty?
+              end
+              delta = story_text_value.call(event["output_text"]) if delta.empty? && event.key?("output_text")
+              delta = story_text_value.call(event["answer"] || event["result"]) if delta.empty? && (event.key?("answer") || event.key?("result"))
+              if delta.empty? && event["error"]
+                raise "Qwen Story stream error: #{event['error'].is_a?(String) ? event['error'] : JSON.generate(event['error'])}"
+              end
+            end
+          else
+            delta = event.dig("choices", 0, "delta", "content").to_s
+            delta = event.dig("choices", 0, "message", "content").to_s if delta.empty?
+          end
+          if delta.empty?
+            break if story_model_turn && story_stream_done
+            next
+          end
 
           answer_parts << delta
+          if story_model_turn
+            now_mono = Process.clock_gettime(Process::CLOCK_MONOTONIC)
+            unless story_first_token_mono
+              story_first_token_mono = now_mono
+              on_status.call("Qwen3 Story is generating text…") if on_status
+            end
+            story_delta_count += 1
+            story_output_bytes += delta.bytesize
+            if story_delta_count == 1 || (story_delta_count % 32).zero?
+              first_seconds = story_first_token_mono - story_started_mono
+              elapsed_seconds = now_mono - story_started_mono
+              warn "[Faith Story Relay] TOKEN_PROGRESS deltas=#{story_delta_count} output_bytes=#{story_output_bytes} first_token_seconds=#{format('%.2f', first_seconds)} elapsed_seconds=#{format('%.2f', elapsed_seconds)}"
+            end
+          end
           on_delta.call(delta) if on_delta
+          # The finish_reason event can contain the final delta itself; forward
+          # it first, then leave the upstream stream without an extra read.
+          break if story_model_turn && story_stream_done
         rescue JSON::ParserError
-          # A partial/non-JSON SSE line is ignored; llama-server will continue
-          # sending the remaining stream. This keeps the browser connection alive.
+          # Ignore malformed event lines and continue, as in the test BAT.
+        end
+      end
+      # Stop immediately at [DONE] or finish_reason, even if the upstream
+      # server keeps the HTTP connection alive for a final bookkeeping event.
+      throw :faith_story_stream_done if story_model_turn && story_stream_done
+    end
+    end
+  end
+
+  # Some llama-server builds end the last SSE data line without a newline.
+  # Process that buffered final event for Story only, preserving regular chat.
+  if story_model_turn && !parse_buffer.strip.empty?
+    final_line = parse_buffer.strip
+    if final_line.start_with?("data:")
+      final_data = final_line.sub(/\Adata:\s*/, "")
+      unless final_data == "[DONE]"
+        begin
+          final_event = JSON.parse(final_data)
+          final_choice = final_event.dig("choices", 0) if final_event.is_a?(Hash) && final_event["choices"].is_a?(Array)
+          final_value = if final_choice.is_a?(Hash)
+            final_choice.dig("delta", "content") || final_choice.dig("message", "content") || final_choice["text"]
+          elsif final_event.is_a?(Hash)
+            final_event["output_text"] || final_event["answer"] || final_event["result"]
+          end
+          final_delta = story_text_value.call(final_value)
+          unless final_delta.empty?
+            answer_parts << final_delta
+            on_delta.call(final_delta) if on_delta
+            story_delta_count += 1
+            story_output_bytes += final_delta.bytesize
+          end
+        rescue JSON::ParserError
+          warn "[Faith Story Relay] FINAL_SSE_LINE_PARSE_FAILED bytes=#{final_line.bytesize}"
         end
       end
     end
   end
 
   answer = answer_parts.join.gsub(/!\[[^\]]*\]\([^)]*\)/, "").gsub(/\n{3,}/, "\n\n").strip
+  on_status.call("Story generation complete. Returning the finished text to Faith…") if story_model_turn && on_status
+  if story_model_turn
+    total_seconds = Process.clock_gettime(Process::CLOCK_MONOTONIC) - story_started_mono
+    first_seconds = story_first_token_mono ? format('%.2f', story_first_token_mono - story_started_mono) : 'none'
+    warn "[Faith Story Relay] UPSTREAM_STREAM_ENDED status=#{response&.code} elapsed_seconds=#{format('%.2f', total_seconds)} first_token_seconds=#{first_seconds} deltas=#{story_delta_count} output_bytes=#{story_output_bytes} answer_chars=#{answer.length}"
+  end
   raise "Qwen returned an empty streamed response." if answer.empty?
 
   elapsed = ((Time.now - started_at) * 1000).round
@@ -2649,6 +3010,7 @@ server.mount_proc "/api/qwen-chat" do |req, res|
     raise "Empty question." if question.empty?
     qwen_session_id = payload["session_id"].to_s
     qwen_session_id = "default" if qwen_session_id.empty?
+    story_mode = payload["story_mode"] == true
 
     erotic_capability_question = emotion_state.call(question) == :erotic
     if !erotic_capability_question && (special_image_phrase.call(question) || generate_image_request.call(question))
@@ -2660,8 +3022,8 @@ server.mount_proc "/api/qwen-chat" do |req, res|
       next
     end
 
-    emotion = emotion_state.call(question)
-    if [:psychotic, :sad, :anger].include?(emotion)
+    emotion = story_mode ? :writing : emotion_state.call(question)
+    if !story_mode && [:psychotic, :sad, :anger].include?(emotion)
       json_response.call(res, 409, {
         error: "This trigger belongs to Faith's dedicated emotion endpoint.",
         special_request: true,
@@ -2677,21 +3039,33 @@ server.mount_proc "/api/qwen-chat" do |req, res|
     # the user sees anything.
     res.status = 200
     res["Content-Type"] = "text/event-stream; charset=utf-8"
-    res["Cache-Control"] = "no-cache, no-store, must-revalidate"
+    # Keep Story deltas from being buffered or transformed by HTTP middleware
+    # or reverse proxies. Preserve the existing normal-chat response headers.
+    res["Cache-Control"] = story_mode ? "no-cache, no-store, must-revalidate, no-transform" : "no-cache, no-store, must-revalidate"
     res["Pragma"] = "no-cache"
     res["Connection"] = "keep-alive"
+    res["Content-Encoding"] = "identity" if story_mode
     res["X-Accel-Buffering"] = "no"
     res["X-Faith-Server-Version"] = FAITH_SERVER_VERSION
     res["X-Faith-Qwen-Relay"] = "direct-stream"
     res.chunked = true
 
     res.body = proc do |out|
+      stream_write_mutex = Mutex.new
       write_event = lambda do |event|
-        out.write("data: #{JSON.generate(event)}\n\n")
+        encoded = "data: #{JSON.generate(event)}\n\n"
+        stream_write_mutex.synchronize do
+          out.write(encoded)
+          out.flush if out.respond_to?(:flush)
+        end
       end
-
       begin
-        if [:psychotic, :sad, :anger].include?(emotion)
+        if story_mode
+          # Story server is intentionally not launched or polled here. The
+          # standalone live-stream BAT already proved :8072 works when running;
+          # dispatch the actual prompt directly and stream the result.
+          warn "[Faith Story Relay] REQUEST_DISPATCHED_DIRECT endpoint=#{FAITH_STORY_AI_URL} model=#{FAITH_STORY_AI_MODEL.inspect} max_tokens=#{ENV.fetch('FAITH_STORY_MAX_TOKENS', '512')}"
+        elsif [:psychotic, :sad, :anger].include?(emotion)
           write_event.call({ type: "status", message: "Checking Faith's direct GGUF tester bridge before sending your request…" })
           ensure_faith_emotion_server!(on_status: lambda do |message|
             write_event.call({ type: "status", phase: "waiting-emotion-model", message: message })
@@ -2711,13 +3085,32 @@ server.mount_proc "/api/qwen-chat" do |req, res|
         else
           answer = direct_qwen_chat.call(question, emotion, lambda do |delta|
             write_event.call({ type: "delta", text: delta })
-          end, qwen_session_id)
+          end, qwen_session_id, lambda do |message|
+            if story_mode
+              stage = if message.start_with?("Story server health check")
+                "story-health-ready"
+              elsif message.start_with?("Prompt request sent")
+                "prompt-sent"
+              elsif message.start_with?("Qwen3 Story accepted")
+                "awaiting-first-token"
+              elsif message.start_with?("Qwen3 Story is generating")
+                "story-generating"
+              elsif message.start_with?("Story generation complete")
+                "story-complete"
+              elsif message.start_with?("POST /v1/chat/completions")
+                "awaiting-story-response"
+              else
+                "story-relay"
+              end
+              write_event.call({ type: "status", phase: stage, message: message })
+            end
+          end)
         end
 
         # The complete text is available now. Send this event BEFORE any
         # Wikimedia/source post-processing so the browser can finalize the
         # visible Faith message immediately even if post-processing is slower.
-        expression = (emotion || (greeting_question.call(question) ? :greeting : :explanation)).to_s
+        expression = story_mode ? "writing" : (emotion || (greeting_question.call(question) ? :greeting : :explanation)).to_s
         write_event.call({
           type: "text_complete",
           answer: answer,
@@ -2741,7 +3134,7 @@ server.mount_proc "/api/qwen-chat" do |req, res|
           image_mode: "none",
           image_generation_available: false,
           image_request: false,
-          post_enrichment: true,
+          post_enrichment: !story_mode,
           source_research_job_id: nil,
           source_research_status: "none"
         })
@@ -2751,7 +3144,7 @@ server.mount_proc "/api/qwen-chat" do |req, res|
           type: "error",
           error: "Faith could not get a response from local Qwen.",
           detail: error.message,
-          backend: FAITH_LOCAL_AI_URL
+          backend: (story_mode ? FAITH_STORY_AI_URL : FAITH_LOCAL_AI_URL)
         })
       end
     end
@@ -2762,7 +3155,7 @@ server.mount_proc "/api/qwen-chat" do |req, res|
     json_response.call(res, 503, {
       error: "Faith could not get a response from local Qwen.",
       detail: error.message,
-      backend: FAITH_LOCAL_AI_URL
+      backend: (story_mode ? FAITH_STORY_AI_URL : FAITH_LOCAL_AI_URL)
     })
   end
 end
@@ -3366,7 +3759,7 @@ server.mount_proc "/api/chat" do |req, res|
         warn "[Faith Qwen Relay] ERROR: #{error.class}: #{error.message}"
         res["X-Faith-Server-Version"] = FAITH_SERVER_VERSION
         res["X-Faith-Qwen-Relay"] = "direct"
-        json_response.call(res, 503, { error: "Faith could not get a response from local Qwen.", detail: error.message, backend: FAITH_LOCAL_AI_URL })
+        json_response.call(res, 503, { error: "Faith could not get a response from local Qwen.", detail: error.message, backend: (story_mode ? FAITH_STORY_AI_URL : FAITH_LOCAL_AI_URL) })
       end
       next
     end
@@ -4541,7 +4934,7 @@ coder_edit_handler = proc do |req, res|
       ensure
         FileUtils.rm_f(temp_path)
       end
-      faith_write_code_file_metadata(stored_path, output_filename)
+      faith_write_code_file_metadata(stored_path, output_filename, direct_edit: true)
       mutex.synchronize do
         latest_code_filename = output_filename
         latest_code_stored_name = stored_name
@@ -4791,15 +5184,30 @@ end
 
 # Coding artifact sidecar metadata. The actual source file remains the primary artifact;
 # the JSON sidecar is optional metadata and must never be required for deletion.
-def faith_write_code_file_metadata(stored_path, original_filename)
+def faith_write_code_file_metadata(stored_path, original_filename, direct_edit: false)
   stat = File.stat(stored_path)
-  meta = {
+  meta_path = stored_path + ".json"
+  prior_meta = File.file?(meta_path) ? (JSON.parse(File.read(meta_path, encoding: "UTF-8")) rescue {}) : {}
+  created_ms = prior_meta["created_at"].to_i
+  if created_ms <= 0
+    begin
+      created_ms = (stat.birthtime.to_f * 1000).to_i
+    rescue StandardError
+      created_ms = (stat.ctime.to_f * 1000).to_i
+    end
+  end
+  # Creation and edit timestamps are separate application metadata. Filesystem
+  # mtime is deliberately NOT used as proof of an edit: copies, extraction,
+  # uploads and metadata refreshes can change it without a confirmed source edit.
+  meta = prior_meta.merge(
     "kind" => "faith_code_file",
     "filename" => File.basename(original_filename.to_s),
     "stored_name" => File.basename(stored_path),
     "size" => stat.size,
-    "updated_at" => (stat.mtime.to_f * 1000).to_i
-  }
+    "created_at" => created_ms
+  )
+  meta["updated_at"] = (Time.now.to_f * 1000).to_i if direct_edit
+  # Keep an existing edit timestamp unless a new confirmed direct edit occurred.
   File.write(stored_path + ".json", JSON.pretty_generate(meta), mode: "w:utf-8")
 rescue StandardError => error
   # Metadata failure must not make a successfully written code artifact unusable.
@@ -4828,7 +5236,16 @@ server.mount_proc "/api/code-files" do |req, res|
       # Metadata is advisory: filenames and sizes always fall back to the real file.
       display_name = meta["filename"].to_s
       display_name = original if display_name.empty?
-      { name: display_name, stored_name: stored_name, url: "/uploads/#{URI.encode_www_form_component(stored_name)}", size: stat.size, updated_at: (stat.mtime.to_f * 1000).to_i }
+      created_ms = meta["created_at"].to_i
+      if created_ms <= 0
+        begin
+          created_ms = (stat.birthtime.to_f * 1000).to_i
+        rescue StandardError
+          created_ms = (stat.ctime.to_f * 1000).to_i
+        end
+      end
+      updated_ms = meta["updated_at"].to_i
+      { name: display_name, stored_name: stored_name, url: "/uploads/#{URI.encode_www_form_component(stored_name)}", size: stat.size, created_at: created_ms, updated_at: updated_ms }
     rescue StandardError
       nil
     end
@@ -4868,8 +5285,9 @@ server.mount_proc "/api/code-files" do |req, res|
             meta = File.file?(meta_path) ? (JSON.parse(File.read(meta_path, encoding: "UTF-8")) rescue {}) : {}
             display_name = meta["filename"].to_s
             display_name = original if display_name.empty?
-            faith_write_code_file_metadata(path, display_name)
-            json_response.call(res, 200, { ok: true, stored_name: stored_name, filename: display_name, size: File.size(path), updated_at: (File.mtime(path).to_f * 1000).to_i })
+            faith_write_code_file_metadata(path, display_name, direct_edit: true)
+            saved_meta = File.file?(path + ".json") ? (JSON.parse(File.read(path + ".json", encoding: "UTF-8")) rescue {}) : {}
+            json_response.call(res, 200, { ok: true, stored_name: stored_name, filename: display_name, size: File.size(path), updated_at: saved_meta["updated_at"] })
           ensure
             FileUtils.rm_f(temp_path)
           end
@@ -4887,7 +5305,7 @@ server.mount_proc "/api/code-files" do |req, res|
           meta = File.file?(meta_path) ? (JSON.parse(File.read(meta_path, encoding: "UTF-8")) rescue {}) : {}
           meta["filename"] = new_filename
           File.write(meta_path, JSON.pretty_generate(meta), mode: "w:utf-8")
-          json_response.call(res, 200, { ok: true, stored_name: stored_name, filename: new_filename, size: File.size(path), updated_at: (File.mtime(path).to_f * 1000).to_i })
+          json_response.call(res, 200, { ok: true, stored_name: stored_name, filename: new_filename, size: File.size(path), updated_at: meta["updated_at"] })
         end
       elsif req.request_method == "POST" && action == "delete"
         # Use POST for deletion so browsers/proxies that reject DELETE requests
