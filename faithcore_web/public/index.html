@@ -17,7 +17,35 @@
       color: #eef3ff; display: flex; flex-direction: column; gap: 12px;
     }
     .faith-sidebar-brand { font-size: 1.05rem; letter-spacing: .14em; font-weight: 800; padding: 4px 8px; }
-    .faith-sidebar-tabs { display: flex; gap: 6px; flex-wrap: wrap; }
+    .faith-sidebar-tabs { display: flex; gap: 6px; flex-wrap: wrap; align-items:center; }
+    .faith-sidebar-tabs button { white-space:nowrap; }
+    #faith-sidebar-settings {
+      position:relative; isolation:isolate;
+      width:38px; min-width:38px; height:38px; box-sizing:border-box;
+      display:inline-flex; align-items:center; justify-content:center; padding:0;
+      color:#b8bec8; border:1px solid rgba(160,170,185,.22); border-radius:10px;
+      background:rgba(255,255,255,.035);
+      box-shadow:inset 0 1px 0 rgba(255,255,255,.035);
+      transition:color .16s ease,border-color .16s ease,background .16s ease,transform .16s ease;
+      cursor:pointer;
+    }
+    #faith-sidebar-settings svg { width:22px; height:22px; display:block; overflow:visible; transition:transform .16s ease; }
+    #faith-sidebar-settings:hover { color:#e0e3e8; border-color:rgba(185,195,210,.42); background:rgba(255,255,255,.075); }
+    #faith-sidebar-settings:hover svg { transform:translateY(-1px); }
+    #faith-sidebar-settings:active { transform:scale(.96); }
+    #faith-sidebar-settings:focus-visible { outline:2px solid #9ca3af; outline-offset:3px; }
+    #faith-sidebar-settings[aria-pressed="true"] { color:#f0f2f5; border-color:rgba(185,195,210,.48); background:rgba(255,255,255,.09); }
+    .faith-setting-card { margin:8px 0; padding:12px; border:1px solid rgba(140,160,200,.18); border-radius:11px; background:rgba(255,255,255,.025); }
+    .faith-setting-title { font-weight:700; margin-bottom:5px; }
+    .faith-setting-meta { color:#9eacc3; font-size:.8rem; overflow-wrap:anywhere; }
+    #faith-model-story-name { color:#c7d0df; font-weight:600; margin-top:3px; }
+    #faith-model-story-size { color:#e3e7ee; font-weight:700; margin:3px 0 7px; }
+    .faith-health-line { display:flex; gap:8px; align-items:center; margin:8px 0; font-size:.88rem; }
+    .faith-health-dot { width:9px; height:9px; flex:0 0 9px; border-radius:50%; background:#8792a5; box-shadow:0 0 8px currentColor; }
+    .faith-health-dot.online { background:#39d98a; color:#39d98a; }
+    .faith-health-dot.offline { background:#ff5d68; color:#ff5d68; }
+    #faith-story-launch { width:100%; margin-top:10px; text-align:center; background:rgba(0,229,255,.09); border-color:rgba(0,229,255,.35); }
+    #faith-story-launch:disabled { opacity:.65; cursor:wait; }
     .faith-files-list { display:flex; flex-direction:column; gap:7px; margin-top:8px; }
     /* Keep the Coding/Files menu scrollable without displaying a mismatched
        native scrollbar beside its compact panel. */
@@ -159,6 +187,12 @@
     @keyframes faith-tendril-drift-4 { 0%,100% { transform: rotate(-17deg) skewX(-10deg) scaleY(.86); } 26% { transform: rotate(24deg) skewX(16deg) scaleY(1.12); } 57% { transform: rotate(-9deg) skewX(-20deg) scaleY(.93); } 79% { transform: rotate(19deg) skewX(7deg) scaleY(1.08); } }
     .faith-mic-glow.faith-mic-listening { border-color: #ee65d8 !important; box-shadow: 0 0 12px rgba(238,101,216,.72), 0 0 20px rgba(0,234,255,.4) !important; }
     .faith-gallery-download, .faith-image-download { display: inline-block; margin-top: 6px; font-size: .76rem; color: #9dbbff; text-decoration: none; }
+    .faith-hover-preview { position:fixed; z-index:100000; display:none; pointer-events:none; padding:7px; border:1px solid rgba(190,210,255,.3); border-radius:12px; background:rgba(8,12,22,.78); backdrop-filter:blur(12px); box-shadow:0 14px 44px rgba(0,0,0,.55); max-width:min( min(72vw, 900px), calc(100vw - 24px)); max-height:calc(100vh - 24px); }
+    .faith-hover-preview img { display:block; max-width:100%; max-height:calc(100vh - 40px); width:auto; height:auto; object-fit:contain; border-radius:7px; }
+    .faith-image-actions { display:flex; gap:9px; flex-wrap:wrap; align-items:center; margin-top:5px; }
+    .faith-image-actions button { border:1px solid rgba(255,255,255,.16); border-radius:6px; background:rgba(255,255,255,.055); color:#cbd8ee; padding:4px 7px; font-size:.72rem; cursor:pointer; }
+    .faith-image-actions button:hover { background:rgba(255,255,255,.12); }
+    .faith-image-actions button.danger { color:#ffb5b5; }
     .faith-gallery-missing { font-size: .7rem; color: #9ba7bd; padding: 12px 3px; }
     .faith-danger-button { width: 100%; color: #ffb5b5 !important; border-color: rgba(255,95,95,.25) !important; font-size: .78rem !important; }
     .faith-context-hint { text-transform: none; letter-spacing: 0; opacity: .65; }
@@ -647,6 +681,7 @@
       <button id="faith-sidebar-gallery" type="button">Gallery</button>
       <button id="faith-sidebar-files" type="button">Files</button>
       <button id="faith-sidebar-studio" type="button">Studio</button>
+      <button id="faith-sidebar-settings" type="button" aria-label="Llama servers" title="Llama servers" aria-pressed="false"><svg viewBox="0 0 24 24" aria-hidden="true" fill="none" xmlns="http://www.w3.org/2000/svg"><rect x="4" y="3.5" width="16" height="5" rx="1.3" stroke="currentColor" stroke-width="1.6"/><rect x="4" y="9.5" width="16" height="5" rx="1.3" stroke="currentColor" stroke-width="1.6"/><rect x="4" y="15.5" width="16" height="5" rx="1.3" stroke="currentColor" stroke-width="1.6"/><circle cx="7.5" cy="6" r=".8" fill="currentColor"/><circle cx="7.5" cy="12" r=".8" fill="currentColor"/><circle cx="7.5" cy="18" r=".8" fill="currentColor"/><path d="M10 6h6M10 12h6M10 18h6" stroke="currentColor" stroke-width="1.3" stroke-linecap="round"/></svg></button>
     </div>
     <div id="faith-chats-panel">
       <button id="faith-new-chat" type="button">＋ New chat</button>
@@ -667,6 +702,42 @@
       <button id="faith-files-refresh" type="button">↻ Refresh files</button>
       <div id="faith-files-storage" class="faith-gallery-storage" aria-live="polite">Loading coding files…</div>
       <div id="faith-files-list" class="faith-files-list"></div>
+    </div>
+    <div id="faith-settings-panel" hidden aria-label="Settings">
+      <div class="faith-sidebar-heading">Llama servers</div>
+      <p class="faith-setting-meta">Live health checks for Faith's configured local language-model servers. Green means the server answered its /health endpoint.</p>
+      <div class="faith-setting-card">
+        <div class="faith-setting-title">Regular chat</div>
+        <div class="faith-setting-meta" id="faith-model-chat-name">Model: loading technical name…</div>
+        <div class="faith-setting-meta" id="faith-model-chat-size">GGUF size: checking…</div>
+        <div class="faith-health-line"><span id="faith-health-chat-dot" class="faith-health-dot"></span><span id="faith-health-chat-label">Checking :8080…</span></div>
+        <div class="faith-setting-meta">Port 8080 · launched automatically by Faith when needed</div>
+      </div>
+      <div class="faith-setting-card">
+        <div class="faith-setting-title">Qwen3 Story · optional</div>
+        <div class="faith-setting-meta" id="faith-model-story-name">Model: loading technical name…</div>
+        <div class="faith-setting-meta" id="faith-model-story-size">GGUF size: checking…</div>
+        <div class="faith-health-line"><span id="faith-health-story-dot" class="faith-health-dot"></span><span id="faith-health-story-label">Checking :8072…</span></div>
+        <div class="faith-setting-meta">Port 8072 · only starts when you opt in below. Writing/story requests require this server to be running.</div>
+        <button id="faith-story-launch" type="button">▶ Launch Qwen3 Story</button>
+        <div id="faith-story-launch-note" class="faith-setting-meta" aria-live="polite">Story model stays off until you launch it.</div>
+      </div>
+      <div class="faith-setting-card">
+        <div class="faith-setting-title">Emotion bridge</div>
+        <div class="faith-setting-meta" id="faith-model-emotion-name">Model: configured emotion backend</div>
+        <div class="faith-setting-meta" id="faith-model-emotion-size">GGUF size: not reported by this bridge</div>
+        <div class="faith-health-line"><span id="faith-health-emotion-dot" class="faith-health-dot"></span><span id="faith-health-emotion-label">Checking :8071…</span></div>
+        <div class="faith-setting-meta">Local emotion bridge · port 8071</div>
+      </div>
+      <div class="faith-setting-card">
+        <div class="faith-setting-title">Code server</div>
+        <div class="faith-setting-meta" id="faith-model-code-name">Model: loading technical name…</div>
+        <div class="faith-setting-meta" id="faith-model-code-size">GGUF size: checking…</div>
+        <div class="faith-health-line"><span id="faith-health-code-dot" class="faith-health-dot"></span><span id="faith-health-code-label">Checking :8090…</span></div>
+        <div class="faith-setting-meta">Port 8090 · used by Build, code editing, and troubleshooting</div>
+      </div>
+      <button id="faith-settings-refresh" type="button">↻ Refresh health checks</button>
+      <div id="faith-settings-updated" class="faith-setting-meta" aria-live="polite">Status not checked yet.</div>
     </div>
     <div id="faith-studio-panel" hidden aria-label="Studio">
       <div class="faith-sidebar-heading">Studio</div>

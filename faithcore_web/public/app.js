@@ -1092,6 +1092,7 @@ const expressionImages = {
   editing: "/assets/editing.PNG",
   troubleshooting: "/assets/troubleshooting.PNG",
   coding: "/assets/coding.PNG",
+  writing: "/assets/writing.png",
   build: "/assets/build.png",
   robotic: "/assets/robotic.PNG",
   psychotic: "/assets/psychotic.PNG",
@@ -1116,6 +1117,7 @@ const expressionNames = {
   editing: "Editing",
   troubleshooting: "Troubleshooting",
   coding: "Coding",
+  writing: "Writing",
   build: "Build",
   robotic: "Robotic",
   psychotic: "Psychotic",
@@ -1164,6 +1166,7 @@ const expressionDetails = {
   editing: "Editing your image...",
   troubleshooting: "Troubleshooting...",
   coding: "Coding...",
+  writing: "Writing a story...",
   build: "Building from the ground up...",
   robotic: "Processing...",
   psychotic: "Something is watching...",
@@ -1218,6 +1221,10 @@ function faithEmotionRoute(question) {
 
   const sadTerms = /\b(?:sad|sadness|depress(?:ed|ion)|lonely|loneliness|alone|isolated|isolation|miserable|heartbroken|heartbreak|hopeless|hopelessness|crying|cried|tears|grief|grieving|hurt|hurting|upset|down|feeling bad|feel bad|feel awful|feel terrible|nobody|no one)\b/;
   if (sadTerms.test(normalized)) return "sad";
+
+  const storyTerms = /\b(?:story|short story|tale|fiction|fictional|fairy tale|bedtime story|narrative|chapter|novella|plot twist|plot|character arc|screenplay|script|scene|fanfiction|fan fiction|fantasy adventure|mystery|thriller|horror story|romance story)\b/i;
+  const storyIntent = /\b(?:write|tell|create|continue|finish|compose|draft|invent|narrate|turn this into|make up)\b/i.test(normalized);
+  if (storyTerms.test(normalized) && storyIntent) return "writing";
 
   return null;
 }
@@ -1662,6 +1669,21 @@ function appendImages(item, images, onGeneratedStateChange = null) {
       download.className = "faith-image-download";
       download.addEventListener("click", () => { download.download = faithSafeFilename(faithLastUserPrompt || image.title); });
       figure.appendChild(download);
+      const actions = document.createElement("div"); actions.className = "faith-image-actions";
+      const favorite = document.createElement("button"); favorite.type = "button"; favorite.textContent = "☆ Favorite image"; favorite.title = "Favorite this image";
+      favorite.addEventListener("click", async () => {
+        const entry = faithFindGalleryEntryForImage(stableImageKey, image.original_url || image.url);
+        if (!entry) { alert("This image is still being saved. Try again in a moment."); return; }
+        await faithSetGalleryFavorite(entry.id, !entry.favorite);
+        favorite.textContent = entry.favorite ? "★ Favorited" : "☆ Favorite image";
+      });
+      const remove = document.createElement("button"); remove.type = "button"; remove.className = "danger"; remove.textContent = "Delete image";
+      remove.addEventListener("click", async () => {
+        const entry = faithFindGalleryEntryForImage(stableImageKey, image.original_url || image.url);
+        if (!confirm("Delete only this image from the gallery and this chat? Other images from the same job will remain.")) return;
+        if (entry) await faithDeleteGalleryImage(entry.id); else figure.remove();
+      });
+      actions.append(favorite, remove); figure.appendChild(actions);
     }
     imageGrid.appendChild(figure);
   });
@@ -2130,6 +2152,10 @@ async function faithAddGalleryImage(image, prompt, imageNode = null, linkNode = 
   return entry;
 }
 
+function faithFindGalleryEntryForImage(imageKey, url) {
+  return faithWorkspace.gallery.find(entry => (imageKey && entry.imageKey === imageKey) || (url && (entry.url === url || String(entry.url || "").endsWith(String(url).split("/").pop()))));
+}
+
 function faithRestoreThreadImages(thread) {
   if (!thread || !chat || !Array.isArray(faithWorkspace.gallery)) return;
   const byKey = new Map();
@@ -2500,7 +2526,7 @@ function faithRenderSidebar() {
             { label: "Download image", action: () => { const a = document.createElement("a"); a.href = entry.url; a.download = entry.filename || faithSafeFilename(entry.title); a.click(); } },
             { label: "Copy prompt", action: () => faithCopyGalleryPrompt(entry) },
             { label: entry.favorite ? "Remove favorite" : "Favorite image ★", action: () => faithSetGalleryFavorite(entry.id, !entry.favorite) },
-            { label: "Delete image", danger: true, action: () => { if (confirm(`Permanently delete “${entry.title || "this image"}” from gallery storage and remove its chat message?`)) faithDeleteGalleryImage(entry.id); } }
+            { label: "Delete image", danger: true, action: () => { if (confirm(`Permanently delete “${entry.title || "this image"}” from gallery storage and remove only this image from its chat?`)) faithDeleteGalleryImage(entry.id); } }
           ]);
         });
         card.title = "Right-click for image options; tap the star to favorite";
@@ -2634,20 +2660,19 @@ function faithRemoveImageMessageFromHtml(html, entry) {
   const holder = document.createElement("div"); holder.innerHTML = html || "";
   const key = String(entry.imageKey || "");
   const url = String(entry.url || "");
-  const affected = new Set();
   holder.querySelectorAll(".message-image, .message-images img, figure").forEach(node => {
     const image = node.matches("img") ? node : node.querySelector("img");
     if (!image) return;
-    const parentFigure = image.closest("figure") || node.closest("figure");
-    const matchesKey = key && (image.dataset.faithImageKey === key || (parentFigure && parentFigure.dataset.faithImageKey === key));
+    const figure = image.closest("figure") || node.closest("figure");
+    const matchesKey = key && (image.dataset.faithImageKey === key || (figure && figure.dataset.faithImageKey === key));
     const src = image.getAttribute("src") || "";
-    const matchesUrl = url && (src === url || src.endsWith(url) || (image.closest("a") && ((image.closest("a").getAttribute("href") || "") === url)));
+    const matchesUrl = url && (src === url || src.endsWith(url) || (image.closest("a") && image.closest("a").getAttribute("href") === url));
     if (matchesKey || matchesUrl) {
-      const message = image.closest(".message");
-      if (message) affected.add(message); else if (parentFigure) parentFigure.remove();
+      if (figure) figure.remove(); else image.remove();
     }
   });
-  affected.forEach(message => message.remove());
+  // Remove only now-empty image grids; preserve the surrounding message text and other content.
+  holder.querySelectorAll(".message-images").forEach(grid => { if (!grid.querySelector("img, figure")) grid.remove(); });
   return holder.innerHTML;
 }
 function faithRemoveDeletedImageFromChats(entry) {
@@ -2836,10 +2861,86 @@ function faithInitSidebar() {
   const tabGallery = document.getElementById("faith-sidebar-gallery");
   const tabFiles = document.getElementById("faith-sidebar-files");
   const tabStudio = document.getElementById("faith-sidebar-studio");
+  const tabSettings = document.getElementById("faith-sidebar-settings");
   const chatsPanel = document.getElementById("faith-chats-panel");
   const galleryPanel = document.getElementById("faith-gallery-panel");
   const filesPanel = document.getElementById("faith-files-panel");
   const studioPanel = document.getElementById("faith-studio-panel");
+  const settingsPanel = document.getElementById("faith-settings-panel");
+
+  const faithSetHealth = (name, online, label, detail) => {
+    const dot = document.getElementById(`faith-health-${name}-dot`);
+    const text = document.getElementById(`faith-health-${name}-label`);
+    if (dot) dot.className = `faith-health-dot ${online ? "online" : "offline"}`;
+    if (text) text.textContent = `${label}: ${online ? "Online" : "Offline"}${detail ? ` · ${detail}` : ""}`;
+  };
+  let faithStoryLaunchInProgress = false;
+  const faithRefreshModelHealth = async () => {
+    const updated = document.getElementById("faith-settings-updated");
+    if (updated) updated.textContent = "Checking local model servers…";
+    try {
+      const response = await fetch("/api/model-health", { cache: "no-store" });
+      const data = await response.json();
+      if (!response.ok) throw new Error(data.error || `HTTP ${response.status}`);
+      faithSetHealth("chat", !!data.chat.online, "Qwen chat", data.chat.endpoint);
+      faithSetHealth("story", !!data.story.online, "Qwen3 Story", data.story.endpoint);
+      faithSetHealth("emotion", !!data.emotion.online, "Emotion bridge", data.emotion.endpoint);
+      faithSetHealth("code", !!data.code.online, "Code server", data.code.endpoint);
+      const setModelMetadata = (key, model) => {
+        const nameEl = document.getElementById(`faith-model-${key}-name`);
+        const sizeEl = document.getElementById(`faith-model-${key}-size`);
+        if (nameEl && model) nameEl.textContent = `Model: ${model.name || "unknown"}`;
+        if (sizeEl && model) sizeEl.textContent = `GGUF size: ${model.size || "unknown"}`;
+      };
+      setModelMetadata("chat", data.chat.model);
+      setModelMetadata("story", data.story.model);
+      setModelMetadata("code", data.code.model);
+      setModelMetadata("emotion", data.emotion.model);
+      // Keep Launch disabled while :8072 is healthy, but make it available again
+      // as soon as a refresh confirms the optional Story server is offline.
+      const launchButton = document.getElementById("faith-story-launch");
+      if (launchButton) {
+        launchButton.disabled = !!data.story.online || faithStoryLaunchInProgress;
+        launchButton.textContent = data.story.online ? "✓ Qwen3 Story is running" : (faithStoryLaunchInProgress ? "Waiting for Qwen3 Story…" : "▶ Launch Qwen3 Story");
+      }
+      if (updated) updated.textContent = `Last checked ${new Date().toLocaleTimeString()}.`;
+      return data;
+    } catch (error) {
+      if (updated) updated.textContent = `Health check failed: ${error.message}`;
+      return null;
+    }
+  };
+  const storyLaunchButton = document.getElementById("faith-story-launch");
+  if (storyLaunchButton) storyLaunchButton.addEventListener("click", async () => {
+    if (faithStoryLaunchInProgress || storyLaunchButton.disabled) return;
+    const note = document.getElementById("faith-story-launch-note");
+    faithStoryLaunchInProgress = true;
+    storyLaunchButton.disabled = true;
+    storyLaunchButton.textContent = "Launching…";
+    if (note) note.textContent = "Starting the optional Qwen3 Story launcher. Waiting indefinitely for :8072 to report healthy; this can take several minutes on first load…";
+    try {
+      const response = await fetch("/api/model-launch/story", { method: "POST", headers: { "Accept": "application/json" } });
+      const data = await response.json();
+      if (!response.ok) throw new Error(data.error || `HTTP ${response.status}`);
+      if (note) note.textContent = data.message || "Launcher opened. Waiting for the model to become ready…";
+      // Model loading can exceed five minutes on CPU or with a large GGUF.
+      // There is intentionally no deadline: stop only after :8072 is healthy.
+      let online = false;
+      while (!online) {
+        await new Promise(resolve => setTimeout(resolve, 1800));
+        const health = await faithRefreshModelHealth();
+        online = !!(health && health.story && health.story.online);
+      }
+      if (note) note.textContent = "Qwen3 Story is ready. Story requests can now use it. The launch button will re-enable after a refresh detects that :8072 is offline.";
+    } catch (error) {
+      if (note) note.textContent = `Could not launch Qwen3 Story: ${error.message}`;
+    } finally {
+      faithStoryLaunchInProgress = false;
+      await faithRefreshModelHealth();
+    }
+  });
+  const settingsRefreshButton = document.getElementById("faith-settings-refresh");
+  if (settingsRefreshButton) settingsRefreshButton.addEventListener("click", faithRefreshModelHealth);
 
   // Small, self-contained language marks inspired by each language's familiar logo.
   // Keep these inline (no external icon font/CDN) so the Files tab works offline.
@@ -2908,7 +3009,19 @@ function faithInitSidebar() {
         const icon = document.createElement("div"); icon.className = "faith-file-icon"; icon.innerHTML = faithCodeIcon(file.name); icon.setAttribute("aria-hidden", "true");
         const meta = document.createElement("div"); meta.className = "faith-file-meta";
         const name = document.createElement("div"); name.className = "faith-file-name"; name.textContent = file.name;
-        const sub = document.createElement("div"); sub.className = "faith-file-sub"; sub.textContent = `${faithFormatBytes(file.size)} · ${new Date(file.updated_at).toLocaleString()}`;
+        const sub = document.createElement("div"); sub.className = "faith-file-sub";
+        const createdAt = Number(file.created_at);
+        const editedAt = Number(file.updated_at);
+        const createdDate = Number.isFinite(createdAt) && createdAt > 0 ? new Date(createdAt) : null;
+        const editedDate = Number.isFinite(editedAt) && editedAt > 0 ? new Date(editedAt) : null;
+        const labels = [faithFormatBytes(file.size)];
+        if (createdDate && !Number.isNaN(createdDate.getTime())) labels.push(`Created: ${createdDate.toLocaleString()}`);
+        // Only show an edit timestamp when the modification time is genuinely
+        // later than the creation time; untouched files must not be labelled edited.
+        if (createdAt > 0 && editedAt > createdAt + 250 && editedDate && !Number.isNaN(editedDate.getTime())) {
+          labels.push(`Last edited: ${editedDate.toLocaleString()}`);
+        }
+        sub.textContent = labels.join(" · ");
         meta.append(name, sub); card.append(icon, meta);
         card.addEventListener("click", () => window.open(file.url, "_blank", "noopener"));
         card.addEventListener("contextmenu", event => {
@@ -3033,11 +3146,67 @@ function faithInitSidebar() {
     const requestLabel = document.createElement("label"); requestLabel.textContent = "What would you like Faith to change? (optional)"; requestLabel.style.cssText = "font-size:.88rem;color:#c7d5ec;";
     const request = document.createElement("textarea"); request.rows = 2; request.placeholder = "Example: Add input validation, preserve existing behavior, and update the error handling…";
     request.style.cssText = "width:100%;box-sizing:border-box;resize:vertical;min-height:54px;max-height:140px;padding:10px;border:1px solid #34445d;border-radius:8px;background:#0a101c;color:#fff;font:14px/1.4 system-ui,sans-serif;";
-    const actions = document.createElement("div"); actions.style.cssText = "display:flex;gap:8px;justify-content:flex-end;flex-wrap:wrap;";
+    const actions = document.createElement("div"); actions.style.cssText = "display:flex;gap:8px;justify-content:flex-end;align-items:center;flex-wrap:wrap;";
     const buttonStyle = "border:0;border-radius:8px;padding:10px 14px;font-weight:600;cursor:pointer;";
-    const save = document.createElement("button"); save.type = "button"; save.textContent = "Save changes to file"; save.style.cssText = buttonStyle + "background:#34435d;color:#fff;";
-    const chatButton = document.createElement("button"); chatButton.type = "button"; chatButton.textContent = "Save & chat about changes"; chatButton.style.cssText = buttonStyle + "background:#6336a6;color:#fff;";
-    actions.append(save, chatButton); panel.append(header, editorWrap, requestLabel, request, actions); overlay.appendChild(panel);
+    // Put the animated FX on a separate wrapper, behind the actual button.
+    // Pseudo-elements on the button itself can be painted underneath its own
+    // background (or over the label), depending on browser stacking rules.
+    if (!document.getElementById("faith-save-chat-glow-style")) {
+      const glowStyle = document.createElement("style");
+      glowStyle.id = "faith-save-chat-glow-style";
+      glowStyle.textContent = `
+        @keyframes faithSaveChatOrbit { to { transform: rotate(360deg); } }
+        @keyframes faithSaveChatOrbitReverse { to { transform: rotate(-360deg); } }
+        @keyframes faithSaveChatGlowPulse {
+          0%,100% { opacity:.72; filter:blur(2px) saturate(1.15) brightness(1.1); }
+          50% { opacity:1; filter:blur(4px) saturate(1.7) brightness(1.45); }
+        }
+        .faith-save-chat-fx-wrap { position:relative; display:inline-flex; isolation:isolate; overflow:visible; z-index:0; padding:0; width:220px; height:44px; flex:0 0 220px; box-sizing:border-box; align-items:stretch; }
+        .faith-save-chat-fx-wrap::before,.faith-save-chat-fx-wrap::after {
+          content:""; position:absolute; pointer-events:none; z-index:0; inset:-22px -38px;
+          border-radius:50%; opacity:1; will-change:transform,opacity,filter;
+          background:conic-gradient(from 0deg,transparent 0deg 12deg,#27f5ff 22deg 34deg,transparent 48deg 82deg,#ff30d5 98deg 111deg,transparent 126deg 166deg,#27f5ff 184deg 198deg,transparent 214deg 260deg,#ff30d5 278deg 291deg,transparent 307deg 360deg);
+          -webkit-mask:radial-gradient(ellipse,transparent 42%,#000 46%,#000 54%,transparent 59%);
+          mask:radial-gradient(ellipse,transparent 42%,#000 46%,#000 54%,transparent 59%);
+          filter:drop-shadow(0 0 5px #27f5ff) drop-shadow(0 0 11px #27f5ff88);
+          animation:faithSaveChatOrbit 2.4s linear infinite,faithSaveChatGlowPulse 1.6s ease-in-out infinite;
+        }
+        .faith-save-chat-fx-wrap::after {
+          inset:-30px -50px; opacity:.9; background:repeating-conic-gradient(from 0deg,transparent 0deg 12deg,rgba(255,48,213,1) 16deg 20deg,transparent 24deg 36deg,#27f5ff 40deg 44deg,transparent 48deg 62deg);
+          -webkit-mask:radial-gradient(ellipse,transparent 39%,#000 44%,#000 52%,transparent 58%);
+          mask:radial-gradient(ellipse,transparent 39%,#000 44%,#000 52%,transparent 58%);
+          filter:drop-shadow(0 0 5px #ff30d5) drop-shadow(0 0 12px #27f5ff99);
+          animation:faithSaveChatOrbitReverse 3.7s linear infinite,faithSaveChatGlowPulse 1.9s ease-in-out -0.7s infinite;
+        }
+        .faith-save-chat-fx-wrap button { position:relative; z-index:1; width:100% !important; min-width:220px !important; max-width:220px !important; height:44px !important; min-height:44px !important; box-sizing:border-box !important; padding:0 12px !important; font-size:13px !important; line-height:1 !important; font-weight:600 !important; }
+        .faith-save-file-button { width:220px !important; min-width:220px !important; max-width:220px !important; height:44px !important; min-height:44px !important; box-sizing:border-box !important; font-size:13px !important; line-height:1 !important; padding:0 12px !important; font-weight:600 !important; flex:0 0 220px !important; align-self:center !important; border-radius:14px !important; }
+        /* Cyan glow is applied only to the button itself; the ring FX above stay unchanged. */
+        .faith-save-chat-fx-wrap .faith-save-chat-button {
+          border:1px solid #27f5ff !important;
+          border-radius:14px !important;
+          overflow:hidden;
+          isolation:isolate;
+          box-shadow:0 0 8px #27f5ffbb,0 0 18px #27f5ff77,0 12px 34px #0008,inset 0 1px #ffffff20 !important;
+          transition:box-shadow .2s ease;
+        }
+        .faith-save-chat-fx-wrap .faith-save-chat-button::before {
+          content:""; position:absolute; inset:0; border-radius:inherit; padding:1.5px;
+          pointer-events:none; z-index:2; background:#65fcff;
+          -webkit-mask:linear-gradient(#000 0 0) content-box,linear-gradient(#000 0 0);
+          -webkit-mask-composite:xor; mask-composite:exclude;
+          filter:drop-shadow(0 0 4px #27f5ff) drop-shadow(0 0 9px #27f5ff);
+        }
+        .faith-save-chat-fx-wrap .faith-save-chat-button:hover {
+          box-shadow:0 0 12px #27f5ffdd,0 0 26px #27f5ff99,0 12px 34px #0008,inset 0 1px #ffffff20 !important;
+        }
+        /* Keep the requested ring rotation visibly animated, including on devices with reduced-motion enabled. */
+      `;
+      document.head.appendChild(glowStyle);
+    }
+    const chatFxWrap = document.createElement("span"); chatFxWrap.className = "faith-save-chat-fx-wrap";
+    const save = document.createElement("button"); save.type = "button"; save.className = "faith-save-file-button"; save.textContent = "Save changes to file"; save.style.cssText = "border:0;border-radius:14px;padding:0 12px;font:600 13px/1 system-ui,sans-serif;cursor:pointer;background:#34435d;color:#fff;width:220px;min-width:220px;max-width:220px;height:44px;min-height:44px;box-sizing:border-box;align-self:center;flex:0 0 220px;";
+    const chatButton = document.createElement("button"); chatButton.type = "button"; chatButton.className = "faith-save-chat-button"; chatButton.textContent = "✨ Save & chat about changes"; chatButton.style.cssText = buttonStyle + "background:#6336a6;color:#fff;font-size:13px;width:220px;min-width:220px;max-width:220px;height:44px;min-height:44px;box-sizing:border-box;padding:0 12px;line-height:1;font-weight:600;flex:0 0 220px;";
+    chatFxWrap.appendChild(chatButton); actions.append(save, chatFxWrap); panel.append(header, editorWrap, requestLabel, request, actions); overlay.appendChild(panel);
     let originalCode = "", loaded = false, saving = false;
     const closeEditor = () => { if (editor.value !== originalCode && !confirm("You have unsaved code changes. Close without saving?")) return; overlay.remove(); selectionStyle.remove(); window.removeEventListener("resize", syncEditorViewport); };
     close.addEventListener("click", closeEditor);
@@ -3166,6 +3335,7 @@ function faithInitSidebar() {
     galleryPanel.hidden = which !== "gallery";
     if (filesPanel) filesPanel.hidden = which !== "files";
     studioPanel.hidden = which !== "studio";
+    if (settingsPanel) settingsPanel.hidden = which !== "settings";
     // Studio is its own blank workspace, not a view layered over the current
     // conversation. The chat and composer return when another sidebar tab opens.
     document.body.classList.toggle("faith-studio-mode", which === "studio");
@@ -3173,6 +3343,8 @@ function faithInitSidebar() {
     tabGallery.classList.toggle("active", which === "gallery");
     if (tabFiles) tabFiles.classList.toggle("active", which === "files");
     tabStudio.classList.toggle("active", which === "studio");
+    if (tabSettings) { tabSettings.classList.toggle("active", which === "settings"); tabSettings.setAttribute("aria-pressed", which === "settings" ? "true" : "false"); }
+    if (which === "settings") faithRefreshModelHealth();
     if (which === "files") faithRefreshCodeFiles();
     if (which === "studio") {
       // Studio owns a private, non-visible system conversation. Its only job is
@@ -3210,6 +3382,7 @@ function faithInitSidebar() {
       // the active conversation's saved expression or behavior.
       showSidebarTab("studio");
     });
+    if (tabSettings) tabSettings.addEventListener("click", () => showSidebarTab("settings"));
   }
 }
 // Rename the existing cyan voice toggle label only if the voice module has
@@ -3620,15 +3793,68 @@ function removeLoadingMessage(item) {
   }
 }
 
-function appendQwenRelayLoadingMessage(label = "Getting response from Qwen and llama_server...") {
+function appendStoryCountdownMessage(label = "Sending story request to Qwen3 on :8072…") {
+  // Story stages have an unlimited elapsed-time counter; never imply a timeout.
   const item = appendLoadingMessage(`${label} (0s)`);
-  const startedAt = Date.now();
-  const timer = setInterval(() => {
-    const seconds = Math.floor((Date.now() - startedAt) / 1000);
-    updateLoadingMessage(item, `${label} (${seconds}s)`);
-  }, 250);
+  let currentLabel = label;
+  let currentStageKey = "story-request";
+  let stageStartedAt = Date.now();
+  const render = () => {
+    const elapsed = Math.floor((Date.now() - stageStartedAt) / 1000);
+    updateLoadingMessage(item, `${currentLabel} (${elapsed}s)`);
+  };
+  const timer = setInterval(render, 250);
   return {
     item,
+    update(nextLabel, stageKey) {
+      if (typeof nextLabel === "string" && nextLabel.trim()) {
+        const normalizedLabel = nextLabel.trim();
+        const nextStageKey = (typeof stageKey === "string" && stageKey.trim())
+          ? stageKey.trim()
+          : normalizedLabel;
+        if (nextStageKey !== currentStageKey) {
+          currentStageKey = nextStageKey;
+          stageStartedAt = Date.now();
+        }
+        currentLabel = normalizedLabel;
+        render();
+      }
+    },
+    stop() {
+      clearInterval(timer);
+      removeLoadingMessage(item);
+    }
+  };
+}
+
+function appendQwenRelayLoadingMessage(label = "Getting response from Qwen and llama_server...") {
+  const item = appendLoadingMessage(`${label} (0s)`);
+  let stageStartedAt = Date.now();
+  let currentLabel = label;
+  let currentStageKey = "initial";
+  const render = () => {
+    const seconds = Math.floor((Date.now() - stageStartedAt) / 1000);
+    updateLoadingMessage(item, `${currentLabel} (${seconds}s)`);
+  };
+  const timer = setInterval(render, 250);
+  return {
+    item,
+    update(nextLabel, stageKey) {
+      if (typeof nextLabel === "string" && nextLabel.trim()) {
+        const normalizedLabel = nextLabel.trim();
+        // Reset elapsed time only when the workflow moves to a new stage.
+        // Repeated updates within the same stage must not restart the clock.
+        const nextStageKey = (typeof stageKey === "string" && stageKey.trim())
+          ? stageKey.trim()
+          : normalizedLabel;
+        if (nextStageKey !== currentStageKey) {
+          currentStageKey = nextStageKey;
+          stageStartedAt = Date.now();
+        }
+        currentLabel = normalizedLabel;
+        render();
+      }
+    },
     stop() {
       clearInterval(timer);
       removeLoadingMessage(item);
@@ -3671,17 +3897,38 @@ async function consumeQwenStream(response, qwenRelayLoading) {
     faithEnsureReadAloudButton(faithItem);
     const textNode = faithItem.querySelector(".message-text");
     if (!textNode) return;
-    // During the live stream, keep the raw text visible so Markdown cannot
-    // produce half-rendered HTML while Qwen is still writing. The final pass
-    // below converts the completed answer to Faith's normal Markdown renderer.
+    // Keep raw text visible during generation. Batch only DOM painting to
+    // animation frames; the SSE reader still consumes every delta immediately.
     textNode.textContent = answer;
     chat.scrollTop = chat.scrollHeight;
+  };
+  let streamRenderScheduled = false;
+  let streamRenderFrame = 0;
+  const scheduleStreamingTextUpdate = () => {
+    if (streamRenderScheduled) return;
+    streamRenderScheduled = true;
+    streamRenderFrame = requestAnimationFrame(() => {
+      streamRenderScheduled = false;
+      streamRenderFrame = 0;
+      updateStreamingText();
+    });
+  };
+  const flushStreamingTextUpdate = () => {
+    if (streamRenderFrame) cancelAnimationFrame(streamRenderFrame);
+    streamRenderScheduled = false;
+    streamRenderFrame = 0;
+    updateStreamingText();
   };
 
   const handleEvent = (event) => {
     if (!event || typeof event !== "object") return;
 
     if (event.type === "status") {
+      if (qwenRelayLoading && event.message) {
+        const stageKey = event.phase || event.stage || event.message;
+        qwenRelayLoading.update(event.message, stageKey);
+      }
+      console.info("[Faith Qwen Relay] status:", event.phase || event.stage || "general", event.message || "");
       return;
     }
 
@@ -3710,14 +3957,14 @@ async function consumeQwenStream(response, qwenRelayLoading) {
       if (!delta) return;
       ensureFaithItem();
       answer += delta;
-      updateStreamingText();
+      scheduleStreamingTextUpdate();
       return;
     }
 
     if (event.type === "text_complete") {
       answer = typeof event.answer === "string" ? event.answer : answer;
       ensureFaithItem();
-      updateStreamingText();
+      flushStreamingTextUpdate();
       faithEnsureReadAloudButton(faithItem);
 
       // Qwen is finished at this exact point. Do not wait for Wikimedia or
@@ -3748,7 +3995,7 @@ async function consumeQwenStream(response, qwenRelayLoading) {
       finalData = event;
       answer = typeof event.answer === "string" ? event.answer : answer;
       ensureFaithItem();
-      updateStreamingText();
+      flushStreamingTextUpdate();
 
       // Critical: streamed text is intentionally shown as textContent while
       // tokens arrive, but it must be converted to the normal Markdown/code
@@ -5127,8 +5374,18 @@ async function submitQuestion() {
     if (eroticCapabilityQuestion) setExpression("erotic", "Checking adult-art capability...");
     // Idle-only: active coding/troubleshooting sessions keep existing behavior.
     const paintActionRequest = sessionMode === "idle" && isFaithPaintAction(question);
+    // Creative writing bypasses ordinary Qwen chat and goes to Qwen3 Story.
+    const isStoryRequest = sessionMode === "idle" && !isTroubleshootingPrompt &&
+      !/\b(?:write|generate|create|edit|fix|debug|explain)\b[\s\S]{0,60}\b(?:code|script|program|function|class|bug|error|file)\b/i.test(question) &&
+      (
+        /\b(?:write|tell|create|continue|compose|craft|narrate|invent|imagine|draft|finish|rewrite|expand|develop)\b[\s\S]{0,140}\b(?:story|tale|fiction|novel|chapter|scene|fanfic|fairy tale|short story|bedtime story|horror story|love story|character arc|plot)\b/i.test(question) ||
+        /\b(?:short story|bedtime story|horror story|love story|write me a story|storytelling|creative writing|fictional scene|a poem|poetry|write a poem|write some fiction)\b/i.test(question) ||
+        /\b(?:write|draft|compose|rewrite|continue)\b[\s\S]{0,100}\b(?:poem|poetry|dialogue|monologue|lyrics|screenplay|play|script|prose)\b/i.test(question) ||
+        faithEmotionRoute(question) === "writing"
+      );
+    if (isStoryRequest) setExpression("writing", "Writing your story...");
     const isSimpleChat = !isTroubleshootingPrompt && sessionMode === "idle" &&
-      (eroticCapabilityQuestion || (!isFaithImageGenerationPhrase(question) &&
+      (isStoryRequest || eroticCapabilityQuestion || (!isFaithImageGenerationPhrase(question) &&
       !paintActionRequest &&
       !/\b(?:generate|create|draw|paint|make)\b[\s\S]*\b(?:image|picture|photo|art)\b/i.test(question))) &&
       !/\b(?:upload|file|code|debug|troubleshoot)\b/i.test(question);
@@ -5136,29 +5393,38 @@ async function submitQuestion() {
     const isImageGeneration = !eroticCapabilityQuestion && (isFaithImageGenerationPhrase(question) ||
       paintActionRequest ||
       /\b(?:generate|create|draw|paint|make|render|illustrate|design|sketch)\b[\s\S]*\b(?:image|picture|photo|art|portrait|drawing|painting|scene|wallpaper)\b/i.test(question));
-    const dedicatedEmotion = (isSimpleChat || eroticCapabilityQuestion) ? faithEmotionRoute(question) : null;
+    const dedicatedEmotion = (!isStoryRequest && (isSimpleChat || eroticCapabilityQuestion)) ? faithEmotionRoute(question) : null;
 
-    // Emotion trigger prompts must go directly to the dedicated :8070 model.
+    // Story prompts are classified as Writing and the server relays them to Qwen3 Story on :8072. Emotion triggers use their dedicated backend.
     // Image generation, Build, and Troubleshooting retain their existing routes.
     const endpoint = isImageGeneration
       ? "/api/imagegen"
-      : (dedicatedEmotion && dedicatedEmotion !== "erotic" ? "/api/emotions" : (isSimpleChat ? "/api/qwen-chat" : "/api/chat"));
+      : (dedicatedEmotion && dedicatedEmotion !== "erotic" && dedicatedEmotion !== "writing" ? "/api/emotions" : (isSimpleChat ? "/api/qwen-chat" : "/api/chat"));
 
     // Normal chat can take a while while Qwen/llama-server generates the
     // response. Show an explicit relay status and a live elapsed-time counter
     // so the user always knows Faith is waiting on the local AI backend.
     // Image generation and other specialized routes keep their own loaders.
     if (isSimpleChat) {
-      qwenRelayLoading = appendQwenRelayLoadingMessage(
-        dedicatedEmotion && dedicatedEmotion !== "erotic"
-          ? `Getting response from Faith's ${dedicatedEmotion} model on :8070...`
-          : "Getting response from Qwen and llama_server..."
-      );
+      if (isStoryRequest) {
+        // Story requests use a fresh countdown for each acknowledged relay
+        // stage (health, prompt dispatch, response headers, generation, finish).
+        qwenRelayLoading = appendStoryCountdownMessage(
+          "Sending story request to Qwen3 on :8072…"
+        );
+      } else {
+        // Preserve the existing regular-chat progression/timer behavior.
+        qwenRelayLoading = appendQwenRelayLoadingMessage(
+          dedicatedEmotion && dedicatedEmotion !== "erotic"
+            ? (dedicatedEmotion === "writing" ? "Waiting for Qwen3 Story Server to launch…" : `Getting response from Faith's ${dedicatedEmotion} model on :8070...`)
+            : "Getting response from Qwen and llama_server..."
+        );
+      }
 
       // START WIKIMEDIA AT THE SAME TIME AS QWEN. Do not wait for the first
       // token, a complete answer, or Explanation mode. The search now gets the
       // full Qwen generation window to find relevant Commons images.
-      if (isSimpleChat && !dedicatedEmotion && !eroticCapabilityQuestion) wikimediaPreflight = (async () => {
+      if (isSimpleChat && !isStoryRequest && !dedicatedEmotion && !eroticCapabilityQuestion) wikimediaPreflight = (async () => {
         try {
           const response = await fetch(`/api/qwen-wikimedia?ts=${Date.now()}`, {
             method: "POST",
@@ -5196,16 +5462,21 @@ async function submitQuestion() {
       method: "POST",
       headers: {
         "Content-Type": "application/json",
-        "Accept": "application/json"
+        // Explicitly negotiate SSE for Story so the browser/proxy path does
+        // not treat the request as a normal JSON response. Keep normal chat's
+        // request negotiation unchanged.
+        "Accept": isStoryRequest ? "text/event-stream" : "application/json",
+        ...(isStoryRequest ? { "Cache-Control": "no-cache, no-store", "Pragma": "no-cache" } : {})
       },
+      cache: isStoryRequest ? "no-store" : "default",
       signal: chatController.signal,
-      body: JSON.stringify({ question, art_style: getFaithArtStyle(), session_id: faithWorkspace.activeId || "main" })
+      body: JSON.stringify({ question, art_style: getFaithArtStyle(), session_id: faithWorkspace.activeId || "main", story_mode: !!isStoryRequest })
     });
 
     // If a stale server/proxy does not know /api/qwen-chat, immediately retry
     // ordinary chat through /api/chat. server.rb contains the same direct-Qwen
     // compatibility guard, so this cannot fall into the slow Faith pipeline.
-    if (((isSimpleChat && !dedicatedEmotion) || isImageGeneration) && (response.status === 404 || response.status === 405)) {
+    if (!isStoryRequest && (((isSimpleChat && !dedicatedEmotion) || isImageGeneration) && (response.status === 404 || response.status === 405))) {
       response = await fetch("/api/chat", {
         method: "POST",
         headers: {
@@ -5693,3 +5964,45 @@ window.addEventListener("beforeunload", () => {
     faithSaveWorkspace();
   } catch (_) {}
 });
+
+// Subtle full-resolution hover viewer for generated images in chats and Gallery.
+(function faithInstallImageHoverPreview() {
+  let preview = null, previewImage = null, activeImage = null;
+  function ensurePreview() {
+    if (preview) return;
+    preview = document.createElement("div"); preview.className = "faith-hover-preview";
+    previewImage = document.createElement("img"); preview.appendChild(previewImage); document.body.appendChild(preview);
+  }
+  function imageFromEvent(target) {
+    if (!(target instanceof Element)) return null;
+    const img = target.closest("#faith-gallery-list img, .message-images img, figure img");
+    if (!img || !img.src || img.closest(".faith-hover-preview")) return null;
+    return img;
+  }
+  function move(event) {
+    if (!preview || !activeImage) return;
+    const pad = 16, rect = preview.getBoundingClientRect();
+    let x = event.clientX + 20, y = event.clientY + 18;
+    if (x + rect.width > innerWidth - pad) x = event.clientX - rect.width - 20;
+    if (y + rect.height > innerHeight - pad) y = innerHeight - rect.height - pad;
+    preview.style.left = Math.max(pad, x) + "px"; preview.style.top = Math.max(pad, y) + "px";
+  }
+  document.addEventListener("mouseover", event => {
+    const img = imageFromEvent(event.target);
+    if (!img || img === activeImage) return;
+    activeImage = img; ensurePreview();
+    previewImage.src = img.currentSrc || img.src;
+    preview.style.display = "block";
+    requestAnimationFrame(() => move(event));
+  });
+  document.addEventListener("mousemove", event => { if (activeImage) move(event); });
+  document.addEventListener("mouseout", event => {
+    if (!activeImage) return;
+    const related = event.relatedTarget;
+    if (related && (related === activeImage || activeImage.contains(related))) return;
+    if (event.target === activeImage || (event.target instanceof Element && event.target.contains(activeImage))) {
+      activeImage = null; if (preview) preview.style.display = "none";
+    }
+  });
+  document.addEventListener("scroll", () => { if (preview) preview.style.display = "none"; activeImage = null; }, true);
+})();
