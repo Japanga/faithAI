@@ -5614,7 +5614,7 @@ boneless_ui_injection = <<~'BONelessHTML'
 #faith-boneless-intro{position:fixed;inset:0;z-index:1000000;display:flex;align-items:center;justify-content:center;padding:18px;background:rgba(4,7,15,.78);backdrop-filter:blur(7px)}
 #faith-boneless-intro[hidden]{display:none!important}
 #faith-boneless-card{width:min(520px,94vw);color:#e9edf7;background:#151b29;border:1px solid rgba(173,151,255,.38);border-radius:18px;padding:22px;box-shadow:0 22px 70px rgba(0,0,0,.55);text-align:center}
-#faith-boneless-card img{width:156px;height:156px;max-width:42vw;max-height:42vw;object-fit:contain;display:block;margin:0 auto 12px}
+#faith-boneless-card img{width:256px;height:256px;max-width: min(72vw,256px);max-height: min(72vw,256px);object-fit:contain;display:block;margin:0 auto 12px}
 #faith-boneless-card h2{margin:4px 0 10px;color:#d7c5ff}
 #faith-boneless-card p{line-height:1.55;color:#c6cede;text-align:left}
 #faith-boneless-card button{margin-top:8px;padding:10px 22px;border:1px solid #9273d5;border-radius:9px;color:white;background:#563b89;cursor:pointer}
