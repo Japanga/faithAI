@@ -5134,6 +5134,187 @@ FileUtils.mkdir_p(FAITH_GALLERY_FAVORITES_DIR) unless Dir.exist?(FAITH_GALLERY_F
 server.mount "/faith-gallery-files", WEBrick::HTTPServlet::FileHandler, FAITH_GALLERY_DIR, FancyIndexing: false
 server.mount "/faith-gallery-favorites", WEBrick::HTTPServlet::FileHandler, FAITH_GALLERY_FAVORITES_DIR, FancyIndexing: false
 
+# Durable, file-backed conversation store. TXT files remain human-readable while
+# a Base64 JSON trailer preserves the exact message HTML and thread state for import.
+FAITH_CHATS_DIR = File.join(ROOT, "chats")
+FAITH_CHAT_ASSETS_DIR = File.join(FAITH_CHATS_DIR, "assets")
+FileUtils.mkdir_p(FAITH_CHATS_DIR)
+FileUtils.mkdir_p(FAITH_CHAT_ASSETS_DIR)
+# Remove abandoned temp writes left by an interrupted previous process.
+Dir.glob(File.join(FAITH_CHATS_DIR, "*.tmp-*")).each { |path| FileUtils.rm_f(path) }
+FAITH_CHAT_DATA_MARKER = "---FAITH-STRUCTURED-DATA-BASE64---"
+server.mount "/faith-chat-assets", WEBrick::HTTPServlet::FileHandler, FAITH_CHAT_ASSETS_DIR, FancyIndexing: false
+faith_archive_wikimedia_assets = lambda do |thread|
+  html = thread["html"].to_s
+  asset_dir = File.join(FAITH_CHAT_ASSETS_DIR, thread["id"].to_s)
+  begin
+    FileUtils.mkdir_p(asset_dir)
+  rescue StandardError => asset_dir_error
+    warn "[Faith Chats] Could not create media folder; retaining original image URLs: #{asset_dir_error.class}: #{asset_dir_error.message}"
+    next html
+  end
+  manifest_path = File.join(asset_dir, "manifest.json")
+  manifest = File.file?(manifest_path) ? (JSON.parse(File.read(manifest_path, encoding: "UTF-8")) rescue {}) : {}
+  count = 0
+  html.gsub(/((?:src|href)=["'])(https:\/\/upload\.wikimedia\.org\/[^"']+)(["'])/i) do |match|
+    prefix, remote_url, suffix = $1, CGI.unescapeHTML($2), $3
+    count += 1
+    next match if count > 20
+    begin
+      existing = manifest[remote_url]
+      if existing && File.file?(File.join(asset_dir, existing["filename"].to_s))
+        next "#{prefix}/faith-chat-assets/#{thread['id']}/#{existing['filename']}#{suffix}"
+      end
+      uri = URI(remote_url)
+      next match unless uri.scheme == "https" && uri.host.to_s.downcase == "upload.wikimedia.org"
+      response = nil
+      Net::HTTP.start(uri.host, uri.port, use_ssl: true, open_timeout: 5, read_timeout: 12) do |http|
+        request = Net::HTTP::Get.new(uri.request_uri, { "User-Agent" => "FaithChatArchive/1.0" })
+        response = http.request(request)
+      end
+      next match unless response && response.is_a?(Net::HTTPSuccess)
+      content_type = response["content-type"].to_s.split(";").first.to_s.downcase
+      ext = { "image/jpeg" => ".jpg", "image/png" => ".png", "image/webp" => ".webp", "image/gif" => ".gif", "image/svg+xml" => ".svg" }[content_type]
+      next match unless ext && response.body && response.body.bytesize.between?(1, 15 * 1024 * 1024)
+      filename = "#{Digest::SHA256.hexdigest(remote_url)[0, 24]}#{ext}"
+      File.binwrite(File.join(asset_dir, filename), response.body)
+      manifest[remote_url] = { "filename" => filename, "source_url" => remote_url, "content_type" => content_type, "bytes" => response.body.bytesize }
+      "#{prefix}/faith-chat-assets/#{thread['id']}/#{filename}#{suffix}"
+    rescue StandardError => asset_error
+      warn "[Faith Chats] Wikimedia asset retained as remote URL: #{asset_error.message}"
+      match
+    end
+  end.tap do
+    begin
+      File.write(manifest_path, JSON.pretty_generate(manifest), mode: "w:utf-8") unless manifest.empty?
+    rescue StandardError => manifest_error
+      warn "[Faith Chats] Could not write media manifest; original URLs remain available: #{manifest_error.class}: #{manifest_error.message}"
+    end
+  end
+end
+faith_chat_read = lambda do |path|
+  read_archive = lambda do |candidate|
+    source = File.read(candidate, encoding: "UTF-8")
+    marker_at = source.index(FAITH_CHAT_DATA_MARKER)
+    raise "Chat archive metadata is missing" unless marker_at
+    encoded = source[(marker_at + FAITH_CHAT_DATA_MARKER.length)..].to_s.strip
+    payload = JSON.parse(Base64.strict_decode64(encoded))
+    payload["thread"]
+  end
+  begin
+    read_archive.call(path)
+  rescue StandardError => primary_error
+    backup = path + ".bak"
+    raise primary_error unless File.file?(backup)
+    recovered = read_archive.call(backup)
+    # Heal the damaged/missing primary archive from the last known good copy.
+    FileUtils.cp(backup, path)
+    warn "[Faith Chats] Recovered #{File.basename(path)} from its backup."
+    recovered
+  end
+end
+server.mount_proc "/api/chats" do |req, res|
+  begin
+    if req.request_method == "GET"
+      requested_id = req.query["id"].to_s
+      if !requested_id.empty?
+        safe_id = requested_id.gsub(/[^a-zA-Z0-9_-]/, "")
+        path = File.join(FAITH_CHATS_DIR, "#{safe_id}.txt")
+        if File.file?(path)
+          json_response.call(res, 200, { ok: true, thread: faith_chat_read.call(path) })
+        else
+          json_response.call(res, 404, { error: "Conversation not found." })
+        end
+      else
+        chats = Dir.glob(File.join(FAITH_CHATS_DIR, "*.txt")).filter_map do |path|
+          begin
+            thread = faith_chat_read.call(path)
+            thread if thread.is_a?(Hash) && !thread["id"].to_s.empty?
+          rescue StandardError => archive_error
+            warn "[Faith Chats] Skipping invalid archive #{File.basename(path)}: #{archive_error.message}"
+            nil
+          end
+        end
+        chats.sort_by! { |thread| -(thread["updatedAt"] || 0).to_i }
+        json_response.call(res, 200, { ok: true, chats: chats, count: chats.length })
+      end
+    elsif req.request_method == "POST"
+      payload = JSON.parse(req.body.to_s)
+      thread = payload["thread"]
+      unless thread.is_a?(Hash) && !thread["id"].to_s.empty?
+        json_response.call(res, 400, { error: "A conversation with an ID is required." })
+        next
+      end
+      id = thread["id"].to_s.gsub(/[^a-zA-Z0-9_-]/, "")
+      if id.empty? || id.length > 140
+        json_response.call(res, 400, { error: "Invalid conversation ID." })
+        next
+      end
+      thread["id"] = id
+      thread["updatedAt"] = (thread["updatedAt"] || (Time.now.to_f * 1000).to_i).to_i
+      thread["createdAt"] = (thread["createdAt"] || thread["updatedAt"]).to_i
+      transcript = payload["transcript"].to_s
+      transcript = "Faith Chat Archive: #{thread['title'] || 'New conversation'}\r\n\r\n" if transcript.empty?
+      thread["html"] = faith_archive_wikimedia_assets.call(thread)
+      structured = Base64.strict_encode64(JSON.generate({ "version" => 2, "thread" => thread }))
+      content = "\uFEFF" + transcript.sub(/\r?\n*\z/, "\r\n") + "\r\n#{FAITH_CHAT_DATA_MARKER}\r\n#{structured}\r\n"
+      # Re-check/create the storage directory at write time.
+      FileUtils.mkdir_p(FAITH_CHATS_DIR)
+      path = File.join(FAITH_CHATS_DIR, "#{id}.txt")
+      temp = path + ".tmp-#{SecureRandom.hex(5)}"
+      backup = path + ".bak"
+      begin
+        FileUtils.cp(path, backup) if File.file?(path)
+      rescue StandardError => backup_error
+        warn "[Faith Chats] Previous-version backup failed; continuing with primary save: #{backup_error.class}: #{backup_error.message}"
+      end
+      begin
+        File.open(temp, "wb") { |file| file.write(content.encode("UTF-8")); file.flush; file.fsync }
+      rescue StandardError
+        FileUtils.rm_f(temp)
+        raise
+      end
+      begin
+        File.rename(temp, path)
+      rescue SystemCallError
+        # Some Windows filesystems refuse to rename over an existing target.
+        previous_path = path + ".replace-old"
+        File.rename(path, previous_path) if File.file?(path)
+        begin
+          File.rename(temp, path)
+          FileUtils.rm_f(previous_path)
+        rescue StandardError
+          File.rename(previous_path, path) if File.file?(previous_path) && !File.file?(path)
+          raise
+        end
+      end
+      json_response.call(res, 200, { ok: true, id: id, filename: File.basename(path), directory: FAITH_CHATS_DIR, updatedAt: thread["updatedAt"] })
+    elsif req.request_method == "DELETE"
+      requested_id = req.query["id"].to_s
+      if requested_id.empty?
+        Dir.glob(File.join(FAITH_CHATS_DIR, "*.txt")).each { |path| FileUtils.rm_f(path) }
+        Dir.glob(File.join(FAITH_CHATS_DIR, "*.bak")).each { |path| FileUtils.rm_f(path) }
+        Dir.glob(File.join(FAITH_CHAT_ASSETS_DIR, "*" )).each { |path| FileUtils.rm_rf(path) }
+        json_response.call(res, 200, { ok: true, deleted: "all" })
+      else
+        safe_id = requested_id.gsub(/[^a-zA-Z0-9_-]/, "")
+        FileUtils.rm_f(File.join(FAITH_CHATS_DIR, "#{safe_id}.txt"))
+        FileUtils.rm_f(File.join(FAITH_CHATS_DIR, "#{safe_id}.txt.bak"))
+        FileUtils.rm_rf(File.join(FAITH_CHAT_ASSETS_DIR, safe_id))
+        json_response.call(res, 200, { ok: true, deleted: safe_id })
+      end
+    else
+      json_response.call(res, 405, { error: "GET, POST, or DELETE required." })
+    end
+  rescue JSON::ParserError
+    json_response.call(res, 400, { error: "Invalid chat archive request." })
+  rescue StandardError => error
+    warn "[Faith Chats] #{error.class}: #{error.message}"
+    json_response.call(res, 500, { error: "Chat storage error: #{error.class}: #{error.message}", directory: FAITH_CHATS_DIR })
+  end
+end
+
+
 faith_gallery_set_favorite = lambda do |payload|
   id = payload["id"].to_s
   make_favorite = payload["favorite"] == true
@@ -5439,6 +5620,56 @@ server.mount_proc "/api/gallery" do |req, res|
         end
         next
       end
+      # Remote generated images are copied into Faith's gallery so chat archives
+      # never depend on expiring Perchance/Pollinations URLs.
+      if payload["action"] == "import_url"
+        source_url = payload["source_url"].to_s
+        begin
+          uri = URI(source_url)
+          allowed_host = uri.scheme == "https" && (uri.host == "image-generation.perchance.org" || uri.host == "upload.wikimedia.org" || uri.host.end_with?(".perchance.org", ".pollinations.ai") || uri.host == "image.pollinations.ai")
+          unless allowed_host
+            json_response.call(res, 400, { error: "This image provider is not on Faith's approved archive list." })
+            next
+          end
+          duplicate = Dir.glob(File.join(FAITH_GALLERY_DIR, "*.json")).filter_map do |meta_path|
+            meta = (JSON.parse(File.read(meta_path, encoding: "UTF-8")) rescue {})
+            meta if meta["sourceUrl"] == source_url
+          end.first
+          if duplicate
+            json_response.call(res, 200, { ok: true, entry: duplicate })
+            next
+          end
+          response = nil
+          Net::HTTP.start(uri.host, uri.port, use_ssl: true, open_timeout: 6, read_timeout: 20) do |http|
+            response = http.request(Net::HTTP::Get.new(uri.request_uri, { "User-Agent" => "FaithChatArchive/1.0" }))
+          end
+          unless response && response.is_a?(Net::HTTPSuccess)
+            json_response.call(res, 502, { error: "The image provider did not return an image." })
+            next
+          end
+          mime = response["content-type"].to_s.split(";").first.to_s.downcase
+          extension = { "image/png" => "png", "image/jpeg" => "jpg", "image/webp" => "webp", "image/gif" => "gif" }[mime]
+          bytes = response.body.to_s.b
+          unless extension && bytes.bytesize.between?(1, 25 * 1024 * 1024)
+            json_response.call(res, 413, { error: "Remote image is invalid or exceeds the 25 MB gallery limit." })
+            next
+          end
+          id = SecureRandom.hex(10)
+          filename = "faith_#{Time.now.strftime('%Y%m%d_%H%M%S')}_#{id}.#{extension}"
+          path = File.join(FAITH_GALLERY_DIR, filename)
+          File.binwrite(path, bytes)
+          entry = { "id" => id, "title" => payload["title"].to_s[0, 100], "prompt" => payload["prompt"].to_s[0, 500],
+                    "filename" => filename, "url" => "/faith-gallery-files/#{filename}", "sourceUrl" => source_url,
+                    "createdAt" => (Time.now.to_f * 1000).to_i, "imageKey" => payload["imageKey"].to_s[0, 300],
+                    "sessionId" => payload["sessionId"].to_s[0, 200], "jobId" => payload["jobId"].to_s[0, 200],
+                    "index" => (Integer(payload["index"] || 0) rescue 0), "favorite" => false, "bytes" => bytes.bytesize }
+          File.write(path + ".json", JSON.pretty_generate(entry), mode: "w:utf-8")
+          json_response.call(res, 201, { ok: true, entry: entry })
+        rescue StandardError => remote_error
+          json_response.call(res, 502, { error: "Could not preserve the remote image: #{remote_error.message}" })
+        end
+        next
+      end
       data_url = payload["url"].to_s
       match = data_url.match(/\Adata:image\/(png|jpeg|jpg|webp|gif);base64,([A-Za-z0-9+\/=\r\n]+)\z/)
       unless match
@@ -5639,6 +5870,27 @@ server.mount_proc "/api/videos" do |req, res|
   rescue StandardError => error
     warn "Faith video library error: #{error.class}: #{error.message}"
     json_response.call(res, 500, { error: error.message })
+  end
+end
+
+# Serve the frontend from public/ when present, with the bundled root-level
+# index.html as a fallback for compact Faith distributions.
+static_handler = WEBrick::HTTPServlet::FileHandler.new(server, PUBLIC_DIR, FancyIndexing: false)
+server.mount_proc "/" do |req, res|
+  if ["/", "/index.html"].include?(req.path) && req.request_method == "GET"
+    candidates = [File.join(PUBLIC_DIR, "index.html"), File.join(ROOT, "index.html")]
+    html_path = candidates.find { |path| File.file?(path) }
+    if html_path
+      res.status = 200
+      res["Content-Type"] = "text/html; charset=utf-8"
+      res["Cache-Control"] = "no-store"
+      res.body = File.read(html_path, encoding: "UTF-8")
+    else
+      res.status = 404
+      res.body = "Faith frontend index.html was not found in public/ or the server directory."
+    end
+  else
+    static_handler.service(req, res)
   end
 end
 
