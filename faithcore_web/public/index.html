@@ -72,7 +72,9 @@
     .faith-sidebar button { font: inherit; cursor: pointer; color: #dbe5f7; background: transparent; border: 1px solid transparent; border-radius: 9px; padding: 9px 10px; text-align: left; }
     .faith-sidebar button:hover { background: rgba(255,255,255,.06); }
     .faith-sidebar button.active { background: rgba(98,132,210,.18); border-color: rgba(119,157,255,.24); }
-    #faith-new-chat { width: 100%; border-color: rgba(255,255,255,.13); background: rgba(255,255,255,.035); }
+    #faith-new-chat, #faith-load-chat { width: 100%; border-color: rgba(255,255,255,.13); background: rgba(255,255,255,.035); }
+    #faith-load-chat { margin-top: 5px; }
+    #faith-chat-storage-status { padding: 5px 9px 2px; font-size: .68rem; }
     .faith-sidebar-heading { color: #91a0b9; font-size: .75rem; text-transform: uppercase; letter-spacing: .09em; padding: 8px 8px 3px; }
     #faith-thread-list {
       scrollbar-width: none;
@@ -685,6 +687,9 @@
     </div>
     <div id="faith-chats-panel">
       <button id="faith-new-chat" type="button">＋ New chat</button>
+      <button id="faith-load-chat" type="button">＋ Load chat (.txt)</button>
+      <input id="faith-load-chat-file" type="file" accept=".txt,text/plain" hidden>
+      <div id="faith-chat-storage-status" class="faith-context-hint" aria-live="polite">Chats saved to the Faith chats folder</div>
       <button id="faith-delete-all-chats" class="faith-danger-button" type="button">Delete all chats</button>
       <div class="faith-sidebar-heading">Recent conversations <span class="faith-context-hint">(right-click to delete)</span></div>
       <nav id="faith-thread-list" aria-label="Recent conversations"></nav>

@@ -2024,6 +2024,8 @@ let faithGalleryFavoritesOnly = false;
 let faithWorkspaceReady = false;
 let faithLastUserPrompt = "";
 function faithLoadWorkspace() {
+  // One-time migration source only. Permanent chat history now lives in ROOT/chats
+  // and is loaded from /api/chats; localStorage is no longer the chat database.
   try {
     const saved = JSON.parse(localStorage.getItem(FAITH_WORKSPACE_KEY) || "null");
     if (saved && Array.isArray(saved.threads) && Array.isArray(saved.gallery)) faithWorkspace = saved;
@@ -2054,23 +2056,113 @@ function faithPersistThreadState(thread) {
   if (!thread || !faithWorkspaceReady) return;
   thread.voiceModeActive = !!window.faithVoiceModeActive && thread.id === faithWorkspace.activeId
     ? true : !!thread.voiceModeActive;
-  try {
-    localStorage.setItem(FAITH_WORKSPACE_KEY, JSON.stringify(faithWorkspace));
-  } catch (_) {
-    // Fall back to the normal size-tolerant workspace save if image data makes
-    // the lightweight state write exceed the browser's storage quota.
-    try { faithSaveWorkspace(); } catch (_) {}
-  }
+  faithQueueServerChatSave(thread, 250);
 }
 window.addEventListener("pagehide", () => {
   const activeVoiceThread = faithWorkspace && Array.isArray(faithWorkspace.threads)
     ? faithWorkspace.threads.find(t => t.id === faithWorkspace.activeId) : null;
   if (activeVoiceThread) {
     activeVoiceThread.voiceModeActive = !!window.faithVoiceModeActive;
-    try { localStorage.setItem(FAITH_WORKSPACE_KEY, JSON.stringify(faithWorkspace)); }
-    catch (_) { /* Existing workspace save handles storage limits during normal use. */ }
+    // Best-effort synchronous keepalive; the periodic and post-turn saves are primary.
+    faithQueueServerChatSave(activeVoiceThread, 0, true);
   }
 });
+let faithChatSaveTimers = new Map();
+let faithChatSaveInFlight = new Map();
+let faithChatDiskAvailable = false;
+let faithChatLastSaveError = "";
+function faithThreadTranscript(thread) {
+  const holder = document.createElement("div"); holder.innerHTML = String(thread.html || "");
+  const lines = [`Faith Chat Archive: ${thread.title || "New conversation"}`, `Conversation ID: ${thread.id}`, `Created: ${new Date(Number(thread.createdAt) || Date.now()).toISOString()}`, `Updated: ${new Date(Number(thread.updatedAt) || Date.now()).toISOString()}`, ""];
+  holder.querySelectorAll(".message").forEach(message => {
+    const user = message.classList.contains("you") || message.classList.contains("user");
+    const node = message.querySelector(".message-text");
+    let body = (node ? (node.innerText || node.textContent) : "").replace(/\u00a0/g, " ").replace(/\r\n?/g, "\n").trim();
+    const imgs = Array.from(message.querySelectorAll("img")).map(img => img.currentSrc || img.src).filter(Boolean);
+    if (imgs.length) body += (body ? "\n" : "") + "Images: " + imgs.join(" | ");
+    const attachments = Array.from(message.querySelectorAll(".message-attachment-name")).map(n => n.textContent.trim()).filter(Boolean);
+    if (attachments.length) body += (body ? "\n" : "") + "Attachments: " + attachments.join(", ");
+    if (body) lines.push(`[${user ? "User" : "Faith"}]: ${body}`, "");
+  });
+  return lines.join("\r\n").trimEnd() + "\r\n";
+}
+async function faithMakePortableThread(thread) {
+  const portable = { ...thread };
+  const holder = document.createElement("div"); holder.innerHTML = String(thread.html || "");
+  const images = Array.from(holder.querySelectorAll("img[src]"));
+  for (const img of images) {
+    const source = img.getAttribute("src") || img.src;
+    if (!source || source.startsWith("data:image/")) continue;
+    try {
+      const response = await fetch(source, { cache: "force-cache" });
+      if (!response.ok) continue;
+      const blob = await response.blob();
+      if (!blob.type.startsWith("image/") || blob.size > 12 * 1024 * 1024) continue;
+      const dataUrl = await new Promise((resolve, reject) => {
+        const reader = new FileReader(); reader.onload = () => resolve(String(reader.result || ""));
+        reader.onerror = reject; reader.readAsDataURL(blob);
+      });
+      if (!dataUrl.startsWith("data:image/")) continue;
+      img.src = dataUrl;
+      const link = img.closest("a"); if (link) link.href = dataUrl;
+    } catch (_) { /* Preserve the original URL if the provider blocks retrieval. */ }
+  }
+  portable.html = holder.innerHTML;
+  return portable;
+}
+async function faithSaveThreadToServer(thread, keepalive = false) {
+  if (!thread || !thread.id) return false;
+  const id = thread.id;
+  const previous = faithChatSaveInFlight.get(id) || Promise.resolve(false);
+  const task = previous.catch(() => false).then(async () => {
+    // Snapshot only after the preceding write completes, preventing stale saves
+    // from racing and replacing a newer version of the same conversation.
+    const snapshot = { ...thread, updatedAt: Number(thread.updatedAt) || Date.now() };
+    const payload = { action: "save", thread: snapshot, transcript: faithThreadTranscript(snapshot) };
+    try {
+      const response = await fetch("/api/chats", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(payload), keepalive });
+      if (!response.ok) {
+        let detail = "";
+        try { const failure = await response.json(); detail = failure.error || ""; }
+        catch (_) { try { detail = (await response.text()).slice(0, 400); } catch (_) {} }
+        throw new Error(detail || `HTTP ${response.status}`);
+      }
+      const savedResult = await response.json().catch(() => ({}));
+      thread.serverSavedAt = Date.now();
+      thread.serverArchivePath = savedResult.filename || null;
+      faithChatLastSaveError = "";
+      faithChatDiskAvailable = true;
+      const status = document.getElementById("faith-chat-storage-status"); if (status) status.textContent = "Chats saved to the Faith chats folder";
+      return true;
+    } catch (error) {
+      faithChatDiskAvailable = false;
+      faithChatLastSaveError = error && error.message ? error.message : String(error);
+      const status = document.getElementById("faith-chat-storage-status"); if (status) status.textContent = "Disk save unavailable — check Faith server";
+      console.warn("Faith chat disk save failed:", error); return false;
+    }
+  });
+  faithChatSaveInFlight.set(id, task);
+  try { return await task; }
+  finally { if (faithChatSaveInFlight.get(id) === task) faithChatSaveInFlight.delete(id); }
+}
+
+function faithQueueServerChatSave(thread, delay = 700, keepalive = false) {
+  if (!thread || !thread.id) return;
+  const prior = faithChatSaveTimers.get(thread.id); if (prior) clearTimeout(prior);
+  if (delay <= 0) { faithSaveThreadToServer(thread, keepalive); return; }
+  faithChatSaveTimers.set(thread.id, setTimeout(() => {
+    faithChatSaveTimers.delete(thread.id);
+    faithSaveThreadToServer(thread).then(ok => {
+      if (!ok) console.warn(`Faith could not persist conversation ${thread.id}; it remains in the current page until storage recovers.`);
+    });
+  }, delay));
+}
+async function faithLoadServerChats() {
+  const response = await fetch("/api/chats", { cache: "no-store" });
+  if (!response.ok) throw new Error("Chat folder could not be read");
+  const payload = await response.json();
+  return Array.isArray(payload.chats) ? payload.chats : [];
+}
 function faithSaveWorkspace() {
   const thread = faithWorkspace.threads.find(t => t.id === faithWorkspace.activeId);
   if (thread && chat) {
@@ -2089,16 +2181,9 @@ function faithSaveWorkspace() {
     }
     if (!thread.detail && detail) thread.detail = detail.textContent || "";
   }
-  try { localStorage.setItem(FAITH_WORKSPACE_KEY, JSON.stringify(faithWorkspace)); } catch (e) {
-    // Large image data URLs can exceed localStorage. Keep conversation text and
-    // gallery metadata instead of allowing storage limits to break the chat.
-    try {
-      const safe = JSON.parse(JSON.stringify(faithWorkspace));
-      safe.gallery = safe.gallery.slice(0, 30).map(g => ({...g, url: g.url && g.url.length > 180000 ? "" : g.url}));
-      safe.threads = safe.threads.map(t => ({...t, html: String(t.html || "").replace(/(src|href)="data:image[^"]+"/gi, '$1=""')}));
-      localStorage.setItem(FAITH_WORKSPACE_KEY, JSON.stringify(safe));
-    } catch (_) {}
-  }
+  // Disk-backed server storage is authoritative. Save the active conversation
+  // after DOM updates and on every explicit workspace save.
+  if (thread) faithQueueServerChatSave(thread, 500);
   faithRenderSidebar();
 }
 function faithSafeFilename(prompt, ext = "png") {
@@ -2133,11 +2218,14 @@ async function faithAddGalleryImage(image, prompt, imageNode = null, linkNode = 
   // transient data URL with the durable gallery URL. This makes the original
   // message reloadable even when localStorage has to drop large image data.
   try {
-    if (String(url).startsWith("data:image/")) {
-      const response = await fetch("/api/gallery", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(entry) });
-      const saved = await response.json();
-      if (response.ok && saved && saved.entry) Object.assign(entry, saved.entry, { imageKey, sessionId, jobId, index: entry.index });
-    }
+    const savePayload = String(url).startsWith("data:image/") ? entry : {
+      action: "import_url", source_url: url, title: entry.title, prompt: entry.prompt,
+      imageKey, sessionId, jobId, index: entry.index
+    };
+    const response = await fetch("/api/gallery", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(savePayload) });
+    const saved = await response.json();
+    if (response.ok && saved && saved.entry) Object.assign(entry, saved.entry, { imageKey, sessionId, jobId, index: entry.index });
+    else if (!response.ok) console.warn("Faith could not make this generated image permanent:", saved.error || response.statusText);
   } catch (error) { console.warn("Faith Gallery server save failed; retaining browser copy if possible.", error); }
   if (imageNode && entry.url && !String(entry.url).startsWith("data:image/")) imageNode.src = entry.url;
   if (linkNode && entry.url && !String(entry.url).startsWith("data:image/")) linkNode.href = entry.url;
@@ -2309,8 +2397,7 @@ function faithRetrofitStorageLimitButtons() {
     if (thread.html !== holder.innerHTML) { thread.html = holder.innerHTML; changed = true; }
   }
   if (changed) {
-    try { localStorage.setItem(FAITH_WORKSPACE_KEY, JSON.stringify(faithWorkspace)); }
-    catch (_) { try { faithSaveWorkspace(); } catch (_) {} }
+    faithWorkspace.threads.forEach(thread => faithQueueServerChatSave(thread, 0));
   }
 }
 
@@ -2385,38 +2472,58 @@ async function faithLoadServerGallery() {
   } catch (_) {}
 }
 
-function faithArchiveThread(thread) {
+async function faithArchiveThread(thread) {
   if (!thread) return;
-  const holder = document.createElement("div");
-  holder.innerHTML = String(thread.html || "");
-  const messages = Array.from(holder.querySelectorAll(".message"));
-  const lines = [];
-  lines.push(`Faith Chat Archive: ${thread.title || "New conversation"}`);
-  lines.push(`Archived: ${new Date().toLocaleString()}`);
-  lines.push("");
-  messages.forEach((message) => {
-    const isUser = message.classList.contains("you") || message.classList.contains("user");
-    const speaker = isUser ? "User" : "Faith";
-    const textNode = message.querySelector(".message-text");
-    let body = (textNode ? (textNode.innerText || textNode.textContent) : "").replace(/\u00a0/g, " ").replace(/\r\n?/g, "\n").replace(/[ \t]+\n/g, "\n").replace(/\n{3,}/g, "\n\n").trim();
-    const attachmentNames = Array.from(message.querySelectorAll(".message-attachment-name")).map(n => n.textContent.trim()).filter(Boolean);
-    if (attachmentNames.length) body += (body ? "\n" : "") + "Attachments: " + attachmentNames.join(", ");
-    const imageCount = message.querySelectorAll(".message-image img, img[data-faith-image-key], .message-images img").length;
-    if (imageCount) body += (body ? "\n" : "") + `[${imageCount} image${imageCount === 1 ? "" : "s"} attached]`;
-    if (body) {
-      // Keep archives compact and readable, matching the requested transcript format.
-      lines.push(`[${speaker}]: ${body}`);
-      lines.push("");
-    }
-  });
-  const content = "\uFEFF" + lines.join("\r\n").trimEnd() + "\r\n";
-  const blob = new Blob([content], { type: "text/plain;charset=utf-8" });
-  const url = URL.createObjectURL(blob);
-  const link = document.createElement("a");
+  if (thread.id === faithWorkspace.activeId) faithSaveWorkspace();
+  let exportThread = thread;
+  const saved = await faithSaveThreadToServer(thread);
+  if (saved) {
+    try {
+      const response = await fetch("/api/chats?id=" + encodeURIComponent(thread.id), { cache: "no-store" });
+      if (response.ok) { const result = await response.json(); if (result.thread) exportThread = result.thread; }
+    } catch (_) {}
+  } else {
+    alert("Faith could not save this archive into the chats folder. A local download will be offered instead.\n\nReason: " + (faithChatLastSaveError || "The server did not return a detailed error.") + "\n\nVerify that Faith's installation folder is writable and that the updated server is running.");
+  }
+  const transcript = faithThreadTranscript(exportThread);
+  const portableThread = await faithMakePortableThread(exportThread);
+  const structured = btoa(unescape(encodeURIComponent(JSON.stringify({ version: 2, thread: portableThread }))));
+  const archive = "\uFEFF" + transcript + "\r\n---FAITH-STRUCTURED-DATA-BASE64---\r\n" + structured + "\r\n";
+  const blob = new Blob([archive], { type: "text/plain;charset=utf-8" });
+  const url = URL.createObjectURL(blob); const link = document.createElement("a");
   const safeTitle = String(thread.title || "faith-chat").replace(/[\\/:*?"<>|]+/g, "-").replace(/\s+/g, "-").slice(0, 60) || "faith-chat";
   link.href = url; link.download = `${safeTitle}-archive.txt`; link.style.display = "none";
-  document.body.appendChild(link); link.click(); link.remove();
-  setTimeout(() => URL.revokeObjectURL(url), 1000);
+  document.body.appendChild(link); link.click(); link.remove(); setTimeout(() => URL.revokeObjectURL(url), 1000);
+}
+
+async function faithImportChatFile(file) {
+  if (!file) return;
+  const raw = await file.text();
+  let imported = null;
+  const marker = "\n---FAITH-STRUCTURED-DATA-BASE64---\n";
+  const at = raw.indexOf(marker);
+  if (at >= 0) {
+    try { imported = JSON.parse(decodeURIComponent(escape(atob(raw.slice(at + marker.length).trim())))); } catch (e) { console.warn("Faith archive metadata could not be decoded", e); }
+  }
+  let thread;
+  if (imported && imported.thread) thread = imported.thread;
+  else {
+    const titleMatch = raw.match(/^Faith Chat Archive:\s*(.+)$/m);
+    const html = document.createElement("div");
+    raw.split(/\r?\n/).forEach(line => {
+      const match = line.match(/^\[(User|Faith)\]:\s*(.*)$/);
+      if (!match) return;
+      const message = document.createElement("div"); message.className = "message " + (match[1] === "User" ? "you" : "faith");
+      const body = document.createElement("div"); body.className = "message-text"; body.textContent = match[2]; message.appendChild(body); html.appendChild(message);
+    });
+    thread = { id: "thread-" + (crypto.randomUUID ? crypto.randomUUID() : Date.now().toString(36)), title: titleMatch ? titleMatch[1].trim() : file.name.replace(/\.txt$/i, ""), html: html.innerHTML, createdAt: Date.now(), updatedAt: Date.now(), mode: "chat", expression: "ruby" };
+  }
+  thread = { ...thread, id: "thread-" + (crypto.randomUUID ? crypto.randomUUID() : Date.now().toString(36)), title: thread.title || file.name.replace(/\.txt$/i, ""), createdAt: Number(thread.createdAt) || Date.now(), updatedAt: Date.now() };
+  faithWorkspace.threads.unshift(thread); faithWorkspace.activeId = thread.id;
+  chat.innerHTML = thread.html || ""; faithBindReplayButtons(chat); faithBindStorageLimitClearButton(chat); faithRestoreThreadImages(thread);
+  sessionMode = thread.behaviorState || thread.mode || "idle"; if (sessionMode === "chat") sessionMode = "idle";
+  setExpression(thread.expression || "ruby", thread.detail || "Imported conversation");
+  faithRenderSidebar(); await faithSaveThreadToServer(thread); faithSaveWorkspace();
 }
 
 function faithShowChatInfo(thread) {
@@ -2452,7 +2559,7 @@ function faithShowChatInfo(thread) {
   const close=document.createElement('button');close.type='button';close.textContent='Close';
   const apply=document.createElement('button');apply.type='button';apply.textContent='Save chat state';apply.style.cssText='background:#6336a6;color:#fff;border:0;border-radius:7px;padding:9px 12px;';
   close.style.cssText='background:#252e40;color:#fff;border:1px solid #46516a;border-radius:7px;padding:9px 12px;';
-  close.onclick=()=>holder.remove(); apply.onclick=()=>{thread.behaviorState=behavior.value;thread.mode=behavior.value;thread.expression=expression.value;thread.detail=expressionDetails[expression.value]||'';thread.updatedAt=Date.now();if(thread.id===faithWorkspace.activeId){sessionMode=behavior.value;window.faithVoiceModeActive=!!thread.voiceModeActive;setExpression(expression.value,thread.detail);faithSaveWorkspace();}else{try{localStorage.setItem(FAITH_WORKSPACE_KEY,JSON.stringify(faithWorkspace));}catch(_){faithSaveWorkspace();}faithRenderSidebar();}holder.remove();};
+  close.onclick=()=>holder.remove(); apply.onclick=()=>{thread.behaviorState=behavior.value;thread.mode=behavior.value;thread.expression=expression.value;thread.detail=expressionDetails[expression.value]||'';thread.updatedAt=Date.now();if(thread.id===faithWorkspace.activeId){sessionMode=behavior.value;window.faithVoiceModeActive=!!thread.voiceModeActive;setExpression(expression.value,thread.detail);faithSaveWorkspace();}else{faithQueueServerChatSave(thread, 0);faithRenderSidebar();}holder.remove();};
   actions.append(close,apply);controls.appendChild(actions);panel.appendChild(controls);holder.appendChild(panel);holder.addEventListener('click',e=>{if(e.target===holder)holder.remove();});document.addEventListener('keydown',function esc(e){if(e.key==='Escape'&&holder.isConnected){holder.remove();document.removeEventListener('keydown',esc);}});document.body.appendChild(holder);
 }
 
@@ -2560,6 +2667,7 @@ function faithSwitchThread(id) {
   faithSaveWorkspace();
 }
 function faithDeleteThread(id) {
+  fetch("/api/chats?id=" + encodeURIComponent(id), { method: "DELETE" }).catch(error => console.warn("Could not delete chat file", error));
   const wasActive = id === faithWorkspace.activeId;
   faithWorkspace.threads = faithWorkspace.threads.filter(t => t.id !== id);
   if (!faithWorkspace.threads.length) faithWorkspace.threads.push({ id: "thread-" + Date.now().toString(36), title: "New conversation", html: "", updatedAt: Date.now(), mode: "chat", expression: "ruby" });
@@ -2578,6 +2686,7 @@ function faithDeleteThread(id) {
 }
 function faithDeleteAllThreads() {
   if (!confirm("Delete ALL saved conversations? This cannot be undone.")) return;
+  fetch("/api/chats", { method: "DELETE" }).catch(error => console.warn("Could not clear chat folder", error));
   const oldIds = faithWorkspace.threads.map(t => t.id);
   faithWorkspace.threads = [{ id: "thread-" + Date.now().toString(36), title: "New conversation", html: "", updatedAt: Date.now(), mode: "chat", expression: "ruby" }];
   faithWorkspace.activeId = faithWorkspace.threads[0].id;
@@ -2733,9 +2842,25 @@ function faithNewThread() {
   setExpression("ruby", "Ready");
   faithSaveWorkspace();
 }
-function faithInitSidebar() {
+async function faithInitSidebar() {
   faithRenameExistingAutoReadLabel();
   faithLoadWorkspace();
+  const legacyThreads = faithWorkspace.threads.slice();
+  try {
+    const diskChats = await faithLoadServerChats();
+    faithChatDiskAvailable = true;
+    if (diskChats.length) {
+      faithWorkspace.threads = diskChats;
+      const preferred = diskChats.find(t => t.id === faithWorkspace.activeId);
+      faithWorkspace.activeId = preferred ? preferred.id : diskChats[0].id;
+    } else {
+      // First-run migration: copy old browser-only threads into the durable folder.
+      for (const legacy of legacyThreads) await faithSaveThreadToServer(legacy);
+    }
+  } catch (error) {
+    faithChatDiskAvailable = false;
+    console.error("Faith could not load its chats folder; retaining this session's legacy data.", error);
+  }
   faithRetrofitStorageLimitButtons();
   const active = faithWorkspace.threads.find(t => t.id === faithWorkspace.activeId);
   if (active) {
@@ -2759,6 +2884,26 @@ function faithInitSidebar() {
   faithRenderSidebar();
   const newButton = document.getElementById("faith-new-chat");
   if (newButton) newButton.addEventListener("click", faithNewThread);
+  const loadButton = document.getElementById("faith-load-chat");
+  const loadInput = document.getElementById("faith-load-chat-file");
+  if (loadButton && loadInput) {
+    loadButton.addEventListener("click", () => loadInput.click());
+    loadInput.addEventListener("change", async () => { try { await faithImportChatFile(loadInput.files && loadInput.files[0]); } catch (e) { alert("Could not import this Faith archive: " + e.message); } finally { loadInput.value = ""; } });
+  }
+  const storageStatus = document.getElementById("faith-chat-storage-status");
+  if (storageStatus) storageStatus.textContent = faithChatDiskAvailable ? "Chats stored in the Faith chats folder" : "Disk storage unavailable — check Faith server";
+  if (chat && !window.faithChatDiskObserver) {
+    let mutationSave = null;
+    window.faithChatDiskObserver = new MutationObserver(() => {
+      clearTimeout(mutationSave);
+      mutationSave = setTimeout(() => { const activeThread = faithWorkspace.threads.find(t => t.id === faithWorkspace.activeId); if (activeThread) faithSaveWorkspace(); }, 1200);
+    });
+    window.faithChatDiskObserver.observe(chat, { childList: true, subtree: true, characterData: true });
+  }
+  if (!window.faithChatPeriodicSave) window.faithChatPeriodicSave = setInterval(() => {
+    faithSaveWorkspace();
+    faithWorkspace.threads.forEach(thread => faithQueueServerChatSave(thread, 0));
+  }, 120000);
   const deleteChatsButton = document.getElementById("faith-delete-all-chats");
   if (deleteChatsButton) deleteChatsButton.addEventListener("click", faithDeleteAllThreads);
   const deleteGalleryButton = document.getElementById("faith-delete-all-gallery");
